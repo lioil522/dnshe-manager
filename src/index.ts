@@ -471,15 +471,81 @@ app.get("/api/logs", async (c) => {
   }
 });
 
-// 2. 清空日志
+// 2. 清空运行日志
 app.post("/api/logs/clear", async (c) => {
   const dbManager = c.get("db");
   try {
     await dbManager.clearLogs();
-    return c.json(successRes({ message: "日志清理成功" }));
+    return c.json(successRes({ message: "日志已清空" }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";
     return c.json(errorRes(message), 500);
+  }
+});
+
+/**
+ * 8. WHOIS 查询域名可注册性 (代理接口)
+ */
+app.get("/api/whois", async (c) => {
+  const domain = c.req.query("domain");
+  if (!domain) {
+    return c.json(errorRes("必须提供完整的域名参数 (例如 test.us.ci)", "bad_request"), 400);
+  }
+
+  const dbManager = c.get("db");
+  try {
+    // 尝试使用已绑定的账号进行查询（以防官方开启了 API Key 验证要求）
+    const accounts = await dbManager.getAccounts();
+    let client: DNSHEClient;
+    if (accounts.length > 0) {
+      const auth = await dbManager.getClientForAccount(accounts[0].id);
+      client = auth.client;
+    } else {
+      client = new DNSHEClient("public", "public");
+    }
+
+    const res = await client.whois(domain.trim());
+    return c.json(successRes({ whois: res }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "WHOIS 查询异常";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+/**
+ * 9. 在线注册新子域名 (代理接口)
+ */
+app.post("/api/domains/register", async (c) => {
+  const dbManager = c.get("db");
+
+  try {
+    const { account_id, subdomain, rootdomain } = await c.req.json();
+    if (!account_id || !subdomain || !rootdomain) {
+      return c.json(errorRes("必须提供 account_id, subdomain 及 rootdomain", "bad_request"), 400);
+    }
+
+    const { client } = await dbManager.getClientForAccount(account_id);
+    const res = await client.registerSubdomain(subdomain.trim(), rootdomain.trim());
+
+    if (res && res.success) {
+      const fullDomain = res.full_domain || `${subdomain.trim()}.${rootdomain.trim()}`;
+      await dbManager.writeLog("success", "sync", `成功在账号 [ID: ${account_id}] 下注册了免费域名: [${fullDomain}]`);
+      
+      // 触发一次账号全量同步，把新注册域名自动拉入 domains_cache 数据库
+      try {
+        const subdomains = await fetchAllSubdomainsFromClient(client);
+        await dbManager.saveSubdomainsCache(account_id, subdomains);
+      } catch (e) {
+        console.error("注册后同步错误:", e);
+      }
+
+      return c.json(successRes({ message: `域名 [${fullDomain}] 注册成功！`, subdomain_id: res.subdomain_id, full_domain: fullDomain }));
+    } else {
+      throw new Error(res.message || "注册子域名失败");
+    }
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "注册子域名发生错误";
+    return c.json(errorRes(message), 400);
   }
 });
 

@@ -28,36 +28,30 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
         run: |
-          echo "🔍 检查并获取 Cloudflare D1 数据库..."
-          # 检查是否存在名为 dnshe-manager-db 的 D1 数据库
-          DB_LIST=$(npx wrangler d1 list --json)
-          DB_ID=$(echo "$DB_LIST" | jq -r '.[] | select(.name=="dnshe-manager-db") | .uuid')
+          DB_ID="${CLOUDFLARE_D1_DATABASE_ID}"
 
-          if [ -z "$DB_ID" ] || [ "$DB_ID" == "null" ]; then
-            echo "⚡ 正在为您自动创建 D1 数据库 [dnshe-manager-db]..."
-            CREATE_RES=$(npx wrangler d1 create dnshe-manager-db --json)
-            DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // .uuid // empty')
-            if [ -z "$DB_ID" ]; then
-              # Fallback 正则提取 uuid
-              DB_ID=$(echo "$CREATE_RES" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n 1)
-            fi
-            echo "✅ 成功创建 D1 数据库，ID: $DB_ID"
-            
-            echo "📋 正在自动初始化数据库表结构 (schema.sql)..."
-            npx wrangler d1 execute dnshe-manager-db --remote --file=./schema.sql -y
+          if [ -n "$DB_ID" ]; then
+            echo "✅ 使用 GitHub Secret 中配置的 CLOUDFLARE_D1_DATABASE_ID: $DB_ID"
           else
-            echo "✅ 找到已有 D1 数据库，ID: $DB_ID"
+            echo "🔍 尝试自动查询/创建 Cloudflare D1 数据库..."
+            DB_LIST=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
+            DB_ID=$(echo "$DB_LIST" | jq -r '.[] | select(.name=="dnshe-manager-db") | .uuid' 2>/dev/null || echo "")
+
+            if [ -z "$DB_ID" ] || [ "$DB_ID" == "null" ]; then
+              echo "⚡ 尝试创建 D1 数据库 [dnshe-manager-db]..."
+              CREATE_RES=$(npx wrangler d1 create dnshe-manager-db --json 2>/dev/null || echo "")
+              DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // .uuid // empty' 2>/dev/null || echo "")
+            fi
           fi
 
-          if [ -z "$DB_ID" ]; then
-            echo "❌ 无法自动获取 D1 数据库 ID，请手动创建 D1 数据库并在 wrangler.toml 中填入 database_id"
-            exit 1
+          if [ -n "$DB_ID" ] && [ "$DB_ID" != "null" ]; then
+            sed -i "s/change_me_to_your_d1_db_id/$DB_ID/g" wrangler.toml
+            echo "🎉 成功将 D1 数据库 ID [$DB_ID] 绑定写入 wrangler.toml"
+          else
+            echo "⚠️ 未能获取到 D1 数据库 ID。请参考说明在 GitHub Secret 中添加 CLOUDFLARE_D1_DATABASE_ID"
           fi
-
-          # 替换 wrangler.toml 中的数据库 ID
-          sed -i "s/change_me_to_your_d1_db_id/$DB_ID/g" wrangler.toml
-          echo "🎉 已经将 D1 数据库 ID [$DB_ID] 写入 wrangler.toml"
 
       - name: Deploy Worker Backend
         uses: cloudflare/wrangler-action@v3

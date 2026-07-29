@@ -121,6 +121,53 @@ export class DatabaseManager {
   }
 
   /**
+   * 自动确保所需的 D1 数据库表结构存在
+   */
+  async ensureTables() {
+    try {
+      await this.db.batch([
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL,
+            api_key TEXT NOT NULL UNIQUE,
+            api_secret TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS domains_cache (
+            id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            subdomain TEXT NOT NULL,
+            rootdomain TEXT NOT NULL,
+            full_domain TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT,
+            expires_at TEXT NOT NULL,
+            last_renewed_at TEXT,
+            has_dns INTEGER DEFAULT 1,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `)
+      ]);
+    } catch (e) {
+      console.error("Auto ensureTables error:", e);
+    }
+  }
+
+  /**
    * 写入日志
    */
   async writeLog(type: "info" | "success" | "warning" | "error", category: "sync" | "renew" | "system", message: string, details?: unknown) {

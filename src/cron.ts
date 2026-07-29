@@ -119,6 +119,7 @@ export async function runDailySyncAndRenewal(
   webhookUrl?: string,
   webhookType: WebhookType = "custom"
 ) {
+  await dbManager.ensureTables();
   await dbManager.writeLog("info", "system", "自动定时任务启动：开始执行域名同步与到期检测续期任务");
 
   let accounts: Array<{ id: number; alias: string }> = [];

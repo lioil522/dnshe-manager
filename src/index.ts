@@ -105,6 +105,7 @@ app.use("/api/*", async (c, next) => {
  */
 app.use("/api/*", async (c, next) => {
   const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
+  await dbManager.ensureTables();
   c.set("db", dbManager);
   return next();
 });

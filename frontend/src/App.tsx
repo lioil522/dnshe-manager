@@ -142,8 +142,12 @@ export default function App() {
   const [newDnsLine, setNewDnsLine] = useState("");
   const [dnsFormOpen, setDnsFormOpen] = useState(false);
 
+  // 管理员访问口令 (ADMIN_TOKEN) 鉴权模态框状态
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [inputAuthToken, setInputAuthToken] = useState(localStorage.getItem("DNSHE_ADMIN_TOKEN") || "");
+
   /**
-   * 统一 API 请求封装 — 自动注入 Authorization 头部
+   * 统一 API 请求封装 — 自动注入 Authorization 头部，遇到 401/403 自动触发锁屏
    */
   const apiFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
     const token = localStorage.getItem("DNSHE_ADMIN_TOKEN");
@@ -151,7 +155,26 @@ export default function App() {
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
-    return fetch(url, { ...options, headers });
+    const res = await fetch(url, { ...options, headers });
+    if (res.status === 401 || res.status === 403) {
+      setAuthModalOpen(true);
+    }
+    return res;
+  };
+
+  // 保存/更新管理口令
+  const handleSaveAuthToken = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (inputAuthToken.trim()) {
+      localStorage.setItem("DNSHE_ADMIN_TOKEN", inputAuthToken.trim());
+      showToast("success", "访问口令更新成功！正在刷新数据...");
+    } else {
+      localStorage.removeItem("DNSHE_ADMIN_TOKEN");
+      showToast("info", "已清除本地保存的口令");
+    }
+    setAuthModalOpen(false);
+    fetchDomains();
+    fetchAccounts();
   };
 
   // 自动淡出 Toast 提示
@@ -775,6 +798,14 @@ export default function App() {
               同步所有账号
             </button>
           )}
+          <button
+            onClick={() => setAuthModalOpen(true)}
+            className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-3.5 py-2.5 rounded-lg text-sm font-semibold flex items-center gap-2 transition-all"
+            title="配置管理访问口令 (ADMIN_TOKEN)"
+          >
+            <Key className="w-4 h-4 text-amber-400" />
+            <span>{localStorage.getItem("DNSHE_ADMIN_TOKEN") ? "已锁屏鉴权" : "设置口令"}</span>
+          </button>
         </div>
       </header>
 
@@ -1538,6 +1569,64 @@ export default function App() {
                 完成
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 管理员口令 (ADMIN_TOKEN) 鉴权模态框 */}
+      {authModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/90 snapshot-blur backdrop-blur-md">
+          <div className="bg-dark-900 border border-dark-800 w-full max-w-md rounded-2xl overflow-hidden shadow-2xl p-6">
+            <div className="flex items-center gap-3 text-amber-400 mb-4">
+              <Key className="w-7 h-7" />
+              <h3 className="text-xl font-bold text-white">管理员安全鉴权</h3>
+            </div>
+            <p className="text-slate-400 text-sm mb-5 leading-relaxed">
+              部署上线环境时若设置了 <code className="bg-slate-800 text-amber-300 px-1.5 py-0.5 rounded">ADMIN_TOKEN</code>，所有 API 接口均需要验证管理口令。请输入您的管理口令以解锁面板功能。
+            </p>
+            <form onSubmit={handleSaveAuthToken} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                  管理访问口令 (Bearer Token)
+                </label>
+                <input
+                  type="password"
+                  value={inputAuthToken}
+                  onChange={(e) => setInputAuthToken(e.target.value)}
+                  placeholder="请输入 ADMIN_TOKEN"
+                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none transition-colors"
+                />
+              </div>
+              <div className="flex items-center justify-end gap-3 pt-2">
+                {localStorage.getItem("DNSHE_ADMIN_TOKEN") && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInputAuthToken("");
+                      localStorage.removeItem("DNSHE_ADMIN_TOKEN");
+                      setAuthModalOpen(false);
+                      showToast("info", "已清除本地口令");
+                    }}
+                    className="text-xs text-slate-400 hover:text-slate-200 underline px-2 py-1"
+                  >
+                    清除口令
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setAuthModalOpen(false)}
+                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold px-3.5 py-2 rounded-lg"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  className="btn-primary text-xs font-semibold text-white px-4 py-2 rounded-lg"
+                >
+                  验证并保存
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

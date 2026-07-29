@@ -1,0 +1,18 @@
+{
+  "name": "dnshe-manager-backend",
+  "version": "1.0.0",
+  "description": "DNSHE Multi-Account Domain Manager Cloudflare Worker",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240320.0",
+    "typescript": "^5.4.3",
+    "wrangler": "^3.35.0"
+  }
+}

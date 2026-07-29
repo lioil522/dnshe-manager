@@ -1,0 +1,465 @@
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { DatabaseManager } from "./db";
+import { runDailySyncAndRenewal } from "./cron";
+
+type Bindings = {
+  DB: D1Database;
+  AES_KEY?: string;
+  WEBHOOK_URL?: string;
+  WEBHOOK_TYPE?: string;
+  ADMIN_TOKEN?: string;
+  ALLOWED_ORIGIN?: string;
+  DEFAULT_API_KEY?: string;
+  DEFAULT_API_SECRET?: string;
+  DEFAULT_API_ALIAS?: string;
+};
+
+// NOTE: 辅助函数 - 如果在环境变量中配置了 DEFAULT_API_KEY 和 DEFAULT_API_SECRET，自动进行初始化绑定
+async function ensureDefaultAccount(c: any, dbManager: DatabaseManager) {
+  const apiKey = c.env.DEFAULT_API_KEY;
+  const apiSecret = c.env.DEFAULT_API_SECRET;
+  const alias = c.env.DEFAULT_API_ALIAS || "默认账号 (环境变量)";
+
+  if (apiKey && apiSecret) {
+    try {
+      const existingAccounts = await dbManager.getAccounts();
+      const exists = existingAccounts.some(acc => acc.api_key === apiKey);
+      if (!exists) {
+        const newAcc = await dbManager.addAccount(alias, apiKey, apiSecret);
+        // 同步一次域名
+        try {
+          const { client } = await dbManager.getClientForAccount(newAcc.id);
+          const res = await client.listSubdomains(1, 500);
+          if (res && res.success && Array.isArray(res.subdomains)) {
+            await dbManager.syncAccountDomains(newAcc.id, res.subdomains);
+          }
+        } catch (syncErr) {
+          console.error("Default account auto-sync failed:", syncErr);
+        }
+      }
+    } catch (e) {
+      console.error("Auto registration of default account failed:", e);
+    }
+  }
+}
+
+// NOTE: 扩展 Hono 上下文变量，使中间件注入的 dbManager 可在路由中安全访问
+type Variables = {
+  db: DatabaseManager;
+};
+
+const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+
+/**
+ * CORS 中间件 — 默认仅允许同源访问，生产环境通过 ALLOWED_ORIGIN 环境变量配置
+ * 
+ * NOTE: 不再使用 origin: "*"，避免任意域名跨域调用管理 API
+ */
+app.use(
+  "/api/*",
+  async (c, next) => {
+    const allowedOrigin = c.env.ALLOWED_ORIGIN || "*";
+    const corsMiddleware = cors({
+      origin: allowedOrigin,
+      allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+      allowHeaders: ["Content-Type", "Authorization"],
+      maxAge: 86400,
+    });
+    return corsMiddleware(c, next);
+  }
+);
+
+/**
+ * 鉴权中间件 — 所有 /api/* 请求必须携带有效的 Bearer Token
+ * 
+ * NOTE: 当未配置 ADMIN_TOKEN 环境变量时，跳过鉴权（便于本地开发调试）。
+ * 部署生产环境时，务必通过 `wrangler secret put ADMIN_TOKEN` 注入密钥。
+ */
+app.use("/api/*", async (c, next) => {
+  const adminToken = c.env.ADMIN_TOKEN;
+
+  // 未配置 ADMIN_TOKEN 时跳过鉴权，便于开发环境调试
+  if (!adminToken) {
+    return next();
+  }
+
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return c.json(errorRes("未提供有效的 Authorization 头部，格式应为: Bearer <token>", "unauthorized"), 401);
+  }
+
+  const token = authHeader.substring(7);
+  if (token !== adminToken) {
+    return c.json(errorRes("认证失败：Token 无效", "forbidden"), 403);
+  }
+
+  return next();
+});
+
+/**
+ * DatabaseManager 实例化中间件 — 避免在每个路由中重复创建
+ * 
+ * NOTE: 通过 Hono 的 Variables 机制，将 dbManager 注入到上下文中，
+ * 后续路由通过 c.get("db") 获取，消除了 16 处重复的 new DatabaseManager(...) 代码。
+ */
+app.use("/api/*", async (c, next) => {
+  const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
+  c.set("db", dbManager);
+  return next();
+});
+
+/**
+ * 统一响应辅助函数
+ */
+const successRes = (data: Record<string, unknown> = {}) => {
+  return { success: true, ...data };
+};
+
+// NOTE: 移除了原先未被使用的 status 参数，避免开发者误认为它会影响 HTTP 状态码
+const errorRes = (message: string, code = "internal_error") => {
+  return { success: false, error_code: code, message };
+};
+
+/**
+ * 账号管理 API
+ */
+
+// 1. 列出所有绑定的账号
+app.get("/api/accounts", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    await ensureDefaultAccount(c, dbManager);
+    const accounts = await dbManager.getAccounts();
+    return c.json(successRes({ accounts }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+// 2. 绑定新账号
+app.post("/api/accounts", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json();
+    const { alias, api_key, api_secret } = body;
+    
+    if (!alias || !api_key || !api_secret) {
+      return c.json(errorRes("参数缺失：alias, api_key, api_secret 均为必填项", "bad_request"), 400);
+    }
+
+    const newAccount = await dbManager.addAccount(alias, api_key, api_secret);
+    
+    // 绑定成功后，在后台触发一次该账号的域名同步，防止页面上显示为空
+    try {
+      const { client } = await dbManager.getClientForAccount(newAccount.id);
+      const res = await client.listSubdomains(1, 500);
+      if (res && res.success && Array.isArray(res.subdomains)) {
+        await dbManager.syncAccountDomains(newAccount.id, res.subdomains);
+      }
+    } catch (syncErr: unknown) {
+      console.error("Initial domain sync failed for new account:", syncErr);
+    }
+
+    return c.json(successRes({ account: newAccount }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+// 3. 解绑账号
+app.delete("/api/accounts/:id", async (c) => {
+  const dbManager = c.get("db");
+  const id = parseInt(c.req.param("id"), 10);
+  try {
+    await dbManager.deleteAccount(id);
+    return c.json(successRes({ message: "账户解绑成功" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+/**
+ * 域名管理 API
+ */
+
+// 1. 跨账号列出所有域名
+app.get("/api/domains", async (c) => {
+  const dbManager = c.get("db");
+  const search = c.req.query("search") || "";
+  const status = c.req.query("status") || "";
+  const accountIdStr = c.req.query("account_id");
+  const accountId = accountIdStr ? parseInt(accountIdStr, 10) : undefined;
+
+  try {
+    const domains = await dbManager.getDomains(search, status, accountId);
+    return c.json(successRes({ domains }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+// 2. 立即全量同步所有账号的域名
+app.post("/api/domains/sync", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    // 异步执行同步以防止 HTTP 响应超时 (Cloudflare Worker 允许在 waitUntil 里跑异步)
+    const webhookType = (c.env.WEBHOOK_TYPE || "custom") as "dingtalk" | "feishu" | "wecom" | "custom";
+    c.executionCtx.waitUntil(runDailySyncAndRenewal(dbManager, c.env.WEBHOOK_URL, webhookType));
+    return c.json(successRes({ message: "域名同步后台任务已启动，请稍后刷新查看最新数据" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+// 3. 手动续期子域名
+app.post("/api/domains/:id/renew", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  try {
+    // NOTE: 使用 getDomainById 按主键索引查询单条记录，取代原先全表 getDomains() + Array.find()
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未在缓存中找到该域名的记录，请先同步数据", "not_found"), 404);
+    }
+
+    const { client, alias } = await dbManager.getClientForAccount(domainInfo.account_id);
+    
+    const res = await client.renewSubdomain(domainId);
+    if (res && res.success) {
+      const newExpiresAt = res.new_expires_at || "";
+      await dbManager.markDomainRenewed(domainId, newExpiresAt);
+      
+      const msg = `域名 [${domainInfo.full_domain}] (账户: ${alias}) 手动续期成功！新有效期至: ${newExpiresAt}`;
+      await dbManager.writeLog("success", "renew", msg, res);
+      
+      return c.json(successRes({ message: "续期成功", new_expires_at: newExpiresAt }));
+    } else {
+      throw new Error(res.message || "续期请求失败");
+    }
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+// 4. 获取子域名下所有的 DNS 解析记录 (代理接口)
+app.get("/api/domains/:id/dns", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  try {
+    // NOTE: 使用主键查询替代全表扫描
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const res = await client.listDnsRecords(domainId);
+    
+    if (res && res.success) {
+      return c.json(successRes({ records: res.records || [] }));
+    } else {
+      throw new Error(res.message || "获取DNS记录失败");
+    }
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+// 5. 新建 DNS 解析记录 (代理接口)
+app.post("/api/domains/:id/dns", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+  // NOTE: body 声明在 try 外层，以便 catch 块能访问已解析的请求体
+  let body: Record<string, unknown> = {};
+
+  try {
+    body = await c.req.json();
+    // NOTE: 使用主键查询替代全表扫描
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const res = await client.createDnsRecord({
+      subdomain_id: domainId,
+      ...body
+    });
+
+    if (res && res.success) {
+      await dbManager.writeLog("success", "system", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${body.name || "@"} -> ${body.content}`);
+      return c.json(successRes({ message: "创建DNS记录成功", record: res.record }));
+    } else {
+      throw new Error(res.message || "创建DNS记录失败");
+    }
+  } catch (e: unknown) {
+    const rawMsg = e instanceof Error ? e.message : "未知错误";
+    // NOTE: DNSHE 上游 API 在 disable_ns_management 开关禁用时，
+    // 会直接拒绝 NS 类型记录的写入并返回 403，此处翻译为更友好的中文提示
+    const isNsType = body.type === "NS";
+    const is403 = rawMsg.includes("403") || rawMsg.includes("Forbidden");
+    const message = (isNsType && is403)
+      ? "DNSHE 上游平台已禁用 NS 管理功能 (disable_ns_management)，无法通过 API 修改 NS 记录。请前往 DNSHE 官网后台手动设置。"
+      : rawMsg;
+    return c.json(errorRes(message, isNsType && is403 ? "ns_management_disabled" : "internal_error"), 400);
+  }
+});
+
+// 6. 修改 DNS 解析记录 (代理接口)
+app.put("/api/domains/:id/dns/:record_id", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+  const recordId = c.req.param("record_id");
+
+  try {
+    const body = await c.req.json();
+    // NOTE: 使用主键查询替代全表扫描
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const res = await client.updateDnsRecord({
+      record_id: recordId,
+      subdomain_id: domainId,
+      ...body
+    });
+
+    if (res && res.success) {
+      await dbManager.writeLog("success", "system", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${body.type} -> ${body.content}`);
+      return c.json(successRes({ message: "更新DNS记录成功" }));
+    } else {
+      throw new Error(res.message || "更新DNS记录失败");
+    }
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+// 7. 删除 DNS 解析记录 (代理接口)
+app.delete("/api/domains/:id/dns/:record_id", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+  const recordId = c.req.param("record_id");
+
+  try {
+    // NOTE: 使用主键查询替代全表扫描
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const res = await client.deleteDnsRecord(domainId, recordId);
+
+    if (res && res.success) {
+      await dbManager.writeLog("success", "system", `删除了域名 [${domainInfo.full_domain}] 下的 DNS 记录 (ID: ${recordId})`);
+      return c.json(successRes({ message: "删除DNS记录成功" }));
+    } else {
+      throw new Error(res.message || "删除DNS记录失败");
+    }
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+/**
+ * 额度配额接口 — 使用 Promise.allSettled 并发查询所有账号配额
+ * 
+ * NOTE: 原先使用 for...of 串行查询，5 个账号总延迟为 5x 单次请求延迟。
+ * 改为并发后总延迟降至单次请求耗时。
+ */
+app.get("/api/quota", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const accounts = await dbManager.getAccounts();
+
+    // 并发发起所有账号的配额查询请求
+    const quotaPromises = accounts.map(async (acc) => {
+      const { client } = await dbManager.getClientForAccount(acc.id);
+      const qRes = await client.getQuota();
+      if (qRes && qRes.success) {
+        return {
+          account_id: acc.id,
+          alias: acc.alias,
+          ...qRes.quota
+        };
+      }
+      throw new Error(qRes.message || "获取额度失败");
+    });
+
+    const results = await Promise.allSettled(quotaPromises);
+
+    const quotas = results.map((result, idx) => {
+      if (result.status === "fulfilled") {
+        return result.value;
+      }
+      return {
+        account_id: accounts[idx].id,
+        alias: accounts[idx].alias,
+        error: result.reason?.message || "获取额度失败"
+      };
+    });
+
+    return c.json(successRes({ quotas }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+/**
+ * 系统运行日志 API
+ */
+
+// 1. 获取日志列表
+app.get("/api/logs", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const logs = await dbManager.getLogs(100);
+    return c.json(successRes({ logs }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+// 2. 清空日志
+app.post("/api/logs/clear", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    await dbManager.clearLogs();
+    return c.json(successRes({ message: "日志清理成功" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+/**
+ * 导出 Worker 入口
+ */
+export default {
+  fetch: app.fetch,
+  
+  // 处理 scheduled 定时任务 (Cron Trigger)
+  async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+    const dbManager = new DatabaseManager(env.DB, env.AES_KEY);
+    const webhookType = (env.WEBHOOK_TYPE || "custom") as "dingtalk" | "feishu" | "wecom" | "custom";
+    // 使用 ctx.waitUntil 保证 Worker 不会在异步任务未结束时被回收
+    ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType));
+  }
+};

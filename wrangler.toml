@@ -1,0 +1,30 @@
+name = "dnshe-manager-backend"
+main = "src/index.ts"
+compatibility_date = "2024-04-01"
+
+# 绑定 D1 数据库
+[[d1_databases]]
+binding = "DB"
+database_name = "dnshe-manager-db"
+database_id = "change_me_to_your_d1_db_id" # 用户部署时替换为实际的 D1 ID
+
+# 定时任务：每天凌晨 2 点执行域名同步和到期检测自动续期
+[triggers]
+crons = ["0 2 * * *"]
+
+# 环境变量定义
+[vars]
+# 【必须】通过 wrangler secret put 注入以下密钥（不要直接写在配置文件中）：
+#
+# AES_KEY       - AES-GCM 加密密钥，用于加密存储 API Secret（强烈建议配置）
+# ADMIN_TOKEN   - 管理面板鉴权令牌，部署后所有 API 请求必须携带 Bearer <token>（强烈建议配置）
+#
+# 以下为可选配置项：
+# ALLOWED_ORIGIN = "https://your-pages-domain.pages.dev"  # 限制 CORS 允许的前端域名
+# WEBHOOK_URL    = "https://your-webhook-notification-url" # Webhook 推送地址
+# WEBHOOK_TYPE   = "dingtalk"                              # Webhook 类型: dingtalk / feishu / wecom / custom
+#
+# 单账号/免输入初始化（可选）：
+# DEFAULT_API_KEY    = "cfsd_xxxxxxxx"                     # 部署时直接绑定默认账号 API Key
+# DEFAULT_API_SECRET = "yyyyyyyyyyyy"                      # 部署时直接绑定默认账号 API Secret
+# DEFAULT_API_ALIAS  = "默认账号"                          # 默认账号别名

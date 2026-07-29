@@ -58,14 +58,27 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          secrets: |
-            AES_KEY
-            ADMIN_TOKEN
-            WEBHOOK_URL
+
+      - name: Sync Optional Secrets to Worker (if set)
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           AES_KEY: ${{ secrets.AES_KEY }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          if [ -n "$AES_KEY" ]; then
+            echo "🔐 正在同步更新 AES_KEY 密钥到 Cloudflare Worker..."
+            echo "$AES_KEY" | npx wrangler secret put AES_KEY || true
+          fi
+          if [ -n "$ADMIN_TOKEN" ]; then
+            echo "🔑 正在同步更新 ADMIN_TOKEN 口令到 Cloudflare Worker..."
+            echo "$ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN || true
+          fi
+          if [ -n "$WEBHOOK_URL" ]; then
+            echo "🔔 正在同步更新 WEBHOOK_URL 推送地址到 Cloudflare Worker..."
+            echo "$WEBHOOK_URL" | npx wrangler secret put WEBHOOK_URL || true
+          fi
 
       - name: Build Frontend
         run: |

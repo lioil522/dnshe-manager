@@ -142,36 +142,64 @@ export default function App() {
   const [newDnsLine, setNewDnsLine] = useState("");
   const [dnsFormOpen, setDnsFormOpen] = useState(false);
 
-  // 管理员访问口令 (ADMIN_TOKEN) 鉴权模态框状态
+  // 管理员访问口令 (ADMIN_TOKEN) 与后端 Worker 地址状态
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [inputAuthToken, setInputAuthToken] = useState(localStorage.getItem("DNSHE_ADMIN_TOKEN") || "");
+  const [backendUrl, setBackendUrl] = useState(localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "");
 
   /**
-   * 统一 API 请求封装 — 自动注入 Authorization 头部，遇到 401/403 自动触发锁屏
+   * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
    */
   const apiFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
     const token = localStorage.getItem("DNSHE_ADMIN_TOKEN");
+    const storedBackend = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
+    
+    // 如果传入相对路径以 /api 开头，根据部署环境自动补全后端基准域名
+    let finalUrl = url;
+    if (url.startsWith("/api")) {
+      if (storedBackend) {
+        finalUrl = `${storedBackend.replace(/\/$/, "")}${url}`;
+      } else if (window.location.hostname.endsWith(".pages.dev")) {
+        // 当部署在 Pages 时，自动尝试拼装默认 Worker 后端地址
+        const workerHost = window.location.hostname.replace("dnshe-manager-frontend.pages.dev", "dnshe-manager-backend.yinjiagang1-d4a.workers.dev");
+        finalUrl = `https://${workerHost}${url}`;
+      }
+    }
+
     const headers = new Headers(options.headers || {});
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
-    const res = await fetch(url, { ...options, headers });
-    if (res.status === 401 || res.status === 403) {
-      setAuthModalOpen(true);
+
+    try {
+      const res = await fetch(finalUrl, { ...options, headers });
+      if (res.status === 401 || res.status === 403) {
+        setAuthModalOpen(true);
+      }
+      return res;
+    } catch (err) {
+      // 遇网络连接异常自动提示配置后端服务
+      console.error("API Fetch Error:", err);
+      throw err;
     }
-    return res;
   };
 
-  // 保存/更新管理口令
+  // 保存/更新管理口令与后端服务地址
   const handleSaveAuthToken = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (inputAuthToken.trim()) {
       localStorage.setItem("DNSHE_ADMIN_TOKEN", inputAuthToken.trim());
-      showToast("success", "访问口令更新成功！正在刷新数据...");
     } else {
       localStorage.removeItem("DNSHE_ADMIN_TOKEN");
-      showToast("info", "已清除本地保存的口令");
     }
+
+    if (backendUrl.trim()) {
+      localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
+    } else {
+      localStorage.removeItem("DNSHE_BACKEND_URL");
+    }
+
+    showToast("success", "配置保存成功！正在重新加载数据...");
     setAuthModalOpen(false);
     fetchDomains();
     fetchAccounts();
@@ -1595,6 +1623,19 @@ export default function App() {
                   onChange={(e) => setInputAuthToken(e.target.value)}
                   placeholder="请输入 ADMIN_TOKEN"
                   className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none transition-colors"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                  后端 Worker API 地址 (可选，默认自动匹配)
+                </label>
+                <input
+                  type="text"
+                  value={backendUrl}
+                  onChange={(e) => setBackendUrl(e.target.value)}
+                  placeholder="https://dnshe-manager-backend.xxxx.workers.dev"
+                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none transition-colors"
                 />
               </div>
               <div className="flex items-center justify-end gap-3 pt-2">

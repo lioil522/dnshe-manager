@@ -276,6 +276,36 @@ app.get("/api/domains/:id/dns", async (c) => {
   }
 });
 
+// 辅助函数：DNS 记录变更后，自动重新计算并同步更新域名的三态 (已委派 / 已解析 / 未解析)
+async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client: DNSHEClient, domainId: number) {
+  try {
+    const dnsRes = await client.listDnsRecords(domainId);
+    const records = (dnsRes && dnsRes.success && Array.isArray(dnsRes.records)) ? dnsRes.records : [];
+    
+    // 是否使用自定义/第三方 NS
+    const nsRecords = records.filter(r => r.type === "NS");
+    const hasCustomNs = nsRecords.length > 0;
+    
+    let computedStatus = "未解析";
+    let hasDns = 1;
+    
+    if (hasCustomNs) {
+      computedStatus = "已委派";
+      hasDns = 0;
+    } else if (records.length > 0) {
+      computedStatus = "已解析";
+      hasDns = 1;
+    } else {
+      computedStatus = "未解析";
+      hasDns = 1;
+    }
+
+    await dbManager.updateDomainStatusAndDns(domainId, computedStatus, hasDns);
+  } catch (e) {
+    console.error(`域名状态实时更新异常 [subdomain_id: ${domainId}]:`, e);
+  }
+}
+
 // 5. 新建 DNS 解析记录 (代理接口)
 app.post("/api/domains/:id/dns", async (c) => {
   const dbManager = c.get("db");
@@ -299,6 +329,7 @@ app.post("/api/domains/:id/dns", async (c) => {
 
     if (res && res.success) {
       await dbManager.writeLog("success", "system", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${body.name || "@"} -> ${body.content}`);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "创建DNS记录成功", record: res.record }));
     } else {
       throw new Error(res.message || "创建DNS记录失败");
@@ -339,6 +370,7 @@ app.put("/api/domains/:id/dns/:record_id", async (c) => {
 
     if (res && res.success) {
       await dbManager.writeLog("success", "system", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${body.type} -> ${body.content}`);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "更新DNS记录成功" }));
     } else {
       throw new Error(res.message || "更新DNS记录失败");
@@ -367,6 +399,7 @@ app.delete("/api/domains/:id/dns/:record_id", async (c) => {
 
     if (res && res.success) {
       await dbManager.writeLog("success", "system", `删除了域名 [${domainInfo.full_domain}] 下的 DNS 记录 (ID: ${recordId})`);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "删除DNS记录成功" }));
     } else {
       throw new Error(res.message || "删除DNS记录失败");

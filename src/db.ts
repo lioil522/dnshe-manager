@@ -200,6 +200,19 @@ export class DatabaseManager {
   }
 
   /**
+   * 实时更新域名的解析状态与 NS 标记 (用于 DNS 增删改后精准即时刷新状态)
+   */
+  async updateDomainStatusAndDns(domainId: number, status: string, hasDns: number) {
+    try {
+      await this.db.prepare(
+        "UPDATE domains_cache SET status = ?, has_dns = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+      ).bind(status, hasDns, domainId).run();
+    } catch (e) {
+      console.error("Failed to update domain status and dns:", e);
+    }
+  }
+
+  /**
    * 自动清理过期日志（保留最近 30 天）
    * 
    * NOTE: 在每次 Cron 任务执行后调用此方法，防止日志无限增长

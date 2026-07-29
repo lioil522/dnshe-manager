@@ -748,6 +748,7 @@ export default function App() {
         setNewDnsContent("");
         setDnsFormOpen(false);
         handleOpenDnsModal(selectedDomain);
+        fetchDomains();
       } else {
         showToast("error", data.message || "创建解析记录失败");
       }
@@ -772,6 +773,7 @@ export default function App() {
       if (data.success) {
         showToast("success", "DNS 解析记录删除成功！");
         handleOpenDnsModal(selectedDomain);
+        fetchDomains();
       } else {
         showToast("error", data.message || "删除解析记录失败");
       }

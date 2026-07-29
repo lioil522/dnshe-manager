@@ -58,6 +58,14 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          secrets: |
+            AES_KEY
+            ADMIN_TOKEN
+            WEBHOOK_URL
+        env:
+          AES_KEY: ${{ secrets.AES_KEY }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
 
       - name: Build Frontend
         run: |

@@ -80,7 +80,48 @@ jobs:
             echo "$WEBHOOK_URL" | npx wrangler secret put WEBHOOK_URL || true
           fi
 
+      - name: Auto Fetch Worker Backend API Domain
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "🔍 正在通过 Cloudflare REST API 查询 Worker [dnshe-manager-backend] 的实际域名..."
+
+          # 1. 尝试查询账号下为该 Worker (dnshe-manager-backend) 绑定的自定义域名 Custom Domain / Routes
+          DOMAINS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/domains" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" || echo "{}")
+
+          CUSTOM_DOMAIN=$(echo "$DOMAINS_JSON" | jq -r '.result[]? | select(.service=="dnshe-manager-backend") | .hostname' 2>/dev/null | head -n 1 || echo "")
+
+          API_BASE_URL=""
+          if [ -n "$CUSTOM_DOMAIN" ] && [ "$CUSTOM_DOMAIN" != "null" ]; then
+            echo "🎉 成功抓取到绑定在 Cloudflare 上的 Worker 自定义域名: https://${CUSTOM_DOMAIN}"
+            API_BASE_URL="https://${CUSTOM_DOMAIN}"
+          else
+            # 2. 若未绑定自定义域名，尝试查询全局默认的 workers.dev 域名
+            SUBDOMAIN_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+            
+            WORKERS_SUBDOMAIN=$(echo "$SUBDOMAIN_JSON" | jq -r '.result.subdomain // empty' 2>/dev/null || echo "")
+
+            if [ -n "$WORKERS_SUBDOMAIN" ]; then
+              API_BASE_URL="https://dnshe-manager-backend.${WORKERS_SUBDOMAIN}.workers.dev"
+              echo "✨ 成功获取到 Cloudflare 默认分配的 Worker 域名: ${API_BASE_URL}"
+            fi
+          fi
+
+          if [ -n "$API_BASE_URL" ]; then
+            echo "VITE_API_BASE_URL=${API_BASE_URL}" >> $GITHUB_ENV
+            echo "✅ 成功注入环境变量 VITE_API_BASE_URL=${API_BASE_URL} 供前端构建"
+          else
+            echo "⚠️ 未能通过 Cloudflare API 自动提取出域名，前端将使用自适应降级识别模式"
+          fi
+
       - name: Build Frontend
+        env:
+          VITE_API_BASE_URL: ${{ env.VITE_API_BASE_URL }}
         run: |
           cd frontend
           npm run build

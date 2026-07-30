@@ -197,10 +197,14 @@ export default function App() {
   const [availableDomainsList, setAvailableDomainsList] = useState<Array<{ fullDomain: string; subdomain: string; rootdomain: string; time: string }>>([]);
   const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" }>>([]);
 
-  // 管理员访问口令 (ADMIN_TOKEN) 与后端 Worker 地址状态 (支持 2FA TOTP 6位动态口令)
+  // 管理员访问 2FA 动态鉴权与后端 Worker 地址状态
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const authTokenInputRef = useRef<HTMLInputElement>(null);
-  const [backendUrl, setBackendUrl] = useState(localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "");
+  const [backendUrl, setBackendUrl] = useState(
+    localStorage.getItem("DNSHE_BACKEND_URL") ||
+    (import.meta as any).env?.VITE_API_BASE_URL ||
+    "https://api-dnshe.930128.xyz"
+  );
 
   /**
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
@@ -210,15 +214,17 @@ export default function App() {
     const token = sessionStorage.getItem("DNSHE_ADMIN_TOKEN") || localStorage.getItem("DNSHE_ADMIN_TOKEN");
     const storedBackend = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
     
-    // 如果传入相对路径以 /api 开头，根据部署环境自动补全后端基准域名
+    // 如果传入相对路径以 /api 开头，智能补全后端基准域名
     let finalUrl = url;
     if (url.startsWith("/api")) {
       if (storedBackend) {
         finalUrl = `${storedBackend.replace(/\/$/, "")}${url}`;
-      } else if (window.location.hostname.endsWith(".pages.dev")) {
-        // 当部署在 Pages 时，自动尝试拼装默认 Worker 后端地址
-        const workerHost = window.location.hostname.replace("dnshe-manager-frontend.pages.dev", "dnshe-manager-backend.yinjiagang1-d4a.workers.dev");
-        finalUrl = `https://${workerHost}${url}`;
+      } else if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+        // 本地开发环境直接走 Vite 代理 relative URL
+        finalUrl = url;
+      } else {
+        // 智能匹配生产环境：优先绑定已设置的自定义域名 api-dnshe.930128.xyz
+        finalUrl = `https://api-dnshe.930128.xyz${url}`;
       }
     }
 
@@ -2516,7 +2522,7 @@ export default function App() {
                   type="text"
                   value={backendUrl}
                   onChange={(e) => setBackendUrl(e.target.value)}
-                  placeholder="https://dnshe-manager-backend.xxxx.workers.dev"
+                  placeholder="https://api-dnshe.930128.xyz"
                   className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none transition-colors font-mono"
                 />
               </div>

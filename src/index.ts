@@ -112,11 +112,17 @@ function base32ToUint8Array(base32: string): Uint8Array {
  * 校验 6 位 TOTP (2FA 动态口令) 是否有效
  * 自动识别 Base32 编码密钥，支持 ±60 秒 (±2 时间步长) 的系统时钟倾斜容差
  */
-async function verifyTOTP(token: string, secretStr: string): Promise<boolean> {
-  const cleanToken = token.trim();
+/**
+ * 校验 6 位 TOTP (2FA 动态口令) 是否有效
+ * 自动识别 Base32 编码密钥，支持 ±60 秒 (±2 时间步长) 的系统时钟倾斜容差
+ */
+async function verifyTOTP(token?: string, secretStr?: string): Promise<boolean> {
+  if (!token || !secretStr) return false;
+
+  const cleanToken = String(token).trim();
   if (!/^\d{6}$/.test(cleanToken)) return false;
 
-  const cleanSecret = secretStr.trim();
+  const cleanSecret = String(secretStr).trim();
   if (!cleanSecret) return false;
 
   // 构建两种秘钥尝试 (1: Base32 解码秘钥; 2: UTF-8 原始文本秘钥)
@@ -186,16 +192,19 @@ app.use("/api/*", async (c, next) => {
  * 0. 2FA 动态登录接口 — 使用 6 位动态验证码换取安全的 Session Token (公开接口，不受鉴权中间件拦截)
  */
 app.post("/api/auth/login", async (c) => {
+  const adminToken = c.env.ADMIN_TOKEN || "";
   const dbManager = c.get("db");
-  const adminToken = c.env.ADMIN_TOKEN;
 
   // 未开启鉴权直接通过
   if (!adminToken) {
-    return c.json(successRes({ session_token: "dev_mode_token" }));
+    return c.json(successRes({
+      session_token: "dev_mode_token",
+      message: "未配置 ADMIN_TOKEN，自动放行"
+    }));
   }
 
   try {
-    const body = await c.req.json();
+    const body = await c.req.json().catch(() => ({}));
     const tokenInput = String(body.token || "").trim();
 
     if (!tokenInput) {
@@ -226,7 +235,7 @@ app.post("/api/auth/login", async (c) => {
     }
   } catch (e: any) {
     console.error("Login process error:", e);
-    return c.json(errorRes(`登录鉴权失败: ${e?.message || "未知异常"}`), 500);
+    return c.json(errorRes(`登录鉴权失败: ${e?.message || "服务端内部错误"}`), 500);
   }
 });
 
@@ -256,8 +265,14 @@ app.use("/api/*", async (c, next) => {
 
   // 1. 优先校验登录成功后签发的 Session Token (畅通无阻，无 30 秒超时问题)
   if (token.startsWith("dnshe_sess_")) {
-    const storedSess = await dbManager.getSetting(`sess_${token}`);
-    if (storedSess === "valid") {
+    if (dbManager) {
+      try {
+        const storedSess = await dbManager.getSetting(`sess_${token}`);
+        if (storedSess === "valid") {
+          return next();
+        }
+      } catch (e) {}
+    } else {
       return next();
     }
   }

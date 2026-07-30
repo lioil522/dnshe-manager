@@ -272,16 +272,6 @@ export class DNSHEClient {
   }
 
   /**
-   * 注册新子域名
-   */
-  async registerSubdomain(subdomain: string, rootdomain: string): Promise<{ success: boolean; message?: string; subdomain_id?: number; full_domain?: string }> {
-    return this.request<{ success: boolean; message?: string; subdomain_id?: number; full_domain?: string }>("subdomains", "register", "POST", {
-      subdomain,
-      rootdomain
-    });
-  }
-
-  /**
    * WHOIS 查询域名可注册性
    */
   async whois(domain: string): Promise<{ success: boolean; domain?: string; registered?: boolean; status?: string; registered_at?: string; expires_at?: string; registrant_email?: string; nameservers?: string[]; message?: string }> {

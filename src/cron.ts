@@ -193,8 +193,10 @@ export async function runDailySyncAndRenewal(
         const nowTime = Date.now();
         const remainingDays = (expiresTime - nowTime) / (1000 * 60 * 60 * 24);
 
-        // 当剩余天数小于等于 15 天时，尝试触发自动续期
-        if (remainingDays >= 0 && remainingDays <= 15) {
+        // NOTE: DNSHE 免费域名有效期为 1 年，且平台允许随时续期。
+        // 阈值设为 350 天：只要剩余有效期不足 350 天就自动续期，
+        // 确保每轮定时任务都能尽早延长有效期，防止遗忘导致域名过期丢失。
+        if (remainingDays >= 0 && remainingDays <= 350) {
           const subId = sub.id as number;
           const fullDomain = sub.full_domain as string;
 

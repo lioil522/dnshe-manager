@@ -184,7 +184,7 @@ export default function App() {
   const [regMode, setRegMode] = useState<"single" | "batch">("single");
   const [batchRules, setBatchRules] = useState<string>("");
   const [excludeChars, setExcludeChars] = useState<string>("");
-  const [selectedRoots, setSelectedRoots] = useState<string[]>(["us.ci", "l.cd", "cn.mt", "de5.net"]);
+  const [selectedRoots, setSelectedRoots] = useState<string[]>([]);
   const [batchLength, setBatchLength] = useState<number>(2);
   const [scanStatus, setScanStatus] = useState<"idle" | "running" | "paused" | "completed">("idle");
   const scanControlRef = useRef<"idle" | "running" | "paused" | "completed">("idle");

@@ -71,52 +71,88 @@ app.use(
 );
 
 /**
+ * 标准 Base32 解码辅助函数
+ */
+function base32ToUint8Array(base32: string): Uint8Array {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const clean = base32.toUpperCase().replace(/=+$/, "");
+  let bits = 0;
+  let value = 0;
+  const output = new Uint8Array(Math.floor((clean.length * 5) / 8));
+  let index = 0;
+
+  for (let i = 0; i < clean.length; i++) {
+    const idx = alphabet.indexOf(clean[i]);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      output[index++] = (value >>> (bits - 8)) & 255;
+      bits -= 8;
+    }
+  }
+  return output.slice(0, index);
+}
+
+/**
  * 校验 6 位 TOTP (2FA 动态口令) 是否有效
- * 容差窗口为 ±30 秒 (当前时间步长 T 及前后的 T-1, T+1)
+ * 自动识别 Base32 编码密钥，支持 ±60 秒 (±2 时间步长) 的系统时钟倾斜容差
  */
 async function verifyTOTP(token: string, secretStr: string): Promise<boolean> {
   const cleanToken = token.trim();
   if (!/^\d{6}$/.test(cleanToken)) return false;
 
-  const encoder = new TextEncoder();
-  const keyData = encoder.encode(secretStr);
+  const cleanSecret = secretStr.trim();
+  if (!cleanSecret) return false;
 
-  try {
-    const cryptoKey = await crypto.subtle.importKey(
-      "raw",
-      keyData,
-      { name: "HMAC", hash: "SHA-1" },
-      false,
-      ["sign"]
-    );
+  // 构建两种秘钥尝试 (1: Base32 解码秘钥; 2: UTF-8 原始文本秘钥)
+  const keyCandidates: Uint8Array[] = [];
 
-    const nowSec = Math.floor(Date.now() / 1000);
-    const timeStep = 30;
-    const currentT = Math.floor(nowSec / timeStep);
+  if (/^[A-Z2-7=]+$/i.test(cleanSecret)) {
+    keyCandidates.push(base32ToUint8Array(cleanSecret));
+  }
+  keyCandidates.push(new TextEncoder().encode(cleanSecret));
 
-    for (let i = -1; i <= 1; i++) {
-      const t = currentT + i;
-      const buffer = new ArrayBuffer(8);
-      const view = new DataView(buffer);
-      view.setBigUint64(0, BigInt(t), false);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const timeStep = 30;
+  const currentT = Math.floor(nowSec / timeStep);
 
-      const signature = await crypto.subtle.sign("HMAC", cryptoKey, buffer);
-      const hmacBytes = new Uint8Array(signature);
+  for (const keyData of keyCandidates) {
+    if (keyData.length === 0) continue;
+    try {
+      const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        keyData,
+        { name: "HMAC", hash: "SHA-1" },
+        false,
+        ["sign"]
+      );
 
-      const offset = hmacBytes[hmacBytes.length - 1] & 0x0f;
-      const binary =
-        ((hmacBytes[offset] & 0x7f) << 24) |
-        ((hmacBytes[offset + 1] & 0xff) << 16) |
-        ((hmacBytes[offset + 2] & 0xff) << 8) |
-        (hmacBytes[offset + 3] & 0xff);
+      // 容忍 ±2 窗口 (±60秒)，极佳兼容服务器与手机系统时间倾斜
+      for (let i = -2; i <= 2; i++) {
+        const t = currentT + i;
+        const buffer = new ArrayBuffer(8);
+        const view = new DataView(buffer);
+        view.setBigUint64(0, BigInt(t), false);
 
-      const otp = (binary % 1000000).toString().padStart(6, "0");
-      if (otp === cleanToken) {
-        return true;
+        const signature = await crypto.subtle.sign("HMAC", cryptoKey, buffer);
+        const hmacBytes = new Uint8Array(signature);
+
+        const offset = hmacBytes[hmacBytes.length - 1] & 0x0f;
+        const binary =
+          ((hmacBytes[offset] & 0x7f) << 24) |
+          ((hmacBytes[offset + 1] & 0xff) << 16) |
+          ((hmacBytes[offset + 2] & 0xff) << 8) |
+          (hmacBytes[offset + 3] & 0xff);
+
+        const otp = (binary % 1000000).toString().padStart(6, "0");
+        if (otp === cleanToken) {
+          return true;
+        }
       }
+    } catch (e) {
+      console.error("TOTP verification attempt error:", e);
     }
-  } catch (e) {
-    console.error("TOTP verification error:", e);
   }
 
   return false;

@@ -197,9 +197,34 @@ export default function App() {
   const [availableDomainsList, setAvailableDomainsList] = useState<Array<{ fullDomain: string; subdomain: string; rootdomain: string; time: string }>>([]);
   const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" }>>([]);
 
-  // 管理员访问 2FA 动态鉴权状态
+  /**
+   * 动态智能推演当前环境对应的后端 Worker API 地址 (适应任意新域名)
+   */
+  const getAutoBackendUrl = (): string => {
+    const host = window.location.hostname;
+    if (!host || host === "localhost" || host === "127.0.0.1") {
+      return "";
+    }
+
+    const parts = host.split(".");
+    if (parts.length >= 2) {
+      const mainDomain = parts.slice(-2).join(".");
+      if (parts[0].startsWith("api")) {
+        return `https://${host}`;
+      }
+      return `https://api-dnshe.${mainDomain}`;
+    }
+    return `https://api-${host}`;
+  };
+
+  // 管理员访问 2FA 动态鉴权与后端 Worker 地址状态
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const authTokenInputRef = useRef<HTMLInputElement>(null);
+  const [backendUrl, setBackendUrl] = useState(
+    localStorage.getItem("DNSHE_BACKEND_URL") ||
+    (import.meta as any).env?.VITE_API_BASE_URL ||
+    ""
+  );
 
   /**
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
@@ -207,19 +232,17 @@ export default function App() {
   const apiFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
     // 优先从 sessionStorage 获取单次网页会话凭据，兼容 localStorage
     const token = sessionStorage.getItem("DNSHE_ADMIN_TOKEN") || localStorage.getItem("DNSHE_ADMIN_TOKEN");
-    const storedBackend = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
+    const storedBackend = backendUrl || localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL;
     
     // 如果传入相对路径以 /api 开头，智能补全后端基准域名
     let finalUrl = url;
     if (url.startsWith("/api")) {
-      if (storedBackend) {
-        finalUrl = `${storedBackend.replace(/\/$/, "")}${url}`;
-      } else if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
-        // 本地开发环境直接走 Vite 代理 relative URL
-        finalUrl = url;
+      const activeBackend = storedBackend || getAutoBackendUrl();
+      if (activeBackend) {
+        finalUrl = `${activeBackend.replace(/\/$/, "")}${url}`;
       } else {
-        // 智能匹配生产环境：优先绑定已设置的自定义域名 api-dnshe.930128.xyz
-        finalUrl = `https://api-dnshe.930128.xyz${url}`;
+        // 本地开发环境直接走相对路径代理
+        finalUrl = url;
       }
     }
 
@@ -258,6 +281,11 @@ export default function App() {
       }
     }
 
+    if (backendUrl.trim()) {
+      localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
+    } else {
+      localStorage.removeItem("DNSHE_BACKEND_URL");
+    }
 
     showToast("success", "安全凭据认证成功！正在重新加载数据...");
     setAuthModalOpen(false);
@@ -2501,6 +2529,23 @@ export default function App() {
                 />
                 <p className="text-[11px] text-slate-500 mt-1.5 leading-normal">
                   🔒 防 DOM 审查安全机制：凭据由加密 Ref 受控，HTML 节点绝无明文 value 露显。
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
+                  <span>后端 Worker API 地址 (自动感算，亦可手动指定):</span>
+                  <span className="text-[10px] text-emerald-400 font-mono">通用自适应</span>
+                </label>
+                <input
+                  type="text"
+                  value={backendUrl}
+                  onChange={(e) => setBackendUrl(e.target.value)}
+                  placeholder={getAutoBackendUrl() || "https://api-dnshe.your-domain.com"}
+                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none transition-colors font-mono"
+                />
+                <p className="text-[11px] text-slate-500 mt-1.5 leading-normal">
+                  💡 自动感算提示：更换任意新域名均会自动感应。若填入地址则使用手动指定的 Worker API。
                 </p>
               </div>
 

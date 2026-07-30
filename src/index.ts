@@ -128,8 +128,8 @@ async function verifyTOTP(token: string, secretStr: string): Promise<boolean> {
         ["sign"]
       );
 
-      // 容忍 ±2 窗口 (±60秒)，极佳兼容服务器与手机系统时间倾斜
-      for (let i = -2; i <= 2; i++) {
+      // 容忍 ±1 窗口 (±30秒)，精准标准时间步容差
+      for (let i = -1; i <= 1; i++) {
         const t = currentT + i;
         const buffer = new ArrayBuffer(8);
         const view = new DataView(buffer);

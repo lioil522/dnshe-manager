@@ -197,14 +197,9 @@ export default function App() {
   const [availableDomainsList, setAvailableDomainsList] = useState<Array<{ fullDomain: string; subdomain: string; rootdomain: string; time: string }>>([]);
   const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" }>>([]);
 
-  // 管理员访问 2FA 动态鉴权与后端 Worker 地址状态
+  // 管理员访问 2FA 动态鉴权状态
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const authTokenInputRef = useRef<HTMLInputElement>(null);
-  const [backendUrl, setBackendUrl] = useState(
-    localStorage.getItem("DNSHE_BACKEND_URL") ||
-    (import.meta as any).env?.VITE_API_BASE_URL ||
-    "https://api-dnshe.930128.xyz"
-  );
 
   /**
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
@@ -263,11 +258,6 @@ export default function App() {
       }
     }
 
-    if (backendUrl.trim()) {
-      localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
-    } else {
-      localStorage.removeItem("DNSHE_BACKEND_URL");
-    }
 
     showToast("success", "安全凭据认证成功！正在重新加载数据...");
     setAuthModalOpen(false);
@@ -2514,18 +2504,7 @@ export default function App() {
                 </p>
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                  后端 Worker API 地址 (可选，默认自动匹配):
-                </label>
-                <input
-                  type="text"
-                  value={backendUrl}
-                  onChange={(e) => setBackendUrl(e.target.value)}
-                  placeholder="https://api-dnshe.930128.xyz"
-                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none transition-colors font-mono"
-                />
-              </div>
+
 
               <div className="flex items-center justify-end gap-3 pt-2">
                 {(sessionStorage.getItem("DNSHE_ADMIN_TOKEN") || localStorage.getItem("DNSHE_ADMIN_TOKEN")) && (

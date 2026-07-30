@@ -146,10 +146,22 @@ export default function App() {
   const [newDnsLine, setNewDnsLine] = useState("");
   const [dnsFormOpen, setDnsFormOpen] = useState(false);
 
-  // 9 大 DNSHE 官方根域名
-  const ALL_ROOT_DOMAINS = [
+  // DNSHE 系统根域名 (支持动态添加)
+  const DEFAULT_ROOT_DOMAINS = [
     "us.ci", "l.cd", "cc.cd", "cn.mt", "bot.cd", "de5.net", "ccwu.cc", "ddns.ge", "bbroot.com"
   ];
+
+  const [allRootDomains, setAllRootDomains] = useState<string[]>(() => {
+    const saved = localStorage.getItem("DNSHE_CUSTOM_ROOT_DOMAINS");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      } catch (e) {}
+    }
+    return DEFAULT_ROOT_DOMAINS;
+  });
+  const [newRootInput, setNewRootInput] = useState("");
 
   // 域名注册与查重状态
   const [searchSubdomain, setSearchSubdomain] = useState("");
@@ -168,10 +180,10 @@ export default function App() {
   } | null>(null);
   const [registerAccountId, setRegisterAccountId] = useState<number | "">("");
 
-  // 高级字典批量扫描器状态
+  // 规则多域名查重状态
   const [regMode, setRegMode] = useState<"single" | "batch">("single");
-  const [batchRules, setBatchRules] = useState<string>("声母+韵母");
-  const [excludeChars, setExcludeChars] = useState<string>("01ol");
+  const [batchRules, setBatchRules] = useState<string>("");
+  const [excludeChars, setExcludeChars] = useState<string>("");
   const [selectedRoots, setSelectedRoots] = useState<string[]>(["us.ci", "l.cd", "cn.mt", "de5.net"]);
   const [batchLength, setBatchLength] = useState<number>(2);
   const [scanStatus, setScanStatus] = useState<"idle" | "running" | "paused" | "completed">("idle");
@@ -183,6 +195,7 @@ export default function App() {
   };
   const [scanProgress, setScanProgress] = useState<{ total: number; checked: number; available: number }>({ total: 0, checked: 0, available: 0 });
   const [availableDomainsList, setAvailableDomainsList] = useState<Array<{ fullDomain: string; subdomain: string; rootdomain: string; time: string }>>([]);
+  const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" }>>([]);
 
   // 管理员访问口令 (ADMIN_TOKEN) 与后端 Worker 地址状态
   const [authModalOpen, setAuthModalOpen] = useState(false);
@@ -847,10 +860,15 @@ export default function App() {
   };
 
   // 执行 WHOIS 域名查重
-  const handleCheckWhois = async (e?: React.FormEvent) => {
+  const handleCheckWhois = async (
+    e?: React.FormEvent,
+    overrideSub?: string,
+    overrideRoot?: string
+  ) => {
     if (e) e.preventDefault();
-    const sub = searchSubdomain.trim().toLowerCase();
-    const root = searchRootdomain.trim().toLowerCase();
+    const sub = (overrideSub !== undefined ? overrideSub : searchSubdomain).trim().toLowerCase();
+    const root = (overrideRoot !== undefined ? overrideRoot : searchRootdomain).trim().toLowerCase();
+
     if (!sub) {
       showToast("error", "请输入想要查询的子域名前缀！");
       return;
@@ -858,7 +876,6 @@ export default function App() {
 
     const fullTargetDomain = `${sub}.${root}`;
     setWhoisLoading(true);
-    setWhoisResult(null);
 
     try {
       const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(fullTargetDomain)}`);
@@ -919,7 +936,32 @@ export default function App() {
     }
   };
 
-  // 批量词库生成器
+  // 添加与删除自定义根域名 handler
+  const handleAddCustomRootDomain = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const cleanRoot = newRootInput.trim().toLowerCase().replace(/^\./, "");
+    if (!cleanRoot) return;
+    if (allRootDomains.includes(cleanRoot)) {
+      showToast("error", `根域名 [.${cleanRoot}] 已在列表中！`);
+      return;
+    }
+    const updated = [...allRootDomains, cleanRoot];
+    setAllRootDomains(updated);
+    setSelectedRoots(prev => Array.from(new Set([...prev, cleanRoot])));
+    localStorage.setItem("DNSHE_CUSTOM_ROOT_DOMAINS", JSON.stringify(updated));
+    setNewRootInput("");
+    showToast("success", `成功追加根域名 [.${cleanRoot}]！`);
+  };
+
+  const handleRemoveCustomRootDomain = (rootToRemove: string) => {
+    const updated = allRootDomains.filter(r => r !== rootToRemove);
+    setAllRootDomains(updated);
+    setSelectedRoots(prev => prev.filter(r => r !== rootToRemove));
+    localStorage.setItem("DNSHE_CUSTOM_ROOT_DOMAINS", JSON.stringify(updated));
+    showToast("info", `已移除根域名 [.${rootToRemove}]`);
+  };
+
+  // 批量词库与自定义前缀生成器
   const generatePrefixesFromRule = (rule: string, len: number, exclude: string): string[] => {
     const consonants = "bcdfghjklmnpqrstvwxyz";
     const vowels = "aeiou";
@@ -927,6 +969,22 @@ export default function App() {
     const digitsNo04 = "12356789";
     const letters = "abcdefghijklmnopqrstuvwxyz";
     const pinyin2 = ["ba","pa","ma","fa","da","ta","na","la","ga","ka","ha","ji","qi","xi","zha","cha","sha","za","ca","sa","bo","po","mo","fo","de","te","ne","le","ge","ke","he","ji","qu","xu","zu","cu","su","ya","ye","wa","wo","er","an","en","ou"];
+
+    const shortcutTags = ["字母", "数字", "数字无04", "声母", "韵母", "2位拼音", "双拼", "2位豹子", "3位豹子", "CVCV"];
+    const hasShortcutTag = shortcutTags.some(tag => rule.includes(tag));
+
+    // 当输入不包含快捷标签时，视为自定义具体前缀（支持逗号、空格、分号或换行分隔多个前缀）
+    if (!hasShortcutTag && rule.trim()) {
+      const rawCustoms = rule.trim().split(/[,;\s\n]+/);
+      let customs = rawCustoms.map(s => s.trim().toLowerCase()).filter(Boolean);
+
+      if (exclude) {
+        const exSet = new Set(exclude.split(""));
+        customs = customs.filter(sub => !sub.split("").some(c => exSet.has(c)));
+      }
+
+      return Array.from(new Set(customs));
+    }
 
     let charPool: string[] = [];
 
@@ -1003,14 +1061,22 @@ export default function App() {
       }
     }
 
+    // 多账号 API 轮询与动态限频计算：
+    // 每个 API 独立保证 1.2s (1200ms) 规程，N 个账号使得整体调度间隔为 1200ms / N（最低底线 100ms）
+    const accountCount = Math.max(1, accounts.length);
+    const delayMs = Math.max(100, Math.floor(1200 / accountCount));
+
     updateScanStatus("running");
     setScanProgress({ total: totalTasks.length, checked: 0, available: availableDomainsList.length });
-    showToast("info", `🚀 开始生成查询！共计构建 ${totalTasks.length} 个待查域名任务`);
+    showToast(
+      "info",
+      `🚀 开始多账号轮询查重！绑定 ${accountCount} 个 API 账号，全局调度间隔 ${delayMs}ms（每个 API 独立保障 1.2s 限频），查重速度提升 ${accountCount} 倍！`
+    );
 
     for (let i = 0; i < totalTasks.length; i++) {
       // 检查停止或重置状态
       if ((scanControlRef.current as string) === "idle") {
-        showToast("info", "扫描已终止");
+        showToast("info", "查重任务已终止");
         return;
       }
 
@@ -1018,32 +1084,49 @@ export default function App() {
       while ((scanControlRef.current as string) === "paused") {
         await new Promise((r) => setTimeout(r, 300));
         if ((scanControlRef.current as string) === "idle") {
-          showToast("info", "扫描已终止");
+          showToast("info", "查重任务已终止");
           return;
         }
       }
 
       const task = totalTasks[i];
+      // 轮询选取当前账号
+      const currentAccount = accounts.length > 0 ? accounts[i % accounts.length] : null;
+      const accountQuery = currentAccount ? `&account_id=${currentAccount.id}` : "";
+      const nowTime = new Date().toLocaleTimeString();
+      const accAlias = currentAccount ? currentAccount.alias : "公共轮询";
+
       try {
-        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.full)}`);
+        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.full)}${accountQuery}`);
         const data = await res.json();
         
         if (data.success && data.whois && data.whois.registered === false) {
-          const nowTime = new Date().toLocaleTimeString();
           setAvailableDomainsList(prev => [
             { fullDomain: task.full, subdomain: task.sub, rootdomain: task.root, time: nowTime },
             ...prev
           ]);
           setScanProgress(p => ({ ...p, checked: i + 1, available: p.available + 1 }));
+          setScanLogs(prev => [
+            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 🎉 尚未注册（可立即在线注册！）`, status: "available" },
+            ...prev.slice(0, 49)
+          ]);
         } else {
           setScanProgress(p => ({ ...p, checked: i + 1 }));
+          setScanLogs(prev => [
+            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 已被他人注册`, status: "registered" },
+            ...prev.slice(0, 49)
+          ]);
         }
       } catch (err) {
         setScanProgress(p => ({ ...p, checked: i + 1 }));
+        setScanLogs(prev => [
+          { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ ⚠️ 查询请求异常，已跳过`, status: "error" },
+          ...prev.slice(0, 49)
+        ]);
       }
 
-      // 请求休眠，遵守 1.2 秒限频规程
-      await new Promise(r => setTimeout(r, 1200));
+      // 根据账号数量按比例自动缩短全局轮询休眠间隔
+      await new Promise(r => setTimeout(r, delayMs));
     }
 
     if (scanControlRef.current === "running") {
@@ -1186,7 +1269,7 @@ export default function App() {
                     : "text-slate-400 hover:text-slate-200 hover:bg-dark-850"
                 }`}
               >
-                <Sparkles className="w-4 h-4 text-amber-400" /> 高级规则字典爆破扫描
+                <Sparkles className="w-4 h-4 text-amber-400" /> 规则多域名查重
               </button>
             </div>
 
@@ -1197,7 +1280,7 @@ export default function App() {
                 <div className="bg-dark-900 border border-dark-800 rounded-2xl p-6 shadow-xl space-y-6">
                   <div>
                     <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                      <Search className="w-5 h-5 text-indigo-400" /> 单精准域名 WHOIS 查重与抢注
+                      <Search className="w-5 h-5 text-indigo-400" /> 单精准域名 WHOIS 查重与注册
                     </h3>
                     <p className="text-xs text-slate-400 mt-1">
                       输入您心仪的二级前缀，选择 9 大免费根域名之一，实时检测域名注册状态及 WHOIS 到期详细信息。
@@ -1227,7 +1310,7 @@ export default function App() {
                         onChange={(e) => setSearchRootdomain(e.target.value)}
                         className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-xl px-4 py-3 text-sm text-white focus:outline-none"
                       >
-                        {ALL_ROOT_DOMAINS.map((rd) => (
+                        {allRootDomains.map((rd) => (
                           <option key={rd} value={rd}>
                             .{rd}
                           </option>
@@ -1252,7 +1335,7 @@ export default function App() {
                 {whoisResult && (
                   <div>
                     {!whoisResult.registered ? (
-                      /* 未注册：绿色可抢注卡片 */
+                      /* 未注册：绿色可注册卡片 */
                       <div className="bg-dark-900 border border-emerald-500/30 rounded-2xl p-6 shadow-xl space-y-4">
                         <div className="flex items-center justify-between border-b border-dark-800 pb-4">
                           <div>
@@ -1265,14 +1348,14 @@ export default function App() {
                           </div>
                           <div className="text-emerald-400 text-sm font-semibold flex items-center gap-1">
                             <CheckCircle2 className="w-5 h-5" />
-                            该域名目前仍处于未注册状态，可以立即在线抢注！
+                            该域名目前仍处于未注册状态，可以立即在线注册！
                           </div>
                         </div>
 
                         <div className="flex flex-col sm:flex-row items-center gap-4 pt-2">
                           <div className="w-full sm:w-1/2">
                             <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                              选择抢注的目标账号:
+                              选择注册的目标账号:
                             </label>
                             <select
                               value={registerAccountId}
@@ -1298,7 +1381,7 @@ export default function App() {
                               className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                               <Plus className="w-4 h-4" />
-                              {actionLoading === "register-subdomain" ? "正在抢注中..." : "一键抢注该域名"}
+                              {actionLoading === "register-subdomain" ? "正在注册中..." : "一键注册该域名"}
                             </button>
                           </div>
                         </div>
@@ -1345,7 +1428,7 @@ export default function App() {
               </div>
             )}
 
-            {/* 模式 B: 高级规则字典爆破扫描控制台 */}
+            {/* 模式 B: 规则多域名查重控制台 */}
             {regMode === "batch" && (
               <div className="space-y-6">
                 
@@ -1362,7 +1445,7 @@ export default function App() {
                         type="text"
                         value={batchRules}
                         onChange={(e) => setBatchRules(e.target.value)}
-                        placeholder="支持使用快捷标签或自定义规则（如 声母+韵母 或 数字）"
+                        placeholder="例如: myapp, test123 或点击下方快捷标签（如 声母+韵母）"
                         className="w-full bg-transparent py-3 text-white text-sm focus:outline-none"
                       />
                       <span className="text-xs text-indigo-400 font-bold whitespace-nowrap px-2">ⓘ 规则就绪</span>
@@ -1373,13 +1456,13 @@ export default function App() {
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div className="md:col-span-2 space-y-2">
                       <label className="block text-xs font-semibold text-slate-400">
-                        排除字符 (多个请用逗号分割，若域名中出现定义的字符，则忽略):
+                        排除字符 (可选，若域名中出现定义的字符，则忽略):
                       </label>
                       <input
                         type="text"
                         value={excludeChars}
                         onChange={(e) => setExcludeChars(e.target.value)}
-                        placeholder="例如 01ol 避免字符易混淆"
+                        placeholder="例如 01ol 避免字符易混淆 (可选)"
                         className="w-full bg-dark-950 border border-dark-800 rounded-xl px-4 py-2.5 text-white text-xs focus:border-indigo-500 focus:outline-none"
                       />
                     </div>
@@ -1419,18 +1502,18 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 4. 根域名后缀多选组 */}
+                  {/* 4. 根域名后缀多选组 (支持添加自定义根域名) */}
                   <div className="space-y-3 border-t border-dark-800 pt-5">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                       <label className="text-xs font-semibold text-slate-300">
-                        选择欲扫码检测的 DNSHE 官方根域名后缀:
+                        选择欲检测的 DNSHE 官方及自定义根域名后缀:
                       </label>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-3">
                         <button
-                          onClick={() => setSelectedRoots([...ALL_ROOT_DOMAINS])}
+                          onClick={() => setSelectedRoots([...allRootDomains])}
                           className="text-xs text-indigo-400 hover:underline"
                         >
-                          全选
+                          全选 ({allRootDomains.length})
                         </button>
                         <span className="text-slate-600">|</span>
                         <button
@@ -1442,35 +1525,68 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-9 gap-2">
-                      {ALL_ROOT_DOMAINS.map((root) => {
+                    {/* 根域名复选框网格 */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-2">
+                      {allRootDomains.map((root) => {
                         const isChecked = selectedRoots.includes(root);
+                        const isDefault = DEFAULT_ROOT_DOMAINS.includes(root);
                         return (
-                          <label
+                          <div
                             key={root}
-                            className={`flex items-center gap-2 p-2 rounded-lg border text-xs font-mono cursor-pointer transition-all ${
+                            className={`group relative flex items-center justify-between p-2 rounded-lg border text-xs font-mono transition-all ${
                               isChecked
                                 ? "bg-indigo-950/40 border-indigo-500/50 text-indigo-300"
                                 : "bg-dark-950 border-dark-800 text-slate-500 hover:text-slate-300"
                             }`}
                           >
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={(e) => {
-                                if (e.target.checked) {
-                                  setSelectedRoots(prev => [...prev, root]);
-                                } else {
-                                  setSelectedRoots(prev => prev.filter(r => r !== root));
-                                }
-                              }}
-                              className="rounded border-dark-800 text-indigo-600 focus:ring-0"
-                            />
-                            .{root}
-                          </label>
+                            <label className="flex items-center gap-2 cursor-pointer w-full overflow-hidden">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedRoots(prev => Array.from(new Set([...prev, root])));
+                                  } else {
+                                    setSelectedRoots(prev => prev.filter(r => r !== root));
+                                  }
+                                }}
+                                className="rounded border-dark-800 text-indigo-600 focus:ring-0"
+                              />
+                              <span className="truncate">.{root}</span>
+                            </label>
+
+                            {!isDefault && (
+                              <button
+                                type="button"
+                                title="删除该自定义根域名"
+                                onClick={() => handleRemoveCustomRootDomain(root)}
+                                className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-red-400 p-0.5 ml-1 transition-opacity"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
                         );
                       })}
                     </div>
+
+                    {/* 添加自定义根域名输入栏 */}
+                    <form onSubmit={handleAddCustomRootDomain} className="flex items-center gap-2 pt-1 max-w-sm">
+                      <input
+                        type="text"
+                        placeholder="添加新根域名(如 sample.cd)"
+                        value={newRootInput}
+                        onChange={(e) => setNewRootInput(e.target.value)}
+                        className="bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none flex-1 font-mono"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!newRootInput.trim()}
+                        className="bg-dark-850 hover:bg-dark-800 text-indigo-400 hover:text-indigo-300 border border-dark-800 text-xs px-3 py-1.5 rounded-lg transition-all flex items-center gap-1 disabled:opacity-40"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> 添加根域
+                      </button>
+                    </form>
                   </div>
 
                   {/* 5. 主控制按钮条 */}
@@ -1481,13 +1597,13 @@ export default function App() {
                       className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 disabled:opacity-50"
                     >
                       <Play className={`w-4 h-4 ${scanStatus === "running" ? "animate-spin" : ""}`} />
-                      {scanStatus === "running" ? "正在扫码中..." : scanStatus === "paused" ? "恢复查询" : "开始生成查询"}
+                      {scanStatus === "running" ? "正在查重中..." : scanStatus === "paused" ? "恢复查询" : "开始生成查询"}
                     </button>
 
                     <button
                       onClick={() => {
                         updateScanStatus("paused");
-                        showToast("info", "⏸️ 扫码查询已暂停");
+                        showToast("info", "⏸️ 域名查重已暂停");
                       }}
                       disabled={scanStatus !== "running"}
                       className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-sm px-5 py-3 rounded-xl transition-all disabled:opacity-50"
@@ -1499,8 +1615,9 @@ export default function App() {
                       onClick={() => {
                         updateScanStatus("idle");
                         setAvailableDomainsList([]);
+                        setScanLogs([]);
                         setScanProgress({ total: 0, checked: 0, available: 0 });
-                        showToast("info", "🔄 已重置扫描器");
+                        showToast("info", "🔄 已重置查重逻辑");
                       }}
                       className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-sm px-5 py-3 rounded-xl transition-all"
                     >
@@ -1522,8 +1639,8 @@ export default function App() {
                 {scanProgress.total > 0 && (
                   <div className="bg-dark-900 border border-dark-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
-                      <span>扫描进度: {scanProgress.checked} / {scanProgress.total} ({Math.round((scanProgress.checked / scanProgress.total) * 100)}%)</span>
-                      <span className="text-emerald-400 font-bold">🎉 已抢发现可用免费域名: {availableDomainsList.length} 个</span>
+                      <span>查重进度: {scanProgress.checked} / {scanProgress.total} ({Math.round((scanProgress.checked / scanProgress.total) * 100)}%)</span>
+                      <span className="text-emerald-400 font-bold">🎉 发现可用免费域名: {availableDomainsList.length} 个</span>
                     </div>
 
                     {/* 进度条 */}
@@ -1538,12 +1655,12 @@ export default function App() {
                     <div className="space-y-3 pt-2">
                       <h4 className="text-sm font-bold text-white flex items-center gap-2">
                         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                        发现未注册可用域名大盘 (点击一键抢注)
+                        发现未注册可用域名大盘 (点击一键注册)
                       </h4>
 
                       {availableDomainsList.length === 0 ? (
                         <div className="text-center py-8 bg-dark-950/40 rounded-xl border border-dark-800 text-xs text-slate-500">
-                          {scanStatus === "running" ? "正在高频扫描校验中，请稍候..." : "暂未扫出可用的域名"}
+                          {scanStatus === "running" ? "正在高频查重校验中，请稍候..." : "暂未查出可用的域名"}
                         </div>
                       ) : (
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
@@ -1563,19 +1680,66 @@ export default function App() {
 
                               <button
                                 onClick={() => {
-                                  setSearchSubdomain(item.subdomain);
-                                  setSearchRootdomain(item.rootdomain);
+                                  const sub = item.subdomain;
+                                  const root = item.rootdomain;
+                                  setSearchSubdomain(sub);
+                                  setSearchRootdomain(root);
                                   setRegMode("single");
-                                  handleCheckWhois();
+                                  if (accounts.length > 0 && !registerAccountId) {
+                                    setRegisterAccountId(accounts[0].id);
+                                  }
+                                  // 瞬发呈现绿色【尚未注册】卡片，提升即时响应体验
+                                  setWhoisResult({
+                                    searchedDomain: item.fullDomain,
+                                    registered: false
+                                  });
+                                  // 显式带参数自动触发后台 WHOIS 重新拉取详细元数据
+                                  handleCheckWhois(undefined, sub, root);
                                 }}
                                 className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-1.5 rounded-lg shadow transition-all flex items-center gap-1"
                               >
-                                <Plus className="w-3.5 h-3.5" /> 抢注
+                                <Plus className="w-3.5 h-3.5" /> 注册
                               </button>
                             </div>
                           ))}
                         </div>
                       )}
+                    </div>
+
+                    {/* 实时爆破扫描中文日志卡片 */}
+                    <div className="space-y-3 pt-4 border-t border-dark-800">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                          <ScrollText className="w-4 h-4 text-indigo-400" />
+                          实时爆破扫描中文日志 (自动滚动最新 50 条)
+                        </h4>
+                        <span className="text-xs text-slate-500 font-mono">
+                          {scanLogs.length > 0 ? `最新推送: ${scanLogs[0].time}` : "等待扫码响应..."}
+                        </span>
+                      </div>
+
+                      <div className="bg-dark-950/90 rounded-xl p-3.5 border border-dark-800 font-mono text-xs max-h-56 overflow-y-auto space-y-1.5 scrollbar-thin">
+                        {scanLogs.length === 0 ? (
+                          <div className="text-center py-6 text-slate-600">
+                            正在高频检测中，实时中文日志流水将在此处高频输出...
+                          </div>
+                        ) : (
+                          scanLogs.map((log) => (
+                            <div key={log.id} className="flex items-center gap-2 border-b border-dark-900/60 pb-1 last:border-0">
+                              <span className="text-slate-500 font-semibold">[{log.time}]</span>
+                              <span className={
+                                log.status === "available"
+                                  ? "text-emerald-400 font-bold"
+                                  : log.status === "error"
+                                  ? "text-amber-400"
+                                  : "text-slate-400"
+                              }>
+                                {log.text}
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}

@@ -488,20 +488,25 @@ app.post("/api/logs/clear", async (c) => {
  */
 app.get("/api/whois", async (c) => {
   const domain = c.req.query("domain");
+  const accountIdParam = c.req.query("account_id");
   if (!domain) {
     return c.json(errorRes("必须提供完整的域名参数 (例如 test.us.ci)", "bad_request"), 400);
   }
 
   const dbManager = c.get("db");
   try {
-    // 尝试使用已绑定的账号进行查询（以防官方开启了 API Key 验证要求）
-    const accounts = await dbManager.getAccounts();
     let client: DNSHEClient;
-    if (accounts.length > 0) {
-      const auth = await dbManager.getClientForAccount(accounts[0].id);
+    if (accountIdParam) {
+      const auth = await dbManager.getClientForAccount(Number(accountIdParam));
       client = auth.client;
     } else {
-      client = new DNSHEClient("public", "public");
+      const accounts = await dbManager.getAccounts();
+      if (accounts.length > 0) {
+        const auth = await dbManager.getClientForAccount(accounts[0].id);
+        client = auth.client;
+      } else {
+        client = new DNSHEClient("public", "public");
+      }
     }
 
     const res = await client.whois(domain.trim());

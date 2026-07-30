@@ -159,47 +159,58 @@ async function verifyTOTP(token: string, secretStr: string): Promise<boolean> {
 }
 
 /**
- * 鉴权中间件 — 所有 /api/* 请求必须携带有效的 Bearer Token (支持 2FA 6位动态口令或静态 Secret)
- * 
- * NOTE: 当未配置 ADMIN_TOKEN 环境变量时，跳过鉴权（便于本地开发调试）。
- * 部署生产环境时，务必通过 `wrangler secret put ADMIN_TOKEN` 注入密钥。
+ * DatabaseManager 实例化中间件 — 注入 dbManager 到 context
  */
 app.use("/api/*", async (c, next) => {
+  const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
+  await dbManager.ensureTables();
+  c.set("db", dbManager);
+  return next();
+});
+
+/**
+ * 鉴权中间件 — 验证 Session 会话 Token 或 2FA 6位动态验证码
+ */
+app.use("/api/*", async (c, next) => {
+  // 放行 2FA 登录与二维码配置等公开接口
+  if (c.req.path === "/api/auth/login" || c.req.path === "/api/auth/totp-setup") {
+    return next();
+  }
+
   const adminToken = c.env.ADMIN_TOKEN;
 
-  // 未配置 ADMIN_TOKEN 时跳过鉴权，便于开发环境调试
+  // 未配置 ADMIN_TOKEN 时跳过鉴权，便于本地开发调试
   if (!adminToken) {
     return next();
   }
 
   const authHeader = c.req.header("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return c.json(errorRes("未提供有效的 Authorization 头部，格式应为: Bearer <token>", "unauthorized"), 401);
+    return c.json(errorRes("未提供有效的 Authorization 头部，格式应为: Bearer <session_token>", "unauthorized"), 401);
   }
 
   const token = authHeader.substring(7).trim();
+  const dbManager = c.get("db");
 
-  // 1. 支持 2FA TOTP 6位动态验证码
+  // 1. 优先校验登录成功后签发的 Session Token (畅通无阻，无 30 秒超时问题)
+  if (token.startsWith("dnshe_sess_")) {
+    const storedSess = await dbManager.getSetting(`sess_${token}`);
+    if (storedSess === "valid") {
+      return next();
+    }
+  }
+
+  // 2. 校验 6 位 TOTP 动态验证码
   const isTotpValid = await verifyTOTP(token, adminToken);
   if (isTotpValid) {
     return next();
   }
 
-  // 2. 支持传统静态 Token
+  // 3. 兼容传统静态 ADMIN_TOKEN
   if (token === adminToken) {
     return next();
   }
 
-  return c.json(errorRes("认证失败：动态 2FA 验证码或管理口令无效", "forbidden"), 403);
-});
-
-/**
- * DatabaseManager 实例化中间件 — 避免在每个路由中重复创建
- * 
- * NOTE: 通过 Hono 的 Variables 机制，将 dbManager 注入到上下文中，
- * 后续路由通过 c.get("db") 获取，消除了 16 处重复的 new DatabaseManager(...) 代码。
- */
-app.use("/api/*", async (c, next) => {
   const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
   await dbManager.ensureTables();
   c.set("db", dbManager);

@@ -87,19 +87,43 @@ jobs:
         run: |
           echo "🔍 正在通过 Cloudflare REST API 查询 Worker [dnshe-manager-backend] 的实际域名..."
 
-          # 1. 尝试查询账号下为该 Worker (dnshe-manager-backend) 绑定的自定义域名 Custom Domain / Routes
+          # 1. 尝试查询账号下为该 Worker (dnshe-manager-backend) 绑定的自定义域名 Custom Domain
           DOMAINS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/domains" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" || echo "{}")
 
           CUSTOM_DOMAIN=$(echo "$DOMAINS_JSON" | jq -r '.result[]? | select(.service=="dnshe-manager-backend") | .hostname' 2>/dev/null | head -n 1 || echo "")
 
+          # 2. 若未在 Custom Domains 中找到，尝试从 Cloudflare Worker Routes 路由列表中查找 (兼容【+ 添加路由】模式)
+          if [ -z "$CUSTOM_DOMAIN" ] || [ "$CUSTOM_DOMAIN" == "null" ]; then
+            ZONES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?per_page=50" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+            
+            ZONE_IDS=$(echo "$ZONES_JSON" | jq -r '.result[]?.id' 2>/dev/null || echo "")
+            for ZID in $ZONE_IDS; do
+              ROUTES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZID}/workers/routes" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" || echo "{}")
+              
+              ROUTE_PATTERN=$(echo "$ROUTES_JSON" | jq -r '.result[]? | select(.script=="dnshe-manager-backend" or .service=="dnshe-manager-backend") | .pattern' 2>/dev/null | head -n 1 || echo "")
+              if [ -n "$ROUTE_PATTERN" ] && [ "$ROUTE_PATTERN" != "null" ]; then
+                CLEAN_DOMAIN=$(echo "$ROUTE_PATTERN" | sed 's/\*//g' | sed 's/\/*$//' | sed 's/^\/*//')
+                if [ -n "$CLEAN_DOMAIN" ]; then
+                  CUSTOM_DOMAIN="$CLEAN_DOMAIN"
+                  echo "🎉 成功从 Cloudflare 路由 (Routes) 中识别到自定义域名: https://${CUSTOM_DOMAIN}"
+                  break
+                fi
+              fi
+            done
+          fi
+
           API_BASE_URL=""
           if [ -n "$CUSTOM_DOMAIN" ] && [ "$CUSTOM_DOMAIN" != "null" ]; then
-            echo "🎉 成功抓取到绑定在 Cloudflare 上的 Worker 自定义域名: https://${CUSTOM_DOMAIN}"
+            echo "🎉 成功抓取到 Worker 自定义域名: https://${CUSTOM_DOMAIN}"
             API_BASE_URL="https://${CUSTOM_DOMAIN}"
           else
-            # 2. 若未绑定自定义域名，尝试查询全局默认的 workers.dev 域名
+            # 3. 若未绑定任何自定义路由/域名，尝试查询全局默认的 workers.dev 域名
             SUBDOMAIN_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" || echo "{}")

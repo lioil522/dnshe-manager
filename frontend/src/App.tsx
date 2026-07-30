@@ -267,30 +267,50 @@ export default function App() {
     }
   };
 
-  // 保存/更新管理口令与后端服务地址
-  const handleSaveAuthToken = (e?: React.FormEvent) => {
+  // 提交 2FA 动态码登录鉴权与换取 Session Token
+  const handleSaveAuthToken = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const tokenVal = authTokenInputRef.current?.value || "";
 
-    if (tokenVal.trim()) {
-      // 存储于 sessionStorage (关闭网页/新打开网页即刻失效，实现每次打开网页均需重新验证)
-      sessionStorage.setItem("DNSHE_ADMIN_TOKEN", tokenVal.trim());
-      // 安全清理 DOM 节点明文 value，防止 F12 查看 Elements
-      if (authTokenInputRef.current) {
-        authTokenInputRef.current.value = "";
+    if (!tokenVal.trim()) {
+      showToast("error", "请输入 2FA 动态验证码");
+      return;
+    }
+
+    try {
+      setActionLoading("login");
+      const res = await apiFetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: tokenVal.trim() })
+      });
+      const data = await res.json();
+
+      if (data.success && data.session_token) {
+        // 存储长期 Session 会话 Token (当前网页无 30 秒超时，网页关闭后自动清理)
+        sessionStorage.setItem("DNSHE_ADMIN_TOKEN", data.session_token);
+        if (authTokenInputRef.current) {
+          authTokenInputRef.current.value = "";
+        }
+
+        if (backendUrl.trim()) {
+          localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
+        } else {
+          localStorage.removeItem("DNSHE_BACKEND_URL");
+        }
+
+        showToast("success", data.message || "🎉 2FA 动态鉴权成功！");
+        setAuthModalOpen(false);
+        fetchDomains();
+        fetchAccounts();
+      } else {
+        showToast("error", data.message || "动态 2FA 验证码错误或已过期");
       }
+    } catch (err) {
+      showToast("error", "登录鉴权请求失败，请检查网络连接");
+    } finally {
+      setActionLoading(null);
     }
-
-    if (backendUrl.trim()) {
-      localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
-    } else {
-      localStorage.removeItem("DNSHE_BACKEND_URL");
-    }
-
-    showToast("success", "安全凭据认证成功！正在重新加载数据...");
-    setAuthModalOpen(false);
-    fetchDomains();
-    fetchAccounts();
   };
 
   // 自动淡出 Toast 提示

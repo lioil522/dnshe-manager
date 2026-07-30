@@ -206,7 +206,8 @@ export default function App() {
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
    */
   const apiFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
-    const token = localStorage.getItem("DNSHE_ADMIN_TOKEN");
+    // 优先从 sessionStorage 获取单次网页会话凭据，兼容 localStorage
+    const token = sessionStorage.getItem("DNSHE_ADMIN_TOKEN") || localStorage.getItem("DNSHE_ADMIN_TOKEN");
     const storedBackend = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
     
     // 如果传入相对路径以 /api 开头，根据部署环境自动补全后端基准域名
@@ -229,6 +230,9 @@ export default function App() {
     try {
       const res = await fetch(finalUrl, { ...options, headers });
       if (res.status === 401 || res.status === 403) {
+        // 遇 401/403 立即清理已过期的单次凭据并唤起鉴权弹窗
+        sessionStorage.removeItem("DNSHE_ADMIN_TOKEN");
+        localStorage.removeItem("DNSHE_ADMIN_TOKEN");
         setAuthModalOpen(true);
       }
       return res;
@@ -245,7 +249,8 @@ export default function App() {
     const tokenVal = authTokenInputRef.current?.value || "";
 
     if (tokenVal.trim()) {
-      localStorage.setItem("DNSHE_ADMIN_TOKEN", tokenVal.trim());
+      // 存储于 sessionStorage (关闭网页/新打开网页即刻失效，实现每次打开网页均需重新验证)
+      sessionStorage.setItem("DNSHE_ADMIN_TOKEN", tokenVal.trim());
       // 安全清理 DOM 节点明文 value，防止 F12 查看 Elements
       if (authTokenInputRef.current) {
         authTokenInputRef.current.value = "";
@@ -2517,18 +2522,19 @@ export default function App() {
               </div>
 
               <div className="flex items-center justify-end gap-3 pt-2">
-                {localStorage.getItem("DNSHE_ADMIN_TOKEN") && (
+                {(sessionStorage.getItem("DNSHE_ADMIN_TOKEN") || localStorage.getItem("DNSHE_ADMIN_TOKEN")) && (
                   <button
                     type="button"
                     onClick={() => {
                       if (authTokenInputRef.current) authTokenInputRef.current.value = "";
+                      sessionStorage.removeItem("DNSHE_ADMIN_TOKEN");
                       localStorage.removeItem("DNSHE_ADMIN_TOKEN");
                       setAuthModalOpen(false);
-                      showToast("info", "已清除本地凭据");
+                      showToast("info", "已清除本地 2FA 凭据");
                     }}
                     className="text-xs text-slate-400 hover:text-slate-200 underline px-2 py-1"
                   >
-                    清除本地凭据
+                    清除凭据
                   </button>
                 )}
                 <button

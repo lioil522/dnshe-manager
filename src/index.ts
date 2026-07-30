@@ -208,8 +208,14 @@ app.post("/api/auth/login", async (c) => {
     if (isTotpValid || isStaticValid) {
       // 生成安全的长期 Session Token (当前网页无 30 秒超时，网页关闭后自动清理)
       const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-      await dbManager.setSetting(`sess_${sessionToken}`, "valid");
-      await dbManager.writeLog("info", "system", "管理员通过 2FA 动态鉴权成功登录");
+      if (dbManager) {
+        try {
+          await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+          await dbManager.writeLog("info", "system", "管理员通过 2FA 动态鉴权成功登录");
+        } catch (dbErr) {
+          console.error("Session storage DB error (non-fatal):", dbErr);
+        }
+      }
 
       return c.json(successRes({
         session_token: sessionToken,
@@ -218,8 +224,9 @@ app.post("/api/auth/login", async (c) => {
     } else {
       return c.json(errorRes("2FA 动态验证码错误或已过期，请重新输入手机 APP 最新的 6 位数字"), 401);
     }
-  } catch (e) {
-    return c.json(errorRes("登录鉴权请求处理失败"), 500);
+  } catch (e: any) {
+    console.error("Login process error:", e);
+    return c.json(errorRes(`登录鉴权失败: ${e?.message || "未知异常"}`), 500);
   }
 });
 
@@ -227,6 +234,11 @@ app.post("/api/auth/login", async (c) => {
  * 鉴权中间件 — 验证受保护 API 的 Session 会话 Token 或 2FA 6位动态验证码
  */
 app.use("/api/*", async (c, next) => {
+  // 显式放行 2FA 登录与二维码配置等公开接口
+  if (c.req.path === "/api/auth/login" || c.req.path === "/api/auth/totp-setup") {
+    return next();
+  }
+
   const adminToken = c.env.ADMIN_TOKEN;
 
   // 未配置 ADMIN_TOKEN 时跳过鉴权，便于本地开发调试

@@ -280,7 +280,16 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: tokenVal.trim() })
       });
-      const data = await res.json();
+
+      const rawText = await res.text();
+      let data: any = {};
+      try {
+        data = JSON.parse(rawText);
+      } catch (parseErr) {
+        console.error("Non-JSON API Response:", rawText);
+        showToast("error", `鉴权处理响应失败 (${res.status}): ${rawText.substring(0, 60)}`);
+        return;
+      }
 
       if (data.success && data.session_token) {
         // 存储长期 Session 会话 Token (当前网页无 30 秒超时，网页关闭后自动清理)

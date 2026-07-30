@@ -35,22 +35,30 @@ jobs:
           if [ -n "$DB_ID" ]; then
             echo "✅ 使用 GitHub Secret 中配置的 CLOUDFLARE_D1_DATABASE_ID: $DB_ID"
           else
-            echo "🔍 尝试自动查询/创建 Cloudflare D1 数据库..."
-            DB_LIST=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
-            DB_ID=$(echo "$DB_LIST" | jq -r '.[] | select(.name=="dnshe-manager-db") | .uuid' 2>/dev/null || echo "")
+            echo "🔍 正在通过 Cloudflare REST API 自动查询 D1 数据库 [dnshe-manager-db]..."
+            
+            D1_LIST=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+            
+            DB_ID=$(echo "$D1_LIST" | jq -r '.result[]? | select(.name=="dnshe-manager-db") | .uuid' 2>/dev/null | head -n 1 || echo "")
 
             if [ -z "$DB_ID" ] || [ "$DB_ID" == "null" ]; then
-              echo "⚡ 尝试创建 D1 数据库 [dnshe-manager-db]..."
-              CREATE_RES=$(npx wrangler d1 create dnshe-manager-db --json 2>/dev/null || echo "")
-              DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // .uuid // empty' 2>/dev/null || echo "")
+              echo "⚡ 正在为您在 Cloudflare 自动一键创建 D1 数据库 [dnshe-manager-db]..."
+              CREATE_RES=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d '{"name":"dnshe-manager-db"}' || echo "{}")
+              
+              DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // empty' 2>/dev/null || echo "")
             fi
           fi
 
           if [ -n "$DB_ID" ] && [ "$DB_ID" != "null" ]; then
             sed -i "s/change_me_to_your_d1_db_id/$DB_ID/g" wrangler.toml
-            echo "🎉 成功将 D1 数据库 ID [$DB_ID] 绑定写入 wrangler.toml"
+            echo "🎉 成功将 D1 数据库 ID [$DB_ID] 自动绑定写入 wrangler.toml"
           else
-            echo "⚠️ 未能获取到 D1 数据库 ID。请在 GitHub Secret 中添加 CLOUDFLARE_D1_DATABASE_ID"
+            echo "⚠️ 未能自动获取/创建 D1 数据库 ID，请检查 API Token 权限是否包含 [D1:编辑]"
           fi
 
       - name: Deploy Worker Backend

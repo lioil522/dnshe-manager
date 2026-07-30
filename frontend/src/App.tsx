@@ -220,11 +220,7 @@ export default function App() {
   // 管理员访问 2FA 动态鉴权与后端 Worker 地址状态
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const authTokenInputRef = useRef<HTMLInputElement>(null);
-  const [backendUrl, setBackendUrl] = useState(
-    localStorage.getItem("DNSHE_BACKEND_URL") ||
-    (import.meta as any).env?.VITE_API_BASE_URL ||
-    ""
-  );
+  const backendUrl = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
 
   /**
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
@@ -2552,22 +2548,7 @@ export default function App() {
                 </p>
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
-                  <span>后端 Worker API 地址 (自动感算，亦可手动指定):</span>
-                  <span className="text-[10px] text-emerald-400 font-mono">通用自适应</span>
-                </label>
-                <input
-                  type="text"
-                  value={backendUrl}
-                  onChange={(e) => setBackendUrl(e.target.value)}
-                  placeholder={getAutoBackendUrl() || "https://api-dnshe.your-domain.com"}
-                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none transition-colors font-mono"
-                />
-                <p className="text-[11px] text-slate-500 mt-1.5 leading-normal">
-                  💡 自动感算提示：更换任意新域名均会自动感应。若填入地址则使用手动指定的 Worker API。
-                </p>
-              </div>
+
 
 
 

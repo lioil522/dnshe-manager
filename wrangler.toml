@@ -1,6 +1,7 @@
 name = "dnshe-manager-backend"
 main = "src/index.ts"
 compatibility_date = "2024-04-01"
+workers_dev = false
 
 # 绑定 D1 数据库
 [[d1_databases]]

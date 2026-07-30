@@ -241,6 +241,47 @@ const errorRes = (message: string, code = "internal_error") => {
 };
 
 /**
+ * 0. 2FA 动态登录接口 — 使用 6 位动态验证码换取安全的 Session Token
+ */
+app.post("/api/auth/login", async (c) => {
+  const dbManager = c.get("db");
+  const adminToken = c.env.ADMIN_TOKEN;
+
+  // 未开启鉴权直接通过
+  if (!adminToken) {
+    return c.json(successRes({ session_token: "dev_mode_token" }));
+  }
+
+  try {
+    const body = await c.req.json();
+    const tokenInput = String(body.token || "").trim();
+
+    if (!tokenInput) {
+      return c.json(errorRes("请输入 2FA 动态验证码"), 400);
+    }
+
+    const isTotpValid = await verifyTOTP(tokenInput, adminToken);
+    const isStaticValid = tokenInput === adminToken;
+
+    if (isTotpValid || isStaticValid) {
+      // 生成安全的长期 Session Token (当前网页无 30 秒超时，网页关闭后自动清理)
+      const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
+      await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+      await dbManager.writeLog("info", "system", "管理员通过 2FA 动态鉴权成功登录");
+
+      return c.json(successRes({
+        session_token: sessionToken,
+        message: "🎉 2FA 动态鉴权成功！已为您生成专属安全会话凭据"
+      }));
+    } else {
+      return c.json(errorRes("2FA 动态验证码错误或已过期，请重新输入手机 APP 最新的 6 位数字"), 401);
+    }
+  } catch (e) {
+    return c.json(errorRes("登录鉴权请求处理失败"), 500);
+  }
+});
+
+/**
  * 账号管理 API
  */
 

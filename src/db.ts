@@ -160,10 +160,43 @@ export class DatabaseManager {
             details TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
         `)
       ]);
     } catch (e) {
       console.error("Auto ensureTables error:", e);
+    }
+  }
+
+  /**
+   * 获取系统设置/会话配置
+   */
+  async getSetting(key: string): Promise<string | null> {
+    try {
+      const res = await this.db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+      return res ? String((res as any).value) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * 更新或保存系统设置/会话配置
+   */
+  async setSetting(key: string, value: string): Promise<void> {
+    try {
+      const now = this.getBeijingNow();
+      await this.db.prepare(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+      ).bind(key, value, now).run();
+    } catch (e) {
+      console.error("setSetting error:", e);
     }
   }
 

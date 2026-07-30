@@ -211,10 +211,7 @@ app.use("/api/*", async (c, next) => {
     return next();
   }
 
-  const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
-  await dbManager.ensureTables();
-  c.set("db", dbManager);
-  return next();
+  return c.json(errorRes("认证失败：会话凭据已失效或 2FA 动态验证码无效，请重新登录", "forbidden"), 403);
 });
 
 /**

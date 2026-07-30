@@ -183,65 +183,7 @@ app.use("/api/*", async (c, next) => {
 });
 
 /**
- * 鉴权中间件 — 验证 Session 会话 Token 或 2FA 6位动态验证码
- */
-app.use("/api/*", async (c, next) => {
-  // 放行 2FA 登录与二维码配置等公开接口
-  if (c.req.path === "/api/auth/login" || c.req.path === "/api/auth/totp-setup") {
-    return next();
-  }
-
-  const adminToken = c.env.ADMIN_TOKEN;
-
-  // 未配置 ADMIN_TOKEN 时跳过鉴权，便于本地开发调试
-  if (!adminToken) {
-    return next();
-  }
-
-  const authHeader = c.req.header("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return c.json(errorRes("未提供有效的 Authorization 头部，格式应为: Bearer <session_token>", "unauthorized"), 401);
-  }
-
-  const token = authHeader.substring(7).trim();
-  const dbManager = c.get("db");
-
-  // 1. 优先校验登录成功后签发的 Session Token (畅通无阻，无 30 秒超时问题)
-  if (token.startsWith("dnshe_sess_")) {
-    const storedSess = await dbManager.getSetting(`sess_${token}`);
-    if (storedSess === "valid") {
-      return next();
-    }
-  }
-
-  // 2. 校验 6 位 TOTP 动态验证码
-  const isTotpValid = await verifyTOTP(token, adminToken);
-  if (isTotpValid) {
-    return next();
-  }
-
-  // 3. 兼容传统静态 ADMIN_TOKEN
-  if (token === adminToken) {
-    return next();
-  }
-
-  return c.json(errorRes("认证失败：会话凭据已失效或 2FA 动态验证码无效，请重新登录", "forbidden"), 403);
-});
-
-/**
- * 统一响应辅助函数
- */
-const successRes = (data: Record<string, unknown> = {}) => {
-  return { success: true, ...data };
-};
-
-// NOTE: 移除了原先未被使用的 status 参数，避免开发者误认为它会影响 HTTP 状态码
-const errorRes = (message: string, code = "internal_error") => {
-  return { success: false, error_code: code, message };
-};
-
-/**
- * 0. 2FA 动态登录接口 — 使用 6 位动态验证码换取安全的 Session Token
+ * 0. 2FA 动态登录接口 — 使用 6 位动态验证码换取安全的 Session Token (公开接口，不受鉴权中间件拦截)
  */
 app.post("/api/auth/login", async (c) => {
   const dbManager = c.get("db");
@@ -279,6 +221,47 @@ app.post("/api/auth/login", async (c) => {
   } catch (e) {
     return c.json(errorRes("登录鉴权请求处理失败"), 500);
   }
+});
+
+/**
+ * 鉴权中间件 — 验证受保护 API 的 Session 会话 Token 或 2FA 6位动态验证码
+ */
+app.use("/api/*", async (c, next) => {
+  const adminToken = c.env.ADMIN_TOKEN;
+
+  // 未配置 ADMIN_TOKEN 时跳过鉴权，便于本地开发调试
+  if (!adminToken) {
+    return next();
+  }
+
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return c.json(errorRes("未提供有效的 Authorization 头部，格式应为: Bearer <session_token>", "unauthorized"), 401);
+  }
+
+  const token = authHeader.substring(7).trim();
+  const dbManager = c.get("db");
+
+  // 1. 优先校验登录成功后签发的 Session Token (畅通无阻，无 30 秒超时问题)
+  if (token.startsWith("dnshe_sess_")) {
+    const storedSess = await dbManager.getSetting(`sess_${token}`);
+    if (storedSess === "valid") {
+      return next();
+    }
+  }
+
+  // 2. 校验 6 位 TOTP 动态验证码
+  const isTotpValid = await verifyTOTP(token, adminToken);
+  if (isTotpValid) {
+    return next();
+  }
+
+  // 3. 兼容传统静态 ADMIN_TOKEN
+  if (token === adminToken) {
+    return next();
+  }
+
+  return c.json(errorRes("认证失败：会话凭据已失效或 2FA 动态验证码无效，请重新登录", "forbidden"), 403);
 });
 
 /**

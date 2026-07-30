@@ -59,9 +59,23 @@ const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 app.use(
   "/api/*",
   async (c, next) => {
-    const allowedOrigin = c.env.ALLOWED_ORIGIN || "*";
+    const origin = c.req.header("Origin") || "*";
+    
+    // 强制直接响应 CORS OPTIONS 预检请求，避免跨域报错
+    if (c.req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": origin,
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     const corsMiddleware = cors({
-      origin: allowedOrigin,
+      origin: c.env.ALLOWED_ORIGIN || origin,
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
       allowHeaders: ["Content-Type", "Authorization"],
       maxAge: 86400,

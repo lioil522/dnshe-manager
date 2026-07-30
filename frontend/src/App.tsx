@@ -302,8 +302,9 @@ export default function App() {
       } else {
         showToast("error", data.message || "动态 2FA 验证码错误或已过期");
       }
-    } catch (err) {
-      showToast("error", "登录鉴权请求失败，请检查网络连接");
+    } catch (err: any) {
+      console.error("Auth login error:", err);
+      showToast("error", `登录鉴权请求失败: ${err?.message || "网络异常，请检查域名 DNS 解析"}`);
     } finally {
       setActionLoading(null);
     }

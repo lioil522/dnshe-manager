@@ -71,7 +71,59 @@ app.use(
 );
 
 /**
- * 鉴权中间件 — 所有 /api/* 请求必须携带有效的 Bearer Token
+ * 校验 6 位 TOTP (2FA 动态口令) 是否有效
+ * 容差窗口为 ±30 秒 (当前时间步长 T 及前后的 T-1, T+1)
+ */
+async function verifyTOTP(token: string, secretStr: string): Promise<boolean> {
+  const cleanToken = token.trim();
+  if (!/^\d{6}$/.test(cleanToken)) return false;
+
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(secretStr);
+
+  try {
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyData,
+      { name: "HMAC", hash: "SHA-1" },
+      false,
+      ["sign"]
+    );
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const timeStep = 30;
+    const currentT = Math.floor(nowSec / timeStep);
+
+    for (let i = -1; i <= 1; i++) {
+      const t = currentT + i;
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+      view.setBigUint64(0, BigInt(t), false);
+
+      const signature = await crypto.subtle.sign("HMAC", cryptoKey, buffer);
+      const hmacBytes = new Uint8Array(signature);
+
+      const offset = hmacBytes[hmacBytes.length - 1] & 0x0f;
+      const binary =
+        ((hmacBytes[offset] & 0x7f) << 24) |
+        ((hmacBytes[offset + 1] & 0xff) << 16) |
+        ((hmacBytes[offset + 2] & 0xff) << 8) |
+        (hmacBytes[offset + 3] & 0xff);
+
+      const otp = (binary % 1000000).toString().padStart(6, "0");
+      if (otp === cleanToken) {
+        return true;
+      }
+    }
+  } catch (e) {
+    console.error("TOTP verification error:", e);
+  }
+
+  return false;
+}
+
+/**
+ * 鉴权中间件 — 所有 /api/* 请求必须携带有效的 Bearer Token (支持 2FA 6位动态口令或静态 Secret)
  * 
  * NOTE: 当未配置 ADMIN_TOKEN 环境变量时，跳过鉴权（便于本地开发调试）。
  * 部署生产环境时，务必通过 `wrangler secret put ADMIN_TOKEN` 注入密钥。
@@ -89,12 +141,20 @@ app.use("/api/*", async (c, next) => {
     return c.json(errorRes("未提供有效的 Authorization 头部，格式应为: Bearer <token>", "unauthorized"), 401);
   }
 
-  const token = authHeader.substring(7);
-  if (token !== adminToken) {
-    return c.json(errorRes("认证失败：Token 无效", "forbidden"), 403);
+  const token = authHeader.substring(7).trim();
+
+  // 1. 支持 2FA TOTP 6位动态验证码
+  const isTotpValid = await verifyTOTP(token, adminToken);
+  if (isTotpValid) {
+    return next();
   }
 
-  return next();
+  // 2. 支持传统静态 Token
+  if (token === adminToken) {
+    return next();
+  }
+
+  return c.json(errorRes("认证失败：动态 2FA 验证码或管理口令无效", "forbidden"), 403);
 });
 
 /**

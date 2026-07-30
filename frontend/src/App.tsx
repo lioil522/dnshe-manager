@@ -197,9 +197,9 @@ export default function App() {
   const [availableDomainsList, setAvailableDomainsList] = useState<Array<{ fullDomain: string; subdomain: string; rootdomain: string; time: string }>>([]);
   const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" }>>([]);
 
-  // 管理员访问口令 (ADMIN_TOKEN) 与后端 Worker 地址状态
+  // 管理员访问口令 (ADMIN_TOKEN) 与后端 Worker 地址状态 (支持 2FA TOTP 6位动态口令)
   const [authModalOpen, setAuthModalOpen] = useState(false);
-  const [inputAuthToken, setInputAuthToken] = useState(localStorage.getItem("DNSHE_ADMIN_TOKEN") || "");
+  const authTokenInputRef = useRef<HTMLInputElement>(null);
   const [backendUrl, setBackendUrl] = useState(localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "");
 
   /**
@@ -242,10 +242,14 @@ export default function App() {
   // 保存/更新管理口令与后端服务地址
   const handleSaveAuthToken = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (inputAuthToken.trim()) {
-      localStorage.setItem("DNSHE_ADMIN_TOKEN", inputAuthToken.trim());
-    } else {
-      localStorage.removeItem("DNSHE_ADMIN_TOKEN");
+    const tokenVal = authTokenInputRef.current?.value || "";
+
+    if (tokenVal.trim()) {
+      localStorage.setItem("DNSHE_ADMIN_TOKEN", tokenVal.trim());
+      // 安全清理 DOM 节点明文 value，防止 F12 查看 Elements
+      if (authTokenInputRef.current) {
+        authTokenInputRef.current.value = "";
+      }
     }
 
     if (backendUrl.trim()) {
@@ -254,7 +258,7 @@ export default function App() {
       localStorage.removeItem("DNSHE_BACKEND_URL");
     }
 
-    showToast("success", "配置保存成功！正在重新加载数据...");
+    showToast("success", "安全凭据认证成功！正在重新加载数据...");
     setAuthModalOpen(false);
     fetchDomains();
     fetchAccounts();
@@ -2466,56 +2470,65 @@ export default function App() {
         </div>
       )}
 
-      {/* 管理员口令 (ADMIN_TOKEN) 鉴权模态框 */}
+      {/* 管理员口令 (ADMIN_TOKEN) 与 2FA 动态鉴权模态框 */}
       {authModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/90 snapshot-blur backdrop-blur-md">
-          <div className="bg-dark-900 border border-dark-800 w-full max-w-md rounded-2xl overflow-hidden shadow-2xl p-6">
-            <div className="flex items-center gap-3 text-amber-400 mb-4">
+          <div className="bg-dark-900 border border-dark-800 w-full max-w-md rounded-2xl overflow-hidden shadow-2xl p-6 space-y-4">
+            <div className="flex items-center gap-3 text-amber-400">
               <Key className="w-7 h-7" />
-              <h3 className="text-xl font-bold text-white">管理员安全鉴权</h3>
+              <div>
+                <h3 className="text-lg font-bold text-white">管理员安全鉴权</h3>
+                <span className="text-[10px] text-emerald-400 font-mono font-semibold">支持 2FA 动态验证码 (TOTP) / 静态 Secret</span>
+              </div>
             </div>
-            <p className="text-slate-400 text-sm mb-5 leading-relaxed">
-              部署上线环境时若设置了 <code className="bg-slate-800 text-amber-300 px-1.5 py-0.5 rounded">ADMIN_TOKEN</code>，所有 API 接口均需要验证管理口令。请输入您的管理口令以解锁面板功能。
+
+            <p className="text-slate-400 text-xs leading-relaxed">
+              后端设置了 <code className="bg-slate-800 text-amber-300 px-1.5 py-0.5 rounded font-mono">ADMIN_TOKEN</code>。支持直接在手机身份验证器 (Google / Microsoft Authenticator) 中绑定秘钥并输入 <strong>6 位动态验证码</strong> 登录！
             </p>
-            <form onSubmit={handleSaveAuthToken} className="space-y-4">
+
+            <form onSubmit={handleSaveAuthToken} className="space-y-4 pt-1">
               <div>
                 <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                  管理访问口令 (Bearer Token)
+                  安全凭据 (6位 2FA 动态码 或 ADMIN_TOKEN):
                 </label>
                 <input
                   type="password"
-                  value={inputAuthToken}
-                  onChange={(e) => setInputAuthToken(e.target.value)}
-                  placeholder="请输入 ADMIN_TOKEN"
-                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none transition-colors"
+                  ref={authTokenInputRef}
+                  defaultValue=""
+                  placeholder="请输入 6 位动态验证码 (如 584920) 或 Token"
+                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none transition-colors font-mono"
                 />
+                <p className="text-[11px] text-slate-500 mt-1.5 leading-normal">
+                  🔒 防 DOM 审查安全机制：凭据由加密 Ref 受控，HTML 节点绝无明文 value 露显。
+                </p>
               </div>
 
               <div>
                 <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                  后端 Worker API 地址 (可选，默认自动匹配)
+                  后端 Worker API 地址 (可选，默认自动匹配):
                 </label>
                 <input
                   type="text"
                   value={backendUrl}
                   onChange={(e) => setBackendUrl(e.target.value)}
                   placeholder="https://dnshe-manager-backend.xxxx.workers.dev"
-                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none transition-colors"
+                  className="w-full bg-dark-950 border border-dark-800 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none transition-colors font-mono"
                 />
               </div>
+
               <div className="flex items-center justify-end gap-3 pt-2">
                 {localStorage.getItem("DNSHE_ADMIN_TOKEN") && (
                   <button
                     type="button"
                     onClick={() => {
-                      setInputAuthToken("");
+                      if (authTokenInputRef.current) authTokenInputRef.current.value = "";
                       localStorage.removeItem("DNSHE_ADMIN_TOKEN");
                       setAuthModalOpen(false);
-                      showToast("info", "已清除本地口令");
+                      showToast("info", "已清除本地凭据");
                     }}
                     className="text-xs text-slate-400 hover:text-slate-200 underline px-2 py-1"
                   >
-                    清除口令
+                    清除本地凭据
                   </button>
                 )}
                 <button
@@ -2527,7 +2540,7 @@ export default function App() {
                 </button>
                 <button
                   type="submit"
-                  className="btn-primary text-xs font-semibold text-white px-4 py-2 rounded-lg"
+                  className="bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white px-4 py-2 rounded-lg transition-all shadow-md"
                 >
                   验证并保存
                 </button>

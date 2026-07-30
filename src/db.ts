@@ -168,14 +168,28 @@ export class DatabaseManager {
   }
 
   /**
+   * 获取当前北京时间 (UTC+8) 的 ISO 格式字符串
+   * 
+   * NOTE: Cloudflare Workers / D1 的 CURRENT_TIMESTAMP 默认为 UTC，
+   * 为了让日志时间与用户所在时区一致，手动构造北京时间。
+   */
+  private getBeijingNow(): string {
+    const now = new Date();
+    const beijingOffset = 8 * 60 * 60 * 1000;
+    const beijingTime = new Date(now.getTime() + beijingOffset);
+    return beijingTime.toISOString().replace("T", " ").replace("Z", "");
+  }
+
+  /**
    * 写入日志
    */
   async writeLog(type: "info" | "success" | "warning" | "error", category: "sync" | "renew" | "system", message: string, details?: unknown) {
     try {
       const detailsStr = details ? (typeof details === "string" ? details : JSON.stringify(details)) : null;
+      const beijingNow = this.getBeijingNow();
       await this.db.prepare(
-        "INSERT INTO logs (type, category, message, details) VALUES (?, ?, ?, ?)"
-      ).bind(type, category, message, detailsStr).run();
+        "INSERT INTO logs (type, category, message, details, created_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(type, category, message, detailsStr, beijingNow).run();
     } catch (e) {
       console.error("Failed to write database log:", e);
     }
@@ -204,9 +218,10 @@ export class DatabaseManager {
    */
   async updateDomainStatusAndDns(domainId: number, status: string, hasDns: number) {
     try {
+      const beijingNow = this.getBeijingNow();
       await this.db.prepare(
-        "UPDATE domains_cache SET status = ?, has_dns = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-      ).bind(status, hasDns, domainId).run();
+        "UPDATE domains_cache SET status = ?, has_dns = ?, updated_at = ? WHERE id = ?"
+      ).bind(status, hasDns, beijingNow, domainId).run();
     } catch (e) {
       console.error("Failed to update domain status and dns:", e);
     }
@@ -399,14 +414,14 @@ export class DatabaseManager {
 
       statements.push(
         this.db.prepare(`
-          INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             status = excluded.status,
             created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
             expires_at = excluded.expires_at,
             has_dns = excluded.has_dns,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = excluded.updated_at
         `).bind(
           sub.id,
           accountId,
@@ -416,7 +431,8 @@ export class DatabaseManager {
           sub.status,
           sub.created_at || "",
           sub.expires_at || "",
-          hasDnsVal
+          hasDnsVal,
+          this.getBeijingNow()
         )
       );
     }
@@ -439,10 +455,11 @@ export class DatabaseManager {
    * 标记域名已续期成功
    */
   async markDomainRenewed(id: number, newExpiresAt: string) {
+    const beijingNow = this.getBeijingNow();
     await this.db.prepare(`
       UPDATE domains_cache 
-      SET expires_at = ?, last_renewed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      SET expires_at = ?, last_renewed_at = ?, updated_at = ?
       WHERE id = ?
-    `).bind(newExpiresAt, id).run();
+    `).bind(newExpiresAt, beijingNow, beijingNow, id).run();
   }
 }

@@ -36,11 +36,11 @@ jobs:
             echo "✅ 使用 GitHub Secret 中配置的 CLOUDFLARE_D1_DATABASE_ID: $DB_ID"
           else
             echo "🔍 正在通过 Cloudflare REST API 自动查询 D1 数据库 [dnshe-manager-db]..."
-            
+
             D1_LIST=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" || echo "{}")
-            
+
             DB_ID=$(echo "$D1_LIST" | jq -r '.result[]? | select(.name=="dnshe-manager-db") | .uuid' 2>/dev/null | head -n 1 || echo "")
 
             if [ -z "$DB_ID" ] || [ "$DB_ID" == "null" ]; then
@@ -49,7 +49,7 @@ jobs:
                 -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
                 -H "Content-Type: application/json" \
                 -d '{"name":"dnshe-manager-db"}' || echo "{}")
-              
+
               DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // empty' 2>/dev/null || echo "")
             fi
           fi
@@ -61,11 +61,80 @@ jobs:
             echo "⚠️ 未能自动获取/创建 D1 数据库 ID，请检查 API Token 权限是否包含 [D1:编辑]"
           fi
 
+      - name: Auto Detect Custom Domain & Configure Worker Routes
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "🔍 正在检测 Worker [dnshe-manager-backend] 是否已绑定自定义域名..."
+
+          # 1. 查询 Custom Domains
+          DOMAINS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/domains" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" || echo "{}")
+
+          CUSTOM_DOMAIN=$(echo "$DOMAINS_JSON" | jq -r '.result[]? | select(.service=="dnshe-manager-backend") | .hostname' 2>/dev/null | head -n 1 || echo "")
+
+          # 2. 若未找到，尝试从 Worker Routes 中查找
+          if [ -z "$CUSTOM_DOMAIN" ] || [ "$CUSTOM_DOMAIN" == "null" ]; then
+            ZONES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?per_page=50" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+
+            ZONE_IDS=$(echo "$ZONES_JSON" | jq -r '.result[]?.id' 2>/dev/null || echo "")
+            for ZID in $ZONE_IDS; do
+              ROUTES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZID}/workers/routes" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" || echo "{}")
+
+              ROUTE_PATTERN=$(echo "$ROUTES_JSON" | jq -r '.result[]? | select(.script=="dnshe-manager-backend" or .service=="dnshe-manager-backend") | .pattern' 2>/dev/null | head -n 1 || echo "")
+              if [ -n "$ROUTE_PATTERN" ] && [ "$ROUTE_PATTERN" != "null" ]; then
+                CLEAN_DOMAIN=$(echo "$ROUTE_PATTERN" | sed 's/\*//g' | sed 's/\/*$//' | sed 's/^\/*//')
+                if [ -n "$CLEAN_DOMAIN" ]; then
+                  CUSTOM_DOMAIN="$CLEAN_DOMAIN"
+                  echo "🎉 检测到自定义域名（从 Routes）: https://${CUSTOM_DOMAIN}"
+                  break
+                fi
+              fi
+            done
+          else
+            echo "🎉 检测到自定义域名（从 Custom Domains）: https://${CUSTOM_DOMAIN}"
+          fi
+
+          # 3. 根据检测结果配置 workers_dev 和 preview_urls
+          if [ -n "$CUSTOM_DOMAIN" ] && [ "$CUSTOM_DOMAIN" != "null" ]; then
+            echo "✅ 已绑定自定义域名，注入 workers_dev = false 和 preview_urls = false 到 wrangler.toml"
+            # 确保幂等：先删除旧的配置行（如果存在），再追加新配置
+            sed -i '/^workers_dev = /d' wrangler.toml
+            sed -i '/^preview_urls = /d' wrangler.toml
+            # 在 compatibility_date 行之后插入
+            sed -i '/^compatibility_date = /a workers_dev = false\npreview_urls = false' wrangler.toml
+            echo "VITE_API_BASE_URL=https://${CUSTOM_DOMAIN}" >> $GITHUB_ENV
+            echo "✅ 前端将使用自定义域名: https://${CUSTOM_DOMAIN}"
+          else
+            echo "⚠️ 未检测到自定义域名，保持 workers.dev 和预览 URL 默认开启"
+            # 查询默认 workers.dev 子域名
+            SUBDOMAIN_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+
+            WORKERS_SUBDOMAIN=$(echo "$SUBDOMAIN_JSON" | jq -r '.result.subdomain // empty' 2>/dev/null || echo "")
+
+            if [ -n "$WORKERS_SUBDOMAIN" ]; then
+              API_BASE_URL="https://dnshe-manager-backend.${WORKERS_SUBDOMAIN}.workers.dev"
+              echo "VITE_API_BASE_URL=${API_BASE_URL}" >> $GITHUB_ENV
+              echo "✅ 前端将使用 workers.dev 域名: ${API_BASE_URL}"
+            else
+              echo "⚠️ 未能获取 workers.dev 子域名，前端将使用自适应降级"
+            fi
+          fi
+
       - name: Deploy Worker Backend
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '3.91.0'
 
       - name: Sync Optional Secrets to Worker (if set)
         env:
@@ -86,69 +155,6 @@ jobs:
           if [ -n "$WEBHOOK_URL" ]; then
             echo "🔔 正在同步更新 WEBHOOK_URL 推送地址到 Cloudflare Worker..."
             echo "$WEBHOOK_URL" | npx wrangler secret put WEBHOOK_URL || true
-          fi
-
-      - name: Auto Fetch Worker Backend API Domain
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          echo "🔍 正在通过 Cloudflare REST API 查询 Worker [dnshe-manager-backend] 的实际域名..."
-
-          # 1. 尝试查询账号下为该 Worker (dnshe-manager-backend) 绑定的自定义域名 Custom Domain
-          DOMAINS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/domains" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" || echo "{}")
-
-          CUSTOM_DOMAIN=$(echo "$DOMAINS_JSON" | jq -r '.result[]? | select(.service=="dnshe-manager-backend") | .hostname' 2>/dev/null | head -n 1 || echo "")
-
-          # 2. 若未在 Custom Domains 中找到，尝试从 Cloudflare Worker Routes 路由列表中查找 (兼容【+ 添加路由】模式)
-          if [ -z "$CUSTOM_DOMAIN" ] || [ "$CUSTOM_DOMAIN" == "null" ]; then
-            ZONES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?per_page=50" \
-              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-              -H "Content-Type: application/json" || echo "{}")
-            
-            ZONE_IDS=$(echo "$ZONES_JSON" | jq -r '.result[]?.id' 2>/dev/null || echo "")
-            for ZID in $ZONE_IDS; do
-              ROUTES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZID}/workers/routes" \
-                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-                -H "Content-Type: application/json" || echo "{}")
-              
-              ROUTE_PATTERN=$(echo "$ROUTES_JSON" | jq -r '.result[]? | select(.script=="dnshe-manager-backend" or .service=="dnshe-manager-backend") | .pattern' 2>/dev/null | head -n 1 || echo "")
-              if [ -n "$ROUTE_PATTERN" ] && [ "$ROUTE_PATTERN" != "null" ]; then
-                CLEAN_DOMAIN=$(echo "$ROUTE_PATTERN" | sed 's/\*//g' | sed 's/\/*$//' | sed 's/^\/*//')
-                if [ -n "$CLEAN_DOMAIN" ]; then
-                  CUSTOM_DOMAIN="$CLEAN_DOMAIN"
-                  echo "🎉 成功从 Cloudflare 路由 (Routes) 中识别到自定义域名: https://${CUSTOM_DOMAIN}"
-                  break
-                fi
-              fi
-            done
-          fi
-
-          API_BASE_URL=""
-          if [ -n "$CUSTOM_DOMAIN" ] && [ "$CUSTOM_DOMAIN" != "null" ]; then
-            echo "🎉 成功抓取到 Worker 自定义域名: https://${CUSTOM_DOMAIN}"
-            API_BASE_URL="https://${CUSTOM_DOMAIN}"
-          else
-            # 3. 若未绑定任何自定义路由/域名，尝试查询全局默认的 workers.dev 域名
-            SUBDOMAIN_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
-              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-              -H "Content-Type: application/json" || echo "{}")
-            
-            WORKERS_SUBDOMAIN=$(echo "$SUBDOMAIN_JSON" | jq -r '.result.subdomain // empty' 2>/dev/null || echo "")
-
-            if [ -n "$WORKERS_SUBDOMAIN" ]; then
-              API_BASE_URL="https://dnshe-manager-backend.${WORKERS_SUBDOMAIN}.workers.dev"
-              echo "✨ 成功获取到 Cloudflare 默认分配的 Worker 域名: ${API_BASE_URL}"
-            fi
-          fi
-
-          if [ -n "$API_BASE_URL" ]; then
-            echo "VITE_API_BASE_URL=${API_BASE_URL}" >> $GITHUB_ENV
-            echo "✅ 成功注入环境变量 VITE_API_BASE_URL=${API_BASE_URL} 供前端构建"
-          else
-            echo "⚠️ 未能通过 Cloudflare API 自动提取出域名，前端将使用自适应降级识别模式"
           fi
 
       - name: Build Frontend

@@ -1162,73 +1162,94 @@ export default function App() {
       }
     }
 
-    // 多账号 API 轮询与动态限频计算：
-    // 每个 API 独立保证 1.2s (1200ms) 规程，N 个账号使得整体调度间隔为 1200ms / N（最低底线 100ms）
-    const accountCount = Math.max(1, accounts.length);
-    const delayMs = Math.max(100, Math.floor(1200 / accountCount));
+    // 多账号并发查重：
+    // 为每个 API 账号开一条独立的流水线（worker），各自绑定固定账号并遵守自身 1.2s (1200ms) 限频。
+    // N 条流水线同时工作 => 整体吞吐量约为单账号的 N 倍（真并发，而非串行轮询）。
+    const RATE_LIMIT_MS = 1200; // 单个 API 账号的独立限频底线
+    const workerAccounts = accounts.length > 0 ? accounts : [null];
+    const workerCount = workerAccounts.length;
 
     updateScanStatus("running");
     setScanProgress({ total: totalTasks.length, checked: 0, available: availableDomainsList.length });
     showToast(
       "info",
-      `🚀 开始多账号轮询查重！绑定 ${accountCount} 个 API 账号，全局调度间隔 ${delayMs}ms（每个 API 独立保障 1.2s 限频），查重速度提升 ${accountCount} 倍！`
+      `🚀 开始多账号并发查重！绑定 ${workerCount} 个 API 账号，${workerCount} 条流水线并行（每个 API 独立保障 1.2s 限频），查重吞吐提升约 ${workerCount} 倍！`
     );
 
-    for (let i = 0; i < totalTasks.length; i++) {
-      // 检查停止或重置状态
-      if ((scanControlRef.current as string) === "idle") {
-        showToast("info", "查重任务已终止");
-        return;
-      }
+    // 共享的任务游标：各 worker 抢占式领取任务，天然实现负载均衡
+    let nextTaskIndex = 0;
+    let checkedCount = 0;
 
-      // 检查暂停状态：挂起循环直到解冻或停止
-      while ((scanControlRef.current as string) === "paused") {
-        await new Promise((r) => setTimeout(r, 300));
-        if ((scanControlRef.current as string) === "idle") {
-          showToast("info", "查重任务已终止");
-          return;
-        }
-      }
-
-      const task = totalTasks[i];
-      // 轮询选取当前账号
-      const currentAccount = accounts.length > 0 ? accounts[i % accounts.length] : null;
-      const accountQuery = currentAccount ? `&account_id=${currentAccount.id}` : "";
+    // 单个域名的查询与日志上报逻辑
+    const processTask = async (
+      task: { sub: string; root: string; full: string },
+      account: (typeof workerAccounts)[number]
+    ) => {
+      const accountQuery = account ? `&account_id=${account.id}` : "";
+      const accAlias = account ? account.alias : "公共轮询";
       const nowTime = new Date().toLocaleTimeString();
-      const accAlias = currentAccount ? currentAccount.alias : "公共轮询";
-
       try {
         const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.full)}${accountQuery}`);
         const data = await res.json();
-        
+
         if (data.success && data.whois && data.whois.registered === false) {
           setAvailableDomainsList(prev => [
             { fullDomain: task.full, subdomain: task.sub, rootdomain: task.root, time: nowTime },
             ...prev
           ]);
-          setScanProgress(p => ({ ...p, checked: i + 1, available: p.available + 1 }));
+          checkedCount++;
+          setScanProgress(p => ({ ...p, checked: checkedCount, available: p.available + 1 }));
           setScanLogs(prev => [
             { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 🎉 尚未注册（可立即在线注册！）`, status: "available" },
             ...prev.slice(0, 49)
           ]);
         } else {
-          setScanProgress(p => ({ ...p, checked: i + 1 }));
+          checkedCount++;
+          setScanProgress(p => ({ ...p, checked: checkedCount }));
           setScanLogs(prev => [
             { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 已被他人注册`, status: "registered" },
             ...prev.slice(0, 49)
           ]);
         }
       } catch (err) {
-        setScanProgress(p => ({ ...p, checked: i + 1 }));
+        checkedCount++;
+        setScanProgress(p => ({ ...p, checked: checkedCount }));
         setScanLogs(prev => [
           { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ ⚠️ 查询请求异常，已跳过`, status: "error" },
           ...prev.slice(0, 49)
         ]);
       }
+    };
 
-      // 根据账号数量按比例自动缩短全局轮询休眠间隔
-      await new Promise(r => setTimeout(r, delayMs));
-    }
+    // 单条流水线：固定绑定一个账号，循环领取任务并遵守自身 1.2s 限频
+    const runWorker = async (account: (typeof workerAccounts)[number]) => {
+      while (true) {
+        // 停止或重置
+        if ((scanControlRef.current as string) === "idle") return;
+
+        // 暂停：挂起直到解冻或停止
+        while ((scanControlRef.current as string) === "paused") {
+          await new Promise(r => setTimeout(r, 300));
+          if ((scanControlRef.current as string) === "idle") return;
+        }
+
+        // 抢占式领取下一个任务
+        const idx = nextTaskIndex++;
+        if (idx >= totalTasks.length) return;
+
+        const startedAt = Date.now();
+        await processTask(totalTasks[idx], account);
+
+        // 该账号自身限频：距上次请求发起不足 1.2s 则补足剩余时间
+        const elapsed = Date.now() - startedAt;
+        if (elapsed < RATE_LIMIT_MS) {
+          await new Promise(r => setTimeout(r, RATE_LIMIT_MS - elapsed));
+        }
+      }
+    };
+
+    // 所有流水线同时启动，等待全部跑完
+    await Promise.all(workerAccounts.map(acc => runWorker(acc)));
 
     if (scanControlRef.current === "running") {
       updateScanStatus("completed");

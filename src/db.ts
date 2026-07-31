@@ -201,6 +201,52 @@ export class DatabaseManager {
   }
 
   /**
+   * 批量读取所有以 cfg_ 为前缀的应用配置项，返回去前缀后的键值对象
+   *
+   * NOTE: 敏感字段（如 Telegram Token）以 AES 加密形式存储，此处返回解密后的原文，
+   * 由上层接口决定是否打码后再下发前端。
+   */
+  async getAllAppSettings(): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    try {
+      const { results } = await this.db.prepare(
+        "SELECT key, value FROM settings WHERE key LIKE 'cfg_%'"
+      ).all<{ key: string; value: string }>();
+      for (const row of results || []) {
+        const shortKey = row.key.replace(/^cfg_/, "");
+        let val = row.value;
+        // 敏感字段解密
+        if ((shortKey === "tg_token" || shortKey === "webhook_url") && val) {
+          try {
+            val = await decryptText(val, this.aesKey);
+          } catch (e) {
+            // 解密失败保持原值（可能是历史明文）
+          }
+        }
+        out[shortKey] = val;
+      }
+    } catch (e) {
+      console.error("getAllAppSettings error:", e);
+    }
+    return out;
+  }
+
+  /**
+   * 保存单个应用配置项（自动加 cfg_ 前缀，敏感字段自动 AES 加密）
+   */
+  async setAppSetting(shortKey: string, value: string): Promise<void> {
+    let stored = value;
+    if ((shortKey === "tg_token" || shortKey === "webhook_url") && value) {
+      try {
+        stored = await encryptText(value, this.aesKey);
+      } catch (e) {
+        console.error("setAppSetting encrypt error:", e);
+      }
+    }
+    await this.setSetting(`cfg_${shortKey}`, stored);
+  }
+
+  /**
    * 获取当前北京时间 (UTC+8) 的 ISO 格式字符串
    * 
    * NOTE: Cloudflare Workers / D1 的 CURRENT_TIMESTAMP 默认为 UTC，
@@ -216,7 +262,7 @@ export class DatabaseManager {
   /**
    * 写入日志
    */
-  async writeLog(type: "info" | "success" | "warning" | "error", category: "sync" | "renew" | "system", message: string, details?: unknown) {
+  async writeLog(type: "info" | "success" | "warning" | "error", category: "sync" | "renew" | "system" | "auth" | "api" | "operation", message: string, details?: unknown) {
     try {
       const detailsStr = details ? (typeof details === "string" ? details : JSON.stringify(details)) : null;
       const beijingNow = this.getBeijingNow();
@@ -230,8 +276,17 @@ export class DatabaseManager {
 
   /**
    * 获取日志列表 (按时间倒序，限制100条)
+   *
+   * NOTE: 可选按 categories 过滤（传入分类数组，如 ["api","sync","renew"]）。
    */
-  async getLogs(limit = 100): Promise<DBLog[]> {
+  async getLogs(limit = 100, categories?: string[]): Promise<DBLog[]> {
+    if (categories && categories.length > 0) {
+      const placeholders = categories.map(() => "?").join(",");
+      const { results } = await this.db.prepare(
+        `SELECT * FROM logs WHERE category IN (${placeholders}) ORDER BY created_at DESC LIMIT ?`
+      ).bind(...categories, limit).all<DBLog>();
+      return results || [];
+    }
     const { results } = await this.db.prepare(
       "SELECT * FROM logs ORDER BY created_at DESC LIMIT ?"
     ).bind(limit).all<DBLog>();
@@ -243,7 +298,7 @@ export class DatabaseManager {
    */
   async clearLogs() {
     await this.db.prepare("DELETE FROM logs").run();
-    await this.writeLog("info", "system", "已手动清空运行日志");
+    await this.writeLog("info", "operation", "已手动清空运行日志");
   }
 
   /**
@@ -297,9 +352,9 @@ export class DatabaseManager {
     
     // 如果没有配置 AES_KEY 并且使用 plain 存储，记录一条 Warning 日志
     if (!this.aesKey) {
-      await this.writeLog("warning", "system", `账户 [${alias}] 已绑定，但由于未配置 AES_KEY，秘钥将以不安全的方式（弱 Base64 编码）存储在 D1 中！`);
+      await this.writeLog("warning", "operation", `账户 [${alias}] 已绑定，但由于未配置 AES_KEY，秘钥将以不安全的方式（弱 Base64 编码）存储在 D1 中！`);
     } else {
-      await this.writeLog("success", "system", `账户 [${alias}] 绑定成功，已启用 AES-GCM 安全加密`);
+      await this.writeLog("success", "operation", `账户 [${alias}] 绑定成功，已启用 AES-GCM 安全加密`);
     }
 
     await this.db.prepare(
@@ -331,7 +386,7 @@ export class DatabaseManager {
     const alias = account ? (account as { alias: string }).alias : `ID ${id}`;
     
     await this.db.prepare("DELETE FROM accounts WHERE id = ?").bind(id).run();
-    await this.writeLog("info", "system", `解绑了账户 [${alias}]，其名下的域名缓存已被自动级联清理`);
+    await this.writeLog("info", "operation", `解绑了账户 [${alias}]，其名下的域名缓存已被自动级联清理`);
   }
 
   /**

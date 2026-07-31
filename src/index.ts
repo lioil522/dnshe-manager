@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { DatabaseManager } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams } from "./dnshe";
-import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient } from "./cron";
+import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
 
 /**
  * 统一成功响应封装 — 将 payload 扁平化后附加 success: true，
@@ -241,7 +241,7 @@ app.post("/api/auth/login", async (c) => {
       if (dbManager) {
         try {
           await dbManager.setSetting(`sess_${sessionToken}`, "valid");
-          await dbManager.writeLog("info", "system", "管理员通过 2FA 动态鉴权成功登录");
+          await dbManager.writeLog("info", "auth", "管理员通过 2FA 动态鉴权成功登录");
         } catch (dbErr) {
           console.error("Session storage DB error (non-fatal):", dbErr);
         }
@@ -252,6 +252,13 @@ app.post("/api/auth/login", async (c) => {
         message: "🎉 2FA 动态鉴权成功！已为您生成专属安全会话凭据"
       }));
     } else {
+      if (dbManager) {
+        try {
+          await dbManager.writeLog("warning", "auth", "管理员登录失败：2FA 动态验证码错误或已过期");
+        } catch (dbErr) {
+          console.error("Login failure log DB error (non-fatal):", dbErr);
+        }
+      }
       return c.json(errorRes("2FA 动态验证码错误或已过期，请重新输入手机 APP 最新的 6 位数字"), 401);
     }
   } catch (e: any) {
@@ -426,9 +433,9 @@ app.post("/api/domains/:id/renew", async (c) => {
     if (res && res.success) {
       const newExpiresAt = res.new_expires_at || "";
       await dbManager.markDomainRenewed(domainId, newExpiresAt);
-      
+
       const msg = `域名 [${domainInfo.full_domain}] (账户: ${alias}) 手动续期成功！新有效期至: ${newExpiresAt}`;
-      await dbManager.writeLog("success", "renew", msg, res);
+      await dbManager.writeLog("success", "api", msg, res);
       
       return c.json(successRes({ message: "续期成功", new_expires_at: newExpiresAt }));
     } else {
@@ -518,7 +525,7 @@ app.post("/api/domains/:id/dns", async (c) => {
     } as CreateDnsRecordParams);
 
     if (res && res.success) {
-      await dbManager.writeLog("success", "system", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${body.name || "@"} -> ${body.content}`);
+      await dbManager.writeLog("success", "api", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${body.name || "@"} -> ${body.content}`);
       await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "创建DNS记录成功", record: res.record }));
     } else {
@@ -559,7 +566,7 @@ app.put("/api/domains/:id/dns/:record_id", async (c) => {
     });
 
     if (res && res.success) {
-      await dbManager.writeLog("success", "system", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${body.type} -> ${body.content}`);
+      await dbManager.writeLog("success", "api", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${body.type} -> ${body.content}`);
       await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "更新DNS记录成功" }));
     } else {
@@ -588,7 +595,7 @@ app.delete("/api/domains/:id/dns/:record_id", async (c) => {
     const res = await client.deleteDnsRecord(domainId, recordId);
 
     if (res && res.success) {
-      await dbManager.writeLog("success", "system", `删除了域名 [${domainInfo.full_domain}] 下的 DNS 记录 (ID: ${recordId})`);
+      await dbManager.writeLog("success", "api", `删除了域名 [${domainInfo.full_domain}] 下的 DNS 记录 (ID: ${recordId})`);
       await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "删除DNS记录成功" }));
     } else {
@@ -674,6 +681,90 @@ app.post("/api/logs/clear", async (c) => {
 });
 
 /**
+ * 应用设置 API
+ */
+
+// 敏感字段打码：仅保留后 4 位
+function maskSecret(v: string): string {
+  if (!v) return "";
+  if (v.length <= 4) return "****";
+  return "****" + v.slice(-4);
+}
+
+// 1. 读取所有应用配置（敏感值打码）
+app.get("/api/settings", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const cfg = await dbManager.getAllAppSettings();
+    // 敏感字段打码后再返回
+    const masked = { ...cfg };
+    if (masked.tg_token) masked.tg_token = maskSecret(cfg.tg_token);
+    if (masked.webhook_url) masked.webhook_url = maskSecret(cfg.webhook_url);
+    // 标记哪些敏感字段已配置（前端用于占位提示）
+    const configured = {
+      tg_token: !!cfg.tg_token,
+      webhook_url: !!cfg.webhook_url,
+    };
+    return c.json(successRes({ settings: masked, configured }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+// 2. 保存应用配置（空值/打码值表示不修改）
+app.post("/api/settings", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    // 允许写入的配置键
+    const allowedKeys = [
+      "webhook_url", "webhook_type", "tg_token", "tg_chat_id",
+      "renew_threshold_days", "notify_days", "auto_renew"
+    ];
+    // 敏感字段：若值为空或仍是打码值（以 **** 开头），则跳过不覆盖
+    const sensitiveKeys = ["tg_token", "webhook_url"];
+
+    for (const key of allowedKeys) {
+      if (!(key in body)) continue;
+      const val = String(body[key] ?? "");
+      if (sensitiveKeys.includes(key)) {
+        if (val === "" || val.startsWith("****")) continue; // 不覆盖已有敏感值
+      }
+      await dbManager.setAppSetting(key, val);
+    }
+
+    await dbManager.writeLog("success", "operation", "管理员更新了系统设置配置");
+    return c.json(successRes({ message: "设置已保存" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+// 3. 测试 Telegram 推送
+app.post("/api/settings/test-telegram", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const cfg = await dbManager.getAllAppSettings();
+    // 优先用请求体里传入的新值（用户可能还没保存），否则用库里已存的
+    const token = (body.tg_token && !String(body.tg_token).startsWith("****")) ? String(body.tg_token) : cfg.tg_token;
+    const chatId = String(body.tg_chat_id || cfg.tg_chat_id || "");
+
+    if (!token || !chatId) {
+      return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
+    }
+
+    await sendTelegramNotification(token, chatId, "🎉 DNSHE Manager 测试推送：Telegram 通知配置成功！");
+    return c.json(successRes({ message: "测试消息已发送，请检查 Telegram" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+/**
  * 8. WHOIS 查询域名可注册性 (代理接口)
  */
 app.get("/api/whois", async (c) => {
@@ -724,7 +815,7 @@ app.post("/api/domains/register", async (c) => {
 
     if (res && res.success) {
       const fullDomain = res.full_domain || `${subdomain.trim()}.${rootdomain.trim()}`;
-      await dbManager.writeLog("success", "sync", `成功在账号 [ID: ${account_id}] 下注册了免费域名: [${fullDomain}]`);
+      await dbManager.writeLog("success", "api", `成功在账号 [ID: ${account_id}] 下注册了免费域名: [${fullDomain}]`);
       
       // 触发一次账号全量同步，把新注册域名自动拉入 domains_cache 数据库
       try {

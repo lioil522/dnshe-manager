@@ -63,6 +63,32 @@ export async function sendWebhookNotification(webhookUrl: string, message: strin
   }
 }
 
+/**
+ * 推送 Telegram 通知
+ *
+ * NOTE: 通过 Telegram Bot API 的 sendMessage 接口推送文本消息。
+ */
+export async function sendTelegramNotification(botToken: string, chatId: string, message: string) {
+  if (!botToken || !chatId) return;
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+        disable_web_page_preview: true,
+      }),
+    });
+    if (!res.ok) {
+      console.error(`Telegram push failed with status: ${res.status}`);
+    }
+  } catch (e) {
+    console.error("Failed to send Telegram notification:", e);
+  }
+}
+
 // NOTE: 使用 DNSHEClient 的类型签名来定义分页拉取接口
 interface SubdomainClient {
   listSubdomains(page: number, perPage: number): Promise<{
@@ -121,6 +147,18 @@ export async function runDailySyncAndRenewal(
 ) {
   await dbManager.ensureTables();
   await dbManager.writeLog("info", "system", "自动定时任务启动：开始执行域名同步与到期检测续期任务");
+
+  // 读取数据库应用配置（优先级高于环境变量）
+  const appCfg = await dbManager.getAllAppSettings();
+  const renewThresholdDays = (() => {
+    const v = parseInt(appCfg["renew_threshold_days"] || "", 10);
+    return isNaN(v) || v <= 0 ? 180 : v;
+  })();
+  const autoRenewEnabled = appCfg["auto_renew"] !== "0"; // 默认开启
+  const effectiveWebhookUrl = appCfg["webhook_url"] || webhookUrl || "";
+  const effectiveWebhookType = (appCfg["webhook_type"] as WebhookType) || webhookType;
+  const tgToken = appCfg["tg_token"] || "";
+  const tgChatId = appCfg["tg_chat_id"] || "";
 
   let accounts: Array<{ id: number; alias: string }> = [];
   try {
@@ -194,9 +232,9 @@ export async function runDailySyncAndRenewal(
         const remainingDays = (expiresTime - nowTime) / (1000 * 60 * 60 * 24);
 
         // NOTE: DNSHE 免费域名有效期为 1 年，且平台允许随时续期。
-        // 阈值设为 180 天：剩余有效期不足半年时自动续期，
-        // 确保定时任务能及时延长有效期，防止遗忘导致域名过期丢失。
-        if (remainingDays >= 0 && remainingDays <= 180) {
+        // 续期阈值默认 180 天（可在设置页配置 renew_threshold_days）：
+        // 剩余有效期不足阈值时自动续期，防止遗忘导致域名过期丢失。
+        if (autoRenewEnabled && remainingDays >= 0 && remainingDays <= renewThresholdDays) {
           const subId = sub.id as number;
           const fullDomain = sub.full_domain as string;
 
@@ -245,9 +283,14 @@ export async function runDailySyncAndRenewal(
   // 自动清理 30 天前的过期日志
   await dbManager.pruneExpiredLogs();
 
-  // 如果有域名触发了续期，并且配置了 webhook，则向用户发送消息推送
-  if (webhookUrl && renewLogs.length > 0) {
+  // 如果有域名触发了续期，则向配置的通知渠道推送消息
+  if (renewLogs.length > 0) {
     const notifyBody = `【DNSHE 域名自动续期报告】\n${summaryMsg}\n\n详细明细：\n${renewLogs.join("\n")}`;
-    await sendWebhookNotification(webhookUrl, notifyBody, webhookType);
+    if (effectiveWebhookUrl) {
+      await sendWebhookNotification(effectiveWebhookUrl, notifyBody, effectiveWebhookType);
+    }
+    if (tgToken && tgChatId) {
+      await sendTelegramNotification(tgToken, tgChatId, notifyBody);
+    }
   }
 }

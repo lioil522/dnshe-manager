@@ -6,8 +6,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="DNSHE 跨账号多域名自动化集中管理系统，支持多 API Key 凭证、域名资产看板、DNS 解析托管及无人值守到期自动续期。" />
     <title>DNSHE 域名多账号集控面板</title>
+    <script>
+      // 在 React 挂载前根据 localStorage 提前设置主题类，避免刷新时闪白
+      (function () {
+        try {
+          var t = localStorage.getItem("DNSHE_THEME") || "dark";
+          if (t === "dark") document.documentElement.classList.add("dark");
+        } catch (e) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
   </head>
-  <body class="bg-dark-950 text-slate-100 min-h-screen">
+  <body class="min-h-screen">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

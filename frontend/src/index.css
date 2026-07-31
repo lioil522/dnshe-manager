@@ -2,19 +2,62 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * 主题配色变量 —— 语义化 CSS 变量，配合 tailwind.config.js 中的语义色使用。
+ * 亮色为默认 (:root)，暗色通过挂在 <html> 上的 .dark 类切换。
+ */
+:root {
+  --bg-base: #f1f5f9;      /* 页面最底层背景 */
+  --bg-surface: #ffffff;   /* 卡片/表格容器 */
+  --bg-elevated: #f8fafc;  /* 悬浮/表头/输入框 */
+  --bg-hover: #f1f5f9;     /* hover 态 */
+  --border-base: #e2e8f0;  /* 主边框 */
+  --border-soft: #eef2f7;  /* 更浅的分隔线 */
+  --text-primary: #0f172a; /* 主文字 */
+  --text-secondary: #334155;
+  --text-muted: #64748b;   /* 次要/说明文字 */
+  --accent: #6366f1;       /* 品牌强调色 */
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-border: rgba(15, 23, 42, 0.06);
+  --glass-shadow: 0 8px 32px 0 rgba(15, 23, 42, 0.08);
+  --input-bg: rgba(248, 250, 252, 0.9);
+  --input-border: rgba(15, 23, 42, 0.12);
+}
+
+.dark {
+  --bg-base: #090d14;
+  --bg-surface: #0f151f;
+  --bg-elevated: #1a2433;
+  --bg-hover: #1a2433;
+  --border-base: #1a2433;
+  --border-soft: #131b28;
+  --text-primary: #ffffff;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --accent: #6366f1;
+  --glass-bg: rgba(26, 36, 51, 0.6);
+  --glass-border: rgba(255, 255, 255, 0.05);
+  --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  --input-bg: rgba(15, 21, 31, 0.8);
+  --input-border: rgba(255, 255, 255, 0.1);
+}
+
 @layer base {
   body {
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    transition: background-color 0.3s ease, color 0.3s ease;
   }
 }
 
 /* 高端玻璃微卡特效 */
 .glass-card {
-  background: rgba(26, 36, 51, 0.6);
+  background: var(--glass-bg);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -38,8 +81,9 @@
 
 /* 表单框阴影 */
 .form-input {
-  background: rgba(15, 21, 31, 0.8);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text-primary);
   transition: all 0.2s ease;
 }
 

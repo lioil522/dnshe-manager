@@ -116,7 +116,7 @@ export default function App() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
   // Toast 提示状态
-  const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
+  const [toast, setToast] = useState<{ type: "success" | "error" | "info" | "warning"; message: string } | null>(null);
 
   // 绑定账号表单状态
   const [newAlias, setNewAlias] = useState("");
@@ -335,7 +335,7 @@ export default function App() {
   }, []);
 
   // 显示 Toast 辅助函数
-  const showToast = (type: "success" | "error" | "info", message: string) => {
+  const showToast = (type: "success" | "error" | "info" | "warning", message: string) => {
     setToast({ type, message });
   };
 
@@ -1022,73 +1022,112 @@ export default function App() {
 
   // 批量词库与自定义前缀生成器
   const generatePrefixesFromRule = (rule: string, len: number, exclude: string): string[] => {
-    const consonants = "bcdfghjklmnpqrstvwxyz";
-    const vowels = "aeiou";
+    const consonants = "bcdfghjklmnpqrstvwxyz"; // 声母 (21 个辅音字母)
+    const vowels = "aeiou";                     // 韵母 (5 个元音字母)
     const digits = "0123456789";
     const digitsNo04 = "12356789";
     const letters = "abcdefghijklmnopqrstuvwxyz";
-    const pinyin2 = ["ba","pa","ma","fa","da","ta","na","la","ga","ka","ha","ji","qi","xi","zha","cha","sha","za","ca","sa","bo","po","mo","fo","de","te","ne","le","ge","ke","he","ji","qu","xu","zu","cu","su","ya","ye","wa","wo","er","an","en","ou"];
+
+    // 组合爆炸保护上限：字母×字母=676、CVCV=2205 均在范围内，超大规则会被安全截断
+    const MAX_PREFIXES = 20000;
+
+    // 排除字符集合（大小写不敏感）与过滤器
+    const exSet = new Set((exclude || "").toLowerCase().split("").filter(Boolean));
+    const filterEx = (arr: string[]) => arr.filter(s => !s.split("").some(c => exSet.has(c)));
+
+    // 简单字符类 token -> 该「位置」的候选字符集合
+    const classMap: Record<string, string[]> = {
+      "字母": letters.split(""),
+      "数字无04": digitsNo04.split(""),
+      "数字": digits.split(""),
+      "声母": consonants.split(""),
+      "韵母": vowels.split(""),
+    };
+
+    // 2 位拼音 / 双拼：声母 + 韵母 组成的可发音音节 (21×5 = 105)
+    const cvSyllables: string[] = [];
+    for (const c of consonants.split("")) {
+      for (const v of vowels.split("")) cvSyllables.push(c + v);
+    }
+
+    // 豹子 (AA / AAA)：字母与数字的等字符重复串
+    const repeatPattern = (n: number) =>
+      [...letters.split(""), ...digits.split("")].map(ch => ch.repeat(n));
+
+    // CVCV：辅音-元音-辅音-元音 四字组合 (21×5×21×5 = 11025，过滤后取上限)
+    const cvcvPattern: string[] = [];
+    for (const c1 of consonants.split("")) {
+      for (const v1 of vowels.split("")) {
+        for (const c2 of consonants.split("")) {
+          for (const v2 of vowels.split("")) cvcvPattern.push(`${c1}${v1}${c2}${v2}`);
+        }
+      }
+    }
 
     const shortcutTags = ["字母", "数字", "数字无04", "声母", "韵母", "2位拼音", "双拼", "2位豹子", "3位豹子", "CVCV"];
     const hasShortcutTag = shortcutTags.some(tag => rule.includes(tag));
 
-    // 当输入不包含快捷标签时，视为自定义具体前缀（支持逗号、空格、分号或换行分隔多个前缀）
-    if (!hasShortcutTag && rule.trim()) {
-      const rawCustoms = rule.trim().split(/[,;\s\n]+/);
-      let customs = rawCustoms.map(s => s.trim().toLowerCase()).filter(Boolean);
+    // ── 自定义前缀模式：无任何快捷标签时，按分隔符拆分为具体前缀词 ──
+    if (!hasShortcutTag) {
+      if (!rule.trim()) return [];
+      const customs = rule.trim().toLowerCase()
+        .split(/[+,;\s\n]+/)
+        .map(s => s.trim())
+        .filter(Boolean);
+      return Array.from(new Set(filterEx(customs)));
+    }
 
-      if (exclude) {
-        const exSet = new Set(exclude.split(""));
-        customs = customs.filter(sub => !sub.split("").some(c => exSet.has(c)));
+    // ── 整体型 token：直接产出完整前缀，不参与逐位笛卡尔组合 ──
+    if (rule.includes("CVCV"))
+      return Array.from(new Set(filterEx(cvcvPattern))).slice(0, MAX_PREFIXES);
+    if (rule.includes("3位豹子"))
+      return Array.from(new Set(filterEx(repeatPattern(3)))).slice(0, MAX_PREFIXES);
+    if (rule.includes("2位豹子"))
+      return Array.from(new Set(filterEx(repeatPattern(2)))).slice(0, MAX_PREFIXES);
+    if (rule.includes("2位拼音") || rule.includes("双拼"))
+      return Array.from(new Set(filterEx(cvSyllables))).slice(0, MAX_PREFIXES);
+
+    // ── 逐位组合型：按 "+" 拆分为有序段，每段对应「一个位置」的候选字符集 ──
+    const segments = rule.split("+").map(s => s.trim()).filter(Boolean);
+
+    let pools: string[][] = [];
+    for (const seg of segments) {
+      if (classMap[seg]) {
+        pools.push(classMap[seg]);
+        continue;
       }
-
-      return Array.from(new Set(customs));
+      // 兼容未用 "+" 分隔的连写（如 "字母数字"），按优先级探测子串（数字无04 优先于 数字）
+      let matched: string[] | null = null;
+      if (seg.includes("数字无04")) matched = classMap["数字无04"];
+      else if (seg.includes("数字")) matched = classMap["数字"];
+      else if (seg.includes("字母")) matched = classMap["字母"];
+      else if (seg.includes("声母")) matched = classMap["声母"];
+      else if (seg.includes("韵母")) matched = classMap["韵母"];
+      if (matched) pools.push(matched);
     }
 
-    let charPool: string[] = [];
-
-    if (rule.includes("字母")) charPool.push(...letters.split(""));
-    if (rule.includes("数字无04")) charPool.push(...digitsNo04.split(""));
-    else if (rule.includes("数字")) charPool.push(...digits.split(""));
-    if (rule.includes("声母")) charPool.push(...consonants.split(""));
-    if (rule.includes("韵母")) charPool.push(...vowels.split(""));
-
-    charPool = Array.from(new Set(charPool));
-
-    if (exclude) {
-      const exSet = new Set(exclude.split(""));
-      charPool = charPool.filter(c => !exSet.has(c));
+    // 仅识别到单个位置时，用下拉框长度把该位置重复 len 次（如 "字母" + 3 位 → aaa..zzz）
+    if (pools.length === 1 && len > 1) {
+      pools = Array(len).fill(pools[0]);
     }
 
-    if (charPool.length === 0) {
-      charPool = letters.split("").filter(c => !exclude.includes(c));
-    }
+    // 对每个位置应用排除字符；任一位置被排空则无法生成
+    pools = pools.map(p => filterEx(p));
+    if (pools.length === 0 || pools.some(p => p.length === 0)) return [];
 
-    let results: string[] = [];
-    if (rule.includes("2位拼音") || rule.includes("双拼")) {
-      results = pinyin2.slice(0, 40);
-    } else if (rule.includes("豹子")) {
-      results = charPool.map(c => c.repeat(len));
-    } else if (rule.includes("CVCV")) {
-      const cList = consonants.split("").filter(c => !exclude.includes(c));
-      const vList = vowels.split("").filter(c => !exclude.includes(c));
-      for (const c1 of cList.slice(0, 6)) {
-        for (const v1 of vList.slice(0, 4)) {
-          results.push(`${c1}${v1}${c1}${v1}`);
-        }
+    // 逐位笛卡尔积：用下标映射保证每条结果都是完整长度，并在 MAX_PREFIXES 处干净截断
+    const total = pools.reduce((acc, p) => acc * p.length, 1);
+    const limit = Math.min(total, MAX_PREFIXES);
+    const results: string[] = [];
+    for (let i = 0; i < limit; i++) {
+      let idx = i;
+      let s = "";
+      for (let p = pools.length - 1; p >= 0; p--) {
+        const pool = pools[p];
+        s = pool[idx % pool.length] + s;
+        idx = Math.floor(idx / pool.length);
       }
-    } else {
-      const recursiveGen = (current: string, currentLen: number) => {
-        if (currentLen === len) {
-          results.push(current);
-          return;
-        }
-        for (const char of charPool) {
-          if (results.length >= 80) break;
-          recursiveGen(current + char, currentLen + 1);
-        }
-      };
-      recursiveGen("", 0);
+      results.push(s);
     }
 
     return Array.from(new Set(results));
@@ -1111,6 +1150,9 @@ export default function App() {
     if (prefixes.length === 0) {
       showToast("error", "根据当前规则未能生成有效的前缀词库，请修改规则！");
       return;
+    }
+    if (prefixes.length >= 20000) {
+      showToast("warning", "⚠️ 规则组合量过大，已按安全上限截断为 20000 个前缀，建议缩小字符集或使用排除字符。");
     }
 
     const totalTasks: Array<{ sub: string; root: string; full: string }> = [];
@@ -2603,6 +2645,7 @@ export default function App() {
           {toast.type === "success" && <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0" />}
           {toast.type === "error" && <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0" />}
           {toast.type === "info" && <Info className="w-5 h-5 text-indigo-500 flex-shrink-0" />}
+          {toast.type === "warning" && <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0" />}
           <span>{toast.message}</span>
         </div>
       )}

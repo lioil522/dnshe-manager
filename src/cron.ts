@@ -78,7 +78,7 @@ interface SubdomainClient {
  *
  * NOTE: DNSHE API 的 per_page 最大值为 500。循环分页直到所有数据拉取完毕。
  */
-async function fetchAllSubdomainsFromClient(client: SubdomainClient): Promise<SubdomainInfo[]> {
+export async function fetchAllSubdomainsFromClient(client: SubdomainClient): Promise<SubdomainInfo[]> {
   const allSubdomains: SubdomainInfo[] = [];
   const perPage = 500;
   let page = 1;

@@ -1,7 +1,28 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { DatabaseManager } from "./db";
-import { runDailySyncAndRenewal } from "./cron";
+import { DNSHEClient } from "./dnshe";
+import type { CreateDnsRecordParams } from "./dnshe";
+import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient } from "./cron";
+
+/**
+ * 统一成功响应封装 — 将 payload 扁平化后附加 success: true，
+ * 与前端 data.success / data.accounts / data.message 等取值约定保持一致
+ */
+function successRes(payload: Record<string, unknown> = {}) {
+  return { success: true, ...payload };
+}
+
+/**
+ * 统一失败响应封装 — 附加 success: false、错误消息与可选错误码 (error_code)
+ */
+function errorRes(message: string, errorCode?: string) {
+  const res: Record<string, unknown> = { success: false, message };
+  if (errorCode) {
+    res.error_code = errorCode;
+  }
+  return res;
+}
 
 type Bindings = {
   DB: D1Database;
@@ -494,7 +515,7 @@ app.post("/api/domains/:id/dns", async (c) => {
     const res = await client.createDnsRecord({
       subdomain_id: domainId,
       ...body
-    });
+    } as CreateDnsRecordParams);
 
     if (res && res.success) {
       await dbManager.writeLog("success", "system", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${body.name || "@"} -> ${body.content}`);
@@ -708,7 +729,7 @@ app.post("/api/domains/register", async (c) => {
       // 触发一次账号全量同步，把新注册域名自动拉入 domains_cache 数据库
       try {
         const subdomains = await fetchAllSubdomainsFromClient(client);
-        await dbManager.saveSubdomainsCache(account_id, subdomains);
+        await dbManager.syncAccountDomains(account_id, subdomains);
       } catch (e) {
         console.error("注册后同步错误:", e);
       }

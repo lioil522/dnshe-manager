@@ -79,6 +79,12 @@ export interface CreateDnsRecordResponse extends BaseResponse {
 /** 通用操作响应（用于更新、删除等不返回额外数据的操作） */
 export interface ActionResponse extends BaseResponse {}
 
+/** 注册子域名响应 */
+export interface RegisterSubdomainResponse extends BaseResponse {
+  subdomain_id?: number;
+  full_domain?: string;
+}
+
 /** 创建 DNS 记录参数 */
 export interface CreateDnsRecordParams {
   subdomain_id: number;
@@ -194,8 +200,8 @@ export class DNSHEClient {
   /**
    * 注册新的子域名
    */
-  async registerSubdomain(subdomain: string, rootdomain: string): Promise<ActionResponse> {
-    return this.request<ActionResponse>("subdomains", "register", "POST", {
+  async registerSubdomain(subdomain: string, rootdomain: string): Promise<RegisterSubdomainResponse> {
+    return this.request<RegisterSubdomainResponse>("subdomains", "register", "POST", {
       subdomain,
       rootdomain
     });

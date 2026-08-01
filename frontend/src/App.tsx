@@ -288,6 +288,8 @@ export default function App() {
   const [authStatusLoaded, setAuthStatusLoaded] = useState(false);
   // 系统是否已初始化（设置过管理员密码）
   const [authInitialized, setAuthInitialized] = useState(true);
+  // 系统是否已开启 2FA（登录页直接展示动态码输入框）
+  const [authTwoFaEnabled, setAuthTwoFaEnabled] = useState(false);
   // 本次登录是否需要 2FA 动态码（后端返回 need_2fa 时置真）
   const [loginNeeds2fa, setLoginNeeds2fa] = useState(false);
 
@@ -368,6 +370,7 @@ export default function App() {
       const data = await res.json();
       if (data.success) {
         setAuthInitialized(!!data.initialized);
+        setAuthTwoFaEnabled(!!data.two_fa_enabled);
       }
     } catch (e) {
       // 后端不可达时默认按已初始化处理，仍展示登录页
@@ -401,7 +404,7 @@ export default function App() {
       setLoginError("请输入用户名与密码");
       return;
     }
-    if (loginNeeds2fa && !loginTotp.trim()) {
+    if (authTwoFaEnabled && !loginTotp.trim()) {
       setLoginError("请输入 6 位动态验证码");
       return;
     }
@@ -851,11 +854,11 @@ export default function App() {
     }
   };
 
-  // 3. 获取配额列表
-  const fetchQuotas = async () => {
+  // 3. 获取配额列表（默认命中缓存，forceRefresh 时强制回源刷新）
+  const fetchQuotas = async (forceRefresh = false) => {
     setLoadingQuotas(true);
     try {
-      const res = await apiFetch("/api/quota");
+      const res = await apiFetch(`/api/quota${forceRefresh ? "?refresh=1" : ""}`);
       const data = await res.json();
       if (data.success) {
         setQuotas(data.quotas || []);
@@ -980,6 +983,7 @@ export default function App() {
         const data = await res.json();
         if (!cancelled && data.success) {
           setAuthInitialized(!!data.initialized);
+          setAuthTwoFaEnabled(!!data.two_fa_enabled);
         }
       } catch (e) {
         // 网络异常时保持默认（已初始化），仍展示登录表单
@@ -1230,7 +1234,7 @@ export default function App() {
   };
 
   // 打开 DNS 管理面板
-  const handleOpenDnsModal = async (domain: Domain) => {
+  const handleOpenDnsModal = async (domain: Domain, forceRefresh = false) => {
     setSelectedDomain(domain);
     setDnsModalOpen(true);
     setLoadingDns(true);
@@ -1246,7 +1250,7 @@ export default function App() {
     setNewDnsLine("");
 
     try {
-      const res = await apiFetch(`/api/domains/${domain.id}/dns`);
+      const res = await apiFetch(`/api/domains/${domain.id}/dns${forceRefresh ? "?refresh=1" : ""}`);
       const data = await res.json();
       if (data.success) {
         setDnsRecords(data.records || []);
@@ -1720,6 +1724,24 @@ export default function App() {
     [logs]
   );
 
+  // 已读告警标记：持久化最近查看过的告警 ID，用于小铃铛红点显隐
+  const [lastAlertSeenId, setLastAlertSeenId] = useState<number>(
+    () => Number(localStorage.getItem("DNSHE_LAST_SEEN_ALERT_ID") || 0)
+  );
+  // 是否存在比上次已读更新/更高的未读告警
+  const unreadAlert = useMemo(() => {
+    const newest = alertLogs[0];
+    return !!newest && newest.id > lastAlertSeenId;
+  }, [alertLogs, lastAlertSeenId]);
+  // 将当前全部告警标记为已读
+  const markAlertsRead = () => {
+    const newest = alertLogs[0];
+    if (newest) {
+      setLastAlertSeenId(newest.id);
+      localStorage.setItem("DNSHE_LAST_SEEN_ALERT_ID", String(newest.id));
+    }
+  };
+
   // 日志分类映射（兼容历史 category 值）
   //   登录 ← auth
   //   API  ← api / sync / renew
@@ -1823,7 +1845,7 @@ export default function App() {
                   className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                 />
               </div>
-              {loginNeeds2fa && (
+              {(authTwoFaEnabled || loginNeeds2fa) && (
                 <div className="space-y-1.5">
                   <label className="text-xs font-semibold text-content-secondary flex items-center gap-1.5">
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" /> 两步验证动态码
@@ -1895,24 +1917,7 @@ export default function App() {
             </form>
           )}
 
-          {/* 后端地址配置（折叠在底部，便于跨域部署时指定 Worker） */}
-          <details className="text-xs text-content-muted">
-            <summary className="cursor-pointer hover:text-content-secondary select-none">后端地址设置（跨域部署时使用）</summary>
-            <div className="flex gap-2 mt-2">
-              <input
-                value={backendUrlInput}
-                onChange={(e) => setBackendUrlInput(e.target.value)}
-                placeholder="https://api-dnshe.example.com"
-                className="form-input flex-1 px-3 py-2 rounded-lg text-xs text-content-primary placeholder:text-content-muted"
-              />
-              <button
-                onClick={handleSaveBackendUrl}
-                className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-xs font-semibold"
-              >
-                保存
-              </button>
-            </div>
-          </details>
+          {/* 登录页 Toast 通知 */}
         </div>
 
         {/* 登录页也需要 Toast 通知 */}
@@ -2016,12 +2021,16 @@ export default function App() {
           {/* 通知铃铛 */}
           <div className="relative">
             <button
-              onClick={() => setNotifOpen((v) => !v)}
+              onClick={() => {
+                const next = !notifOpen;
+                setNotifOpen(next);
+                if (next) markAlertsRead();
+              }}
               className="relative p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all"
               title="告警通知"
             >
               <Bell className="w-5 h-5" />
-              {alertLogs.length > 0 && (
+              {unreadAlert && (
                 <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-red-500 animate-pulse" />
               )}
             </button>
@@ -2030,7 +2039,7 @@ export default function App() {
                 <div className="px-2 py-1.5 text-xs font-bold text-content-muted flex items-center justify-between">
                   <span>最近告警</span>
                   <button
-                    onClick={() => { setActiveTab("logs"); setNotifOpen(false); }}
+                    onClick={() => { markAlertsRead(); setActiveTab("logs"); setNotifOpen(false); }}
                     className="text-indigo-400 hover:text-indigo-300"
                   >
                     查看全部
@@ -2859,7 +2868,18 @@ export default function App() {
         {/* Tab 3: 账户配额 */}
         {activeTab === "quota" && (
           <div>
-            <h2 className="text-lg font-bold text-content-primary mb-6">各账户域名配额概览</h2>
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-lg font-bold text-content-primary">各账户域名配额概览</h2>
+              <button
+                onClick={() => fetchQuotas(true)}
+                disabled={loadingQuotas}
+                className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-60"
+                title="强制从 DNSHE 重新拉取配额"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${loadingQuotas ? "animate-spin" : ""}`} />
+                刷新
+              </button>
+            </div>
             
             {loadingQuotas ? (
               <div className="flex justify-center py-20">
@@ -3366,12 +3386,22 @@ export default function App() {
                   域名: {selectedDomain.full_domain}
                 </p>
               </div>
-              <button 
-                onClick={() => setDnsModalOpen(false)}
-                className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-1">
+                <button 
+                  onClick={() => handleOpenDnsModal(selectedDomain, true)}
+                  disabled={loadingDns}
+                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded disabled:opacity-50"
+                  title="强制刷新（重新从 DNSHE 拉取）"
+                >
+                  <RefreshCw className={`w-4 h-4 ${loadingDns ? "animate-spin" : ""}`} />
+                </button>
+                <button 
+                  onClick={() => setDnsModalOpen(false)}
+                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
             {/* 模态框主体 */}

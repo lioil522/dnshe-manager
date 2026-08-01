@@ -656,6 +656,15 @@ app.post("/api/domains/:id/renew", async (c) => {
 
       const msg = `域名 [${domainInfo.full_domain}] (账户: ${alias}) 手动续期成功！新有效期至: ${newExpiresAt}`;
       await dbManager.writeLog("success", "api", msg, res);
+      // 续期可能影响配额，回源刷新配额缓存，保证后续读操作命中最新数据
+      try {
+        const { accounts, quotas } = await fetchAllQuotas(dbManager);
+        if (accounts.length > 0) {
+          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+        }
+      } catch (e) {
+        console.error("续期后刷新配额缓存失败:", e);
+      }
       
       return c.json(successRes({ message: "续期成功", new_expires_at: newExpiresAt }));
     } else {
@@ -671,6 +680,8 @@ app.post("/api/domains/:id/renew", async (c) => {
 app.get("/api/domains/:id/dns", async (c) => {
   const dbManager = c.get("db");
   const domainId = parseInt(c.req.param("id"), 10);
+  const cacheKey = `api_cache:dns:${domainId}`;
+  const forceRefresh = c.req.query("refresh") === "1";
 
   try {
     // NOTE: 使用主键查询替代全表扫描
@@ -679,11 +690,22 @@ app.get("/api/domains/:id/dns", async (c) => {
       return c.json(errorRes("未找到域名记录", "not_found"), 404);
     }
 
+    // 读操作默认只命中缓存，不调用上游 API（除非显式强制刷新）
+    if (!forceRefresh) {
+      const cached = await dbManager.getCache(cacheKey);
+      if (cached) {
+        return c.json(successRes({ records: JSON.parse(cached) }));
+      }
+    }
+
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
     const res = await client.listDnsRecords(domainId);
     
     if (res && res.success) {
-      return c.json(successRes({ records: res.records || [] }));
+      const records = res.records || [];
+      await dbManager.setCache(cacheKey, JSON.stringify(records));
+      await dbManager.writeLog("success", "api", `查看了域名 [${domainInfo.full_domain}] 的 DNS 解析记录 (${records.length} 条)`);
+      return c.json(successRes({ records }));
     } else {
       throw new Error(res.message || "获取DNS记录失败");
     }
@@ -698,6 +720,9 @@ async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client
   try {
     const dnsRes = await client.listDnsRecords(domainId);
     const records = (dnsRes && dnsRes.success && Array.isArray(dnsRes.records)) ? dnsRes.records : [];
+    
+    // 写操作回源后，将最新记录回填到缓存，后续读操作直接命中
+    await dbManager.setCache(`api_cache:dns:${domainId}`, JSON.stringify(records));
     
     // 是否使用自定义/第三方 NS
     const nsRecords = records.filter(r => r.type === "NS");
@@ -833,37 +858,62 @@ app.delete("/api/domains/:id/dns/:record_id", async (c) => {
  * NOTE: 原先使用 for...of 串行查询，5 个账号总延迟为 5x 单次请求延迟。
  * 改为并发后总延迟降至单次请求耗时。
  */
+/**
+ * 辅助函数：并发拉取所有账号的配额并返回（不含缓存逻辑，供接口与写操作回填复用）
+ */
+async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: Array<{ id: number; alias: string }>; quotas: any[] }> {
+  const accounts = await dbManager.getAccounts();
+
+  // 并发发起所有账号的配额查询请求
+  const quotaPromises = accounts.map(async (acc) => {
+    const { client } = await dbManager.getClientForAccount(acc.id);
+    const qRes = await client.getQuota();
+    if (qRes && qRes.success) {
+      return {
+        account_id: acc.id,
+        alias: acc.alias,
+        ...qRes.quota
+      };
+    }
+    throw new Error(qRes.message || "获取额度失败");
+  });
+
+  const results = await Promise.allSettled(quotaPromises);
+
+  const quotas = results.map((result, idx) => {
+    if (result.status === "fulfilled") {
+      return result.value;
+    }
+    return {
+      account_id: accounts[idx].id,
+      alias: accounts[idx].alias,
+      error: result.reason?.message || "获取额度失败"
+    };
+  });
+
+  return { accounts, quotas };
+}
+
 app.get("/api/quota", async (c) => {
   const dbManager = c.get("db");
+  const cacheKey = "api_cache:quota";
+  const forceRefresh = c.req.query("refresh") === "1";
+
   try {
-    const accounts = await dbManager.getAccounts();
-
-    // 并发发起所有账号的配额查询请求
-    const quotaPromises = accounts.map(async (acc) => {
-      const { client } = await dbManager.getClientForAccount(acc.id);
-      const qRes = await client.getQuota();
-      if (qRes && qRes.success) {
-        return {
-          account_id: acc.id,
-          alias: acc.alias,
-          ...qRes.quota
-        };
+    // 读操作默认只命中缓存，不调用上游 API（除非显式强制刷新）
+    if (!forceRefresh) {
+      const cached = await dbManager.getCache(cacheKey);
+      if (cached) {
+        return c.json(successRes({ quotas: JSON.parse(cached) }));
       }
-      throw new Error(qRes.message || "获取额度失败");
-    });
+    }
 
-    const results = await Promise.allSettled(quotaPromises);
+    const { accounts, quotas } = await fetchAllQuotas(dbManager);
 
-    const quotas = results.map((result, idx) => {
-      if (result.status === "fulfilled") {
-        return result.value;
-      }
-      return {
-        account_id: accounts[idx].id,
-        alias: accounts[idx].alias,
-        error: result.reason?.message || "获取额度失败"
-      };
-    });
+    if (accounts.length > 0) {
+      await dbManager.writeLog("success", "api", `查询了 ${accounts.length} 个账号的账户配额`);
+      await dbManager.setCache(cacheKey, JSON.stringify(quotas));
+    }
 
     return c.json(successRes({ quotas }));
   } catch (e: unknown) {
@@ -1011,6 +1061,7 @@ app.get("/api/whois", async (c) => {
     }
 
     const res = await client.whois(domain.trim());
+    await dbManager.writeLog("success", "api", `WHOIS 查询域名 [${domain.trim()}]`);
     return c.json(successRes({ whois: res }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "WHOIS 查询异常";
@@ -1036,6 +1087,15 @@ app.post("/api/domains/register", async (c) => {
     if (res && res.success) {
       const fullDomain = res.full_domain || `${subdomain.trim()}.${rootdomain.trim()}`;
       await dbManager.writeLog("success", "api", `成功在账号 [ID: ${account_id}] 下注册了免费域名: [${fullDomain}]`);
+      // 注册会消耗配额，回源刷新配额缓存，保证后续读操作命中最新数据
+      try {
+        const { accounts, quotas } = await fetchAllQuotas(dbManager);
+        if (accounts.length > 0) {
+          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+        }
+      } catch (e) {
+        console.error("注册后刷新配额缓存失败:", e);
+      }
       
       // 触发一次账号全量同步，把新注册域名自动拉入 domains_cache 数据库
       try {

@@ -27,10 +27,17 @@ CREATE TABLE IF NOT EXISTS domains_cache (
 CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL,                   -- info / success / warning / error
-    category TEXT NOT NULL,               -- sync / renew / system
+    category TEXT NOT NULL,               -- sync / renew / system / auth / api / operation
     message TEXT NOT NULL,                -- 简短描述
     details TEXT,                         -- 详细 JSON 内容或报错堆栈
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. API 上游响应缓存表（防止频繁调用 DNSHE 官方 API 被判定滥用）
+CREATE TABLE IF NOT EXISTS cache (
+    key TEXT PRIMARY KEY,                 -- 缓存键 (如 api_cache:quota / api_cache:dns:<domainId>)
+    value TEXT NOT NULL,                  -- 缓存的 JSON 数据
+    expires_at INTEGER NOT NULL           -- 绝对过期时间 (epoch 秒)
 );
 
 -- 创建索引以加速跨账号域名搜索和定时扫描

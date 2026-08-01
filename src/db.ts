@@ -223,6 +223,13 @@ export class DatabaseManager {
             value TEXT NOT NULL,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
           );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS cache (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+          );
         `)
       ]);
     } catch (e) {
@@ -300,6 +307,51 @@ export class DatabaseManager {
       }
     }
     await this.setSetting(`cfg_${shortKey}`, stored);
+  }
+
+  /**
+   * 读取缓存值（仅在面板内写操作后失效，长期有效）
+   *
+   * NOTE: 此缓存模型为"写操作回源回填，读操作仅命中缓存"：
+   * 只有面板内的增删改会删除/重填缓存，缓存本身不过期。
+   * 为避免历史/意外长期占用，仍写入一个较远的绝对过期时间作为兜底。
+   */
+  async getCache(key: string): Promise<string | null> {
+    try {
+      const row = await this.db.prepare(
+        "SELECT value FROM cache WHERE key = ? AND expires_at > ?"
+      ).bind(key, Math.floor(Date.now() / 1000)).first<{ value: string }>();
+      return row ? row.value : null;
+    } catch (e) {
+      console.error("getCache error:", e);
+      return null;
+    }
+  }
+
+  /**
+   * 写入缓存（默认 1 年后过期，作为极端兜底；正常由写操作主动失效/重填）
+   */
+  async setCache(key: string, value: string): Promise<void> {
+    try {
+      // 366 天后的绝对过期时间，保证"不过期"语义的同时不会永久占用 D1 存储
+      const expiresAt = Math.floor(Date.now() / 1000) + 366 * 24 * 3600;
+      await this.db.prepare(
+        "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at"
+      ).bind(key, value, expiresAt).run();
+    } catch (e) {
+      console.error("setCache error:", e);
+    }
+  }
+
+  /**
+   * 删除指定缓存（写操作后调用，强制下一次读取回源刷新）
+   */
+  async deleteCache(key: string): Promise<void> {
+    try {
+      await this.db.prepare("DELETE FROM cache WHERE key = ?").bind(key).run();
+    } catch (e) {
+      console.error("deleteCache error:", e);
+    }
   }
 
   /**

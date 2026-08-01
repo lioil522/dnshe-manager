@@ -3,34 +3,82 @@
 [![Cloudflare Workers](https://img.shields.io/badge/Backend-Cloudflare_Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 [![Cloudflare Pages](https://img.shields.io/badge/Frontend-Cloudflare_Pages-F38020?logo=cloudflare&logoColor=white)](https://pages.cloudflare.com/)
 [![Database](https://img.shields.io/badge/Database-Cloudflare_D1_SQL-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/d1/)
+[![TypeScript](https://img.shields.io/badge/Language-TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-一款专为 **DNSHE 免费域名用户** 设计的现代化、全自动跨账号集中托管控制面板。基于 **Cloudflare Serverless 架构** 开发，完全免费托管于 Cloudflare 平台（支持 Serverless 零成本运行）。
+一款专为 **DNSHE 免费域名用户** 设计的高颜值、现代化、全自动跨账号集中托管控制面板。
+
+基于 **Cloudflare Serverless 全家桶**（Cloudflare Workers + Cloudflare Pages + Cloudflare D1）构建，无需采购服务器，即可完美免费托管于 Cloudflare 平台（支持 Serverless 零成本运行）。
 
 ---
 
-## 🌟 核心功能特色
+## 📖 目录
 
-- **🔑 跨账号集中管理**：一次性绑定多个 DNSHE 账号 API Key，在一个高颜值面板下统筹管理所有名下的子域名及 DNS 解析记录。
-- **🏷️ 域名三态智能识别**：自动识别域名的健康与配置状态：
-  - **`未解析`** (灰调)：使用官方默认 NS，但尚未添加任何解析记录。
-  - **`已解析`** (绿调)：使用官方默认 NS，且已配置有效解析记录（支持面板在线一键编辑）。
-  - **`已委派`** (蓝调)：已托管至第三方 NS（如 Cloudflare/DNSPod 等），下级解析交由外部处理。
-- **🛡️ NS 域名服务器智能切换**：支持在线添加自定义第三方 NS 委派（提供【强制替换冲突记录】能力），并支持一键恢复为官方默认 NS（`ns1.dnshe.com` / `ns2.dnshe.com`）。
-- **⏳ 终身无人值守自动续期**：内置每日 Cron Trigger 自动巡检任务，域名到期前 15 天自动触发免费续期，无需人工干预。
-- **🔔 Webhook 消息通知**：支持绑定钉钉、飞书、企业微信或自定义 Webhook，在域名成功续期或发生异常时第一时间发送推送提醒。
-- **🔐 AES-GCM 高强度加密**：所有绑定的账号 API Secret 在 Cloudflare D1 数据库中均通过 AES-GCM 对称算法加密保存，保障密钥安全。
+- [🌟 核心功能特性](#-核心功能特性)
+- [🏗️ 系统架构图解](#-系统架构图解)
+- [🔑 环境变量与密钥说明（必看）](#-环境变量与密钥说明必看)
+  - [1. GitHub Secrets（GitHub Actions 自动化部署必需）](#1-github-secretsgithub-actions-自动化部署必需)
+  - [2. Cloudflare Worker 环境变量 / Secrets（后端运行期）](#2-cloudflare-worker-环境变量--secrets后端运行期)
+  - [3. 前端编译环境变量](#3-前端编译环境变量)
+- [🚀 详细部署流程](#-详细部署流程)
+  - [准备工作：获取 Cloudflare 凭证](#准备工作获取-cloudflare-凭证)
+  - [方式一：GitHub Actions 一键全自动部署 (推荐 ⭐⭐⭐⭐⭐)](#方式一github-actions-一键全自动部署-推荐-)
+  - [方式二：Cloudflare CLI / Wrangler 手动部署](#方式二cloudflare-cli--wrangler-手动部署)
+- [💻 本地二次开发与调试](#-本地二次开发与调试)
+- [📁 项目目录结构](#-项目目录结构)
+- [❓ 常见问题与注意事项 (FAQ)](#-常见问题与注意事项-faq)
+- [📄 开源协议](#-开源协议)
 
 ---
 
-## 🏗️ 系统技术架构
+## 🌟 核心功能特性
+
+### 🔑 1. 跨账号集中管理
+- 支持一次性绑定多个 DNSHE 账号（API Key + API Secret + 别名）。
+- 在统一控制面板中高颜值统筹展示所有账号名下的子域名及 DNS 解析记录。
+- **额度配额并发查询**：支持并发（`Promise.allSettled`）实时拉取所有绑定账号的免费域名注册配额使用情况。
+
+### 🏷️ 2. 域名三态智能识别
+系统能自动侦测并识别域名的当前解析与配置状态：
+- **`未解析`** ⚪ (灰色)：使用官方默认 NS（`ns1.dnshe.com` / `ns2.dnshe.com`），但尚未添加任何 DNS 解析记录。
+- **`已解析`** 🟢 (绿色)：使用官方默认 NS，且已配置有效解析记录（支持在控制台进行全功能增删改查）。
+- **`已委派`** 🔵 (蓝色)：已托管至第三方 NS（如 Cloudflare / DNSPod / NextDNS 等），下级 DNS 解析交由外部平台处理。
+
+### 🛡️ 3. NS 域名服务器智能切换
+- 支持在面板中一键添加自定义第三方 NS 记录（提供【强制替换冲突记录】能力）。
+- 支持一键快捷恢复为 DNSHE 官方默认 NS 节点。
+- **友好错误拦截**：若 DNSHE 上游平台禁用 NS 管理（`disable_ns_management`），后端能捕获并反馈清晰的中文指引。
+
+### ⏳ 4. 终身无人值守自动续期
+- 内置 Cloudflare Cron Trigger 触发器（默认每日 02:00 巡检）。
+- **可自定义续期阈值**：可在设置中自定义提前续期天数（默认 180 天），剩余有效期低于阈值时自动触发免费续期 API。
+- 自动更新本地数据库缓存并清理过期的系统日志。
+
+### 🔔 5. 多渠道自动化消息通知
+自动续期完成后，支持多渠道第一时间推送明细报告：
+- **多平台 Webhook 适配**：内置适配 **钉钉 (DingTalk)**、**飞书 (Feishu)**、**企业微信 (WeCom)** 及 **自定义 (Custom)** 平台的 JSON 数据 Payload 结构。
+- **Telegram Bot 原生推送**：支持独立配置 Telegram Bot Token 与 Chat ID，支持在控制台进行实时连通性测试。
+
+### 🔐 6. 顶级安全防护体系
+- **AES-GCM 加密**：敏感的 API Secret 和 2FA 密钥均采用 256 位 AES-GCM 高强度算法加密存储于 D1 数据库中。
+- **PBKDF2 加盐密码**：管理员密码采用标准 PBKDF2 + Safe Random Salt 哈希防查表比对。
+- **两步验证 (2FA / TOTP)**：支持绑定标准身份验证器（Google Authenticator / Microsoft Authenticator / Bitwarden），扫描 Base32 二维码完成 6 位动态口令验证。
+- **应急逃生通道 (`ADMIN_TOKEN`)**：配置后可在忘记密码时，通过后门口令（静态 Token 或其 TOTP 动态码）安全恢复访问。
+
+### 🔍 7. 在线 WHOIS 查询与一键注册
+- 内置 WHOIS 代理查询功能，实时检测特定免费域名可注册状态。
+- 支持直接在面板中一键提交新域名注册，注册成功后自动增量同步入库。
+
+---
+
+## 🏗️ 系统架构图解
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │                 Cloudflare Pages (前端 UI)                  │
 │       React 18 + TypeScript + Tailwind CSS + Lucide Icons   │
 └──────────────────────────────┬──────────────────────────────┘
-                               │ HTTP API
+                               │ HTTP API / Bearer Session Token
 ┌──────────────────────────────▼──────────────────────────────┐
 │                Cloudflare Workers (后端 API)                 │
 │              Hono.js 框架 + Router + Security Auth           │
@@ -44,75 +92,165 @@
 
 ---
 
-## 🚀 云端部署指南
+## 🔑 环境变量与密钥说明（必看）
 
-系统支持两种部署方式：**GitHub Actions 一键全自动部署** (推荐) 与 **Cloudflare Pages 控制台部署**。
+为确保部署顺利以及数据安全，请仔细阅读以下环境变量的区分与定义：
 
-### 方式一：GitHub Actions 全自动部署 (推荐)
+### 1. GitHub Secrets（GitHub Actions 自动化部署必需）
 
-只要向本仓库 Push 代码，GitHub Actions 将会自动打包部署前端与后端。
+在使用 GitHub Actions 进行自动构建发布时，需在 GitHub 仓库的 **Settings -> Secrets and variables -> Actions** 中配置：
 
-1. **获取 Cloudflare API 凭证**：
-   - 登录 [Cloudflare 控制台](https://dash.cloudflare.com/) -> 点击右上角头像 -> **我的个人资料** -> **API 令牌** -> **创建令牌** -> 选择 **编辑 Cloudflare Workers** 模板创建。
-   - 记录生成的 `API Token` 以及控制台右侧的 `Account ID` (账户 ID)。
-2. **在 GitHub 仓库添加 Secrets**：
-   - 打开 GitHub 仓库 -> **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**。
-   - 依次添加以下两个变量：
-     - `CLOUDFLARE_API_TOKEN`: 填入您的 Cloudflare API Token。
-     - `CLOUDFLARE_ACCOUNT_ID`: 填入您的 Cloudflare Account ID。
-3. **提交推送代码**：
-   - 执行 `git push`，GitHub 会自动运行 `.github/workflows/deploy.yml` 脚本，将 Worker 后端与 Pages 前端自动发布上线！
+| 变量名 | 是否必要 | 默认值 / 推荐值 | 作用与详细说明 |
+| :--- | :---: | :--- | :--- |
+| **`CLOUDFLARE_API_TOKEN`** | **必要 🔴** | 无 | Cloudflare API Token。需要在 Cloudflare 后台创建，至少具备 `Workers:编辑`、`Pages:编辑`、`D1:编辑` 权限。 |
+| **`CLOUDFLARE_ACCOUNT_ID`** | **必要 🔴** | 无 | 您的 Cloudflare 账户 ID。登录 Cloudflare 控制台在右侧侧边栏即可获取。 |
+| **`CLOUDFLARE_D1_DATABASE_ID`** | **非必要 🟢** | 自动查询/自动创建 | 绑定的 D1 数据库 UUID。如果不配置，GitHub Actions 将会自动检测或在您的 Cloudflare 账户中一键创建名为 `dnshe-manager-db` 的 D1 数据库并自动注入绑定。 |
+| **`AES_KEY`** | **推荐 🟡** | 随机强字符串 | 数据库敏感数据加密密钥。强烈建议填写一个随机长字符串（例如 `my-super-secret-aes-key-2026`），系统将用其对数据库内的 API Secret 和 2FA 密钥加密。 |
+| **`ADMIN_TOKEN`** | **非必要 🟢** | 无 | 应急后门 Token。忘记管理员登录密码时的救援凭证。 |
+| **`WEBHOOK_URL`** | **非必要 🟢** | 无 | 域名自动续期通知推送的 Webhook 地址。 |
 
 ---
 
-### 方式二：Cloudflare 控制台 / Pages 手动部署
+### 2. Cloudflare Worker 环境变量 / Secrets（后端运行期）
 
-#### 1. 部署后端 Worker & 创建 D1 数据库
+在 Worker 部署后生效的配置项，可通过 `wrangler.toml` 配置文件或使用 `npx wrangler secret put <KEY>` 命令行/控制台写入：
 
-在项目根目录下打开终端：
+#### 🔒 密钥 (Secrets) — 强烈建议通过 `wrangler secret put` 注入：
+| 密钥名 | 是否必要 | 说明 |
+| :--- | :---: | :--- |
+| **`AES_KEY`** | **推荐 🟡** | AES-GCM 对称加密密钥。用于对数据库中存储的 API Secret 进行加密保护。 |
+| **`ADMIN_TOKEN`** | **非必要 🟢** | 应急后门口令。设置后，即使忘记密码也可以使用该口令（或计算出的 TOTP 动态码）作为 Bearer Token 进行紧急登录与 API 鉴权。 |
+| **`WEBHOOK_URL`** | **非必要 🟢** | 自动化任务续期通知推送 URL 地址。可在前端面板的【设置】中进行图形化修改。 |
 
+#### ⚙️ 普通配置项 (Vars / `wrangler.toml`)：
+| 配置项名 | 是否必要 | 默认值 | 作用与说明 |
+| :--- | :---: | :---: | :--- |
+| **`DB`** | **必要 🔴** | `dnshe-manager-db` | D1 数据库绑定句柄（`[[d1_databases]]` 节点）。 |
+| **`ALLOWED_ORIGIN`** | **非必要 🟢** | `*` (自适应) | 允许的跨域前端 Origin 来源（例如 `https://your-app.pages.dev`）。生产环境建议配置以防接口跨域盗用。 |
+| **`WEBHOOK_TYPE`** | **非必要 🟢** | `custom` | Webhook 消息格式类型。可选：`dingtalk` (钉钉)、`feishu` (飞书)、`wecom` (企业微信)、`custom` (通用格式)。 |
+| **`DEFAULT_API_KEY`** | **非必要 🟢** | 无 | 部署完成后首次启动时，若存在此配置，系统将自动绑定该 API Key 账号，无需在 UI 手动录入。 |
+| **`DEFAULT_API_SECRET`**| **非必要 🟢** | 无 | 搭配 `DEFAULT_API_KEY` 使用的 API Secret。 |
+| **`DEFAULT_API_ALIAS`** | **非必要 🟢** | `默认账号` | 默认账号的显示别名。 |
+
+---
+
+### 3. 前端编译环境变量
+
+| 变量名 | 是否必要 | 说明 |
+| :--- | :---: | :--- |
+| **`VITE_API_BASE_URL`** | **非必要 🟢** | 后端 Worker REST API 的基准 URL（如 `https://dnshe-manager-backend.xxx.workers.dev`）。使用 GitHub Actions 部署时，程序会自动检测 Worker 域名并自动注入该变量，无需手动配置。 |
+
+---
+
+## 🚀 详细部署流程
+
+### 准备工作：获取 Cloudflare 凭证
+
+1. **登录 Cloudflare 仪表盘**：访问 [dash.cloudflare.com](https://dash.cloudflare.com/)。
+2. **获取账户 ID (Account ID)**：
+   - 在仪表盘右侧侧边栏中找到 **账户 ID (Account ID)**，复制备用。
+3. **创建 API 令牌 (API Token)**：
+   - 点击右上角头像 -> **我的个人资料 (My Profile)** -> **API 令牌 (API Tokens)** -> **创建令牌 (Create Token)**。
+   - 选择 **编辑 Cloudflare Workers (Edit Cloudflare Workers)** 模板。
+   - 确保权限列表中包含：
+     - `Account -> Cloudflare Workers -> Edit`
+     - `Account -> Cloudflare Pages -> Edit`
+     - `Account -> D1 -> Edit`
+   - 保存并复制生成的 API Token。
+
+---
+
+### 方式一：GitHub Actions 一键全自动部署 (推荐 ⭐⭐⭐⭐⭐)
+
+只需要把本项目 Fork 或 Push 到您自己的 GitHub 仓库中，GitHub Actions 会**全自动**为您创建 D1 数据库、建表、发布后端 Worker 以及编译部署前端 Pages！
+
+1. **配置 GitHub Secrets**：
+   - 进入您的 GitHub 仓库 -> **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**。
+   - 依次添加以下两个变量：
+     - `CLOUDFLARE_API_TOKEN`: 填入准备工作中获取的 Token。
+     - `CLOUDFLARE_ACCOUNT_ID`: 填入准备工作中获取的 Account ID。
+     - `AES_KEY`: (推荐) 填入自定义的随机加密密钥串。
+2. **推送代码或手动触发**：
+   - 提交代码并 `git push main`，或者进入 GitHub 仓库的 **Actions** 选项卡 -> 点击 **Deploy to Cloudflare** -> 点击 **Run workflow**。
+3. **等待部署完成**：
+   - 部署完成后，脚本控制台会输出 Cloudflare Pages 前端访问域名。访问该域名即可开启 DNSHE 面板！
+
+---
+
+### 方式二：Cloudflare CLI / Wrangler 手动部署
+
+如果您习惯在本地使用终端发布，请按照以下步骤依次操作：
+
+#### 1. 安装环境与登录 Cloudflare
 ```bash
-# 登录 Cloudflare 账号
+# 全局或项目局部安装 Cloudflare CLI 工具 Wrangler
+npm install -g wrangler
+
+# 授权登录 Cloudflare
 npx wrangler login
-
-# 创建 D1 数据库
-npx wrangler d1 create dnshe-manager-db
-
-# 提示：将命令输出的 database_id 替换写入本地 wrangler.toml 文件中
 ```
 
-初始化数据库表结构并部署 Worker：
-
+#### 2. 创建 Cloudflare D1 数据库
 ```bash
-# 执行数据库建表语句
+# 创建名为 dnshe-manager-db 的分布式 D1 数据库
+npx wrangler d1 create dnshe-manager-db
+```
+*终端会输出类似如下信息：*
+```text
+[[d1_databases]]
+binding = "DB"
+database_name = "dnshe-manager-db"
+database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+打开根目录下的 `wrangler.toml` 文件，将生成的 `database_id` 替换填入 `database_id = "..."` 处。
+
+#### 3. 执行 SQL 初始化数据表表结构
+```bash
+# 远程执行建表 SQL 语句
 npx wrangler d1 execute dnshe-manager-db --remote --file=./schema.sql
+```
 
-# 部署后端 Worker
-npx wrangler deploy
-
-# 设置数据库加密 AES 密钥 (任意强随机字符串)
+#### 4. (推荐) 设置对称加密密钥与环境变量
+```bash
+# 设置数据加密 AES 密钥 (输入任意强随机字符)
 npx wrangler secret put AES_KEY
 ```
 
-#### 2. 部署前端 Cloudflare Pages
+#### 5. 部署后端 Worker
+```bash
+npx wrangler deploy
+```
+*发布成功后，终端会打印 Worker 访问地址（如 `https://dnshe-manager-backend.your-subdomain.workers.dev`）。*
 
-1. 登录 Cloudflare 仪表盘 -> 进入 **`Workers 和 Pages`** -> 点击 **`创建`** -> **`Pages`** -> 选择 **`连接到 GitHub`**。
-2. 选择您的仓库，填写构建参数：
-   - **框架预设**：`Vite` 或 `Create React App`
-   - **根目录 (Root directory)**：`frontend` *(重要：在高级选项中填写)*
-   - **构建命令 (Build command)**：`npm run build`
-   - **构建输出目录 (Build output directory)**：`dist`
-3. 点击 **保存并部署** 即可发布前端！
+#### 6. 构建并发布前端 Cloudflare Pages
+```bash
+# 进入前端源码目录
+cd frontend
+
+# 安装前端依赖
+npm install
+
+# 编译打包前端（如果 Worker 使用自定义域名，可先设置 VITE_API_BASE_URL 环境变量）
+npm run build
+
+# 部署编译后的 dist 目录到 Cloudflare Pages
+npx wrangler pages deploy dist --project-name=dnshe-manager-frontend --branch=main
+```
+根据控制台输出的 Pages 网址访问面板即可！
 
 ---
 
-## 💻 本地开发与调试
+## 💻 本地二次开发与调试
 
-如果您需要对项目进行本地二次开发或联调：
+若您需要对项目源码进行修改或调试：
 
-### 1. 安装依赖
+### 1. 克隆代码与安装依赖
 
 ```bash
+# 克隆仓库
+git clone https://github.com/your-username/dnshe-manager.git
+cd dnshe-manager
+
 # 安装后端依赖
 npm install
 
@@ -122,30 +260,31 @@ npm install
 cd ..
 ```
 
-### 2. 初始化本地数据库模拟环境
+### 2. 初始化本地 D1 数据库模拟环境
 
 ```bash
+# 在本地 SQLite 虚拟仿真环境中建表
 npx wrangler d1 execute dnshe-manager-db --local --file=./schema.sql
 ```
 
-### 3. 启动开发服务器
+### 3. 双终端联动启动开发服务
 
-分别打开两个终端：
+分别打开两个终端窗口：
 
-- **终端 1 (启动后端 Worker 服务)**：
+- **终端 1 (启动后端 Worker 模拟服务)**：
   ```bash
   npm run dev
   ```
-  *(后端开发服务运行在 `http://localhost:8787`)*
+  *(后端将运行在 `http://localhost:8787`)*
 
-- **终端 2 (启动前端 Vite 界面)**：
+- **终端 2 (启动前端 Vite 实时热重载服务)**：
   ```bash
   cd frontend
   npm run dev
   ```
-  *(前端开发服务运行在 `http://localhost:3000`)*
+  *(前端将运行在 `http://localhost:3000`)*
 
-访问 `http://localhost:3000` 即可开始本地调试！
+浏览器打开 `http://localhost:3000` 即可开始本地开发与联调！
 
 ---
 
@@ -155,26 +294,49 @@ npx wrangler d1 execute dnshe-manager-db --local --file=./schema.sql
 dnshe-manager/
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml          # GitHub Actions 自动构建部署工作流
-├── frontend/                   # 前端 React 项目源码
+│       └── deploy.yml          # GitHub Actions 自动化 CI/CD 构建部署工作流
+├── frontend/                   # 前端 React 18 + Vite 项目源码
 │   ├── src/
-│   │   ├── App.tsx             # 主界面组件 (包含域名卡片、NS/DNS模态框)
-│   │   ├── main.tsx            # 应用入口
-│   │   └── index.css           # Tailwind CSS 样式
-│   ├── package.json            # 前端依赖与构建脚本
-│   └── vite.config.ts          # Vite 开发代理配置
-├── src/                        # 后端 Hono / Worker 源码
-│   ├── index.ts                # RESTful API 路由与逻辑
-│   ├── dnshe.ts                # DNSHE 官方 API V2.0 Client 客户端封装
-│   ├── db.ts                   # D1 数据库操作与日志记录封装
-│   └── cron.ts                 # 每日定时巡检与自动续期逻辑
-├── schema.sql                  # D1 SQL 数据库表结构初始化脚本
-├── wrangler.toml               # Cloudflare Worker 配置文件
-└── README.md                   # 项目说明文档
+│   │   ├── App.tsx             # 前端主界面组件 (包含面板卡片、域名管理、DNS模态框、安全设置)
+│   │   ├── main.tsx            # 应用挂载入口
+│   │   └── index.css           # Tailwind CSS 样式导入
+│   ├── package.json            # 前端依赖配置 (React, Lucide-React, TailwindCSS, qrcode.react)
+│   ├── postcss.config.js       # PostCSS 插件配置
+│   ├── tailwind.config.js      # Tailwind 样式主题扩展
+│   ├── tsconfig.json           # 前端 TS 规范配置
+│   └── vite.config.ts          # Vite 开发代理及打包构建配置
+├── src/                        # 后端 Cloudflare Worker 源码
+│   ├── index.ts                # RESTful API 路由定义 (基于 Hono.js 框架)、鉴权中间件与 Worker 入口
+│   ├── dnshe.ts                # DNSHE 官方 REST API V2.0 客户端 SDK (HMAC/请求签名逻辑)
+│   ├── db.ts                   # D1 数据库操作类、AES-GCM 加解密算法与安全日志封装
+│   └── cron.ts                 # 每日 Cron Trigger 自动巡检、域名自动续期及多渠道通知
+├── schema.sql                  # D1 SQLite 数据库初始化表结构 SQL 脚本
+├── wrangler.toml               # Cloudflare Worker 项目配置文件 (包含 D1 绑定与触发器)
+├── package.json                # 后端依赖配置
+├── tsconfig.json               # 后端 TS 规范配置
+└── README.md                   # 项目详细使用与部署说明文档
 ```
 
 ---
 
-## 📄 开源许可
+## ❓ 常见问题与注意事项 (FAQ)
 
-本项目遵循 [MIT License](LICENSE) 协议开源，欢迎 Star / Fork 与提交 PR！
+#### Q1: 首次访问系统提示“请设置管理员用户名与密码”？
+这是系统安全设计的机制。系统初始化时**没有默认密码**，首次访问时，您只需在界面上自行输入您喜爱的管理员用户名和密码（密码至少 8 位），即可完成初始化并自动签发登录 Session。
+
+#### Q2: 忘记管理员登录密码怎么办？
+如果您在部署时配置了环境变量/Secret `ADMIN_TOKEN`，可以在登录界面使用 `ADMIN_TOKEN` 作为应急后门访问系统，登录后在【设置】界面直接重置管理员密码。
+
+#### Q3: 添加 NS 记录失败，提示 `disable_ns_management`？
+DNSHE 上游平台有时会根据政策选择性关闭特定顶级后缀域名的 NS 修改权限。当平台关闭 NS 接口时，系统会自动捕捉上游返回的 403 限制，并给出友好的中文提示。此时如果需要修改 NS，需登录 DNSHE 官网后台人工调整。
+
+#### Q4: 域名自动续期的触发条件是什么？
+- 每日凌晨 02:00（UTC）定时任务会自动扫描数据库中的所有域名。
+- 系统比较域名的到期时间（`expires_at`）与当前系统时间。
+- 当剩余到期时间**小于等于设置的阈值天数**（默认 180 天）时，自动调用 DNSHE 官方 API 发起续期请求。
+
+---
+
+## 📄 开源协议
+
+本项目基于 [MIT License](LICENSE) 协议开源，欢迎 Star 🌟、Fork 🍴 以及提交 Issue 与 PR！

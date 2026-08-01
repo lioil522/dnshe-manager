@@ -14,10 +14,17 @@ crons = ["0 2 * * *"]
 
 # 环境变量定义
 [vars]
-# 【必须】通过 wrangler secret put 注入以下密钥（不要直接写在配置文件中）：
+# 【强烈建议】通过 wrangler secret put 注入以下密钥（不要直接写在配置文件中）：
 #
-# AES_KEY       - AES-GCM 加密密钥，用于加密存储 API Secret（强烈建议配置）
-# ADMIN_TOKEN   - 管理面板鉴权令牌，部署后所有 API 请求必须携带 Bearer <token>（强烈建议配置）
+# AES_KEY       - AES-GCM 加密密钥，用于加密存储 API Secret 与 2FA TOTP 密钥（强烈建议配置）
+#
+# 鉴权模型说明（v2 起）：
+#   登录改为「用户名 + 密码」为主，密码经 PBKDF2 加盐哈希后存于 D1，永不明文。
+#   两步验证 (2FA / TOTP) 为设置页内的可选开关，开启后登录需额外输入 6 位动态码。
+#   首次访问系统时，在登录页自行设置管理员用户名与密码完成初始化（无内置默认密码）。
+#
+# ADMIN_TOKEN   - 【可选】应急后门令牌。配置后可在忘记密码时，用它（静态值或其对应 TOTP 动态码）
+#                 直接登录/访问 API 作为兜底找回手段；不配置则完全禁用该通道，仅认用户名密码 + 2FA。
 #
 # 以下为可选配置项：
 # ALLOWED_ORIGIN = "https://your-pages-domain.pages.dev"  # 限制 CORS 允许的前端域名

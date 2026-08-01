@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { DatabaseManager } from "./db";
+import { DatabaseManager, timingSafeEqual } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams } from "./dnshe";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
@@ -130,6 +130,44 @@ function base32ToUint8Array(base32: string): Uint8Array {
 }
 
 /**
+ * 生成随机 Base32 编码的 TOTP 密钥（默认 20 字节 = 160 位，符合 RFC 4226 建议）
+ */
+function generateBase32Secret(byteLength = 20): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
+  let bits = 0;
+  let value = 0;
+  let output = "";
+  for (let i = 0; i < bytes.length; i++) {
+    value = (value << 8) | bytes[i];
+    bits += 8;
+    while (bits >= 5) {
+      output += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    output += alphabet[(value << (5 - bits)) & 31];
+  }
+  return output;
+}
+
+/**
+ * 构建标准 otpauth:// URI，供前端生成二维码，导入 Google / Microsoft Authenticator
+ */
+function buildOtpAuthUri(secret: string, account: string, issuer = "DNSHE Manager"): string {
+  const label = encodeURIComponent(`${issuer}:${account}`);
+  const params = new URLSearchParams({
+    secret,
+    issuer,
+    algorithm: "SHA1",
+    digits: "6",
+    period: "30",
+  });
+  return `otpauth://totp/${label}?${params.toString()}`;
+}
+
+/**
  * 校验 6 位 TOTP (2FA 动态口令) 是否有效
  * 自动识别 Base32 编码密钥，支持 ±60 秒 (±2 时间步长) 的系统时钟倾斜容差
  */
@@ -210,57 +248,128 @@ app.use("/api/*", async (c, next) => {
 });
 
 /**
- * 0. 2FA 动态登录接口 — 使用 6 位动态验证码换取安全的 Session Token (公开接口，不受鉴权中间件拦截)
+ * 0-a. 鉴权状态查询接口 — 供前端登录页判断是否需要首次设置密码 / 是否要求 2FA (公开接口)
+ */
+app.get("/api/auth/status", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const cfg = await dbManager.getAuthConfig();
+    return c.json(successRes({
+      initialized: cfg.initialized,      // 是否已完成首次密码设置
+      two_fa_enabled: cfg.twoFaEnabled,  // 登录是否需要 2FA 动态码
+    }));
+  } catch (e: any) {
+    return c.json(errorRes(`读取鉴权状态失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+/**
+ * 0-b. 首次初始化接口 — 系统未设置过密码时，允许自行设定管理员用户名与密码 (公开接口，仅在未初始化时可用)
+ */
+app.post("/api/auth/setup", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const cfg = await dbManager.getAuthConfig();
+    if (cfg.initialized) {
+      return c.json(errorRes("系统已完成初始化，无法再次通过此接口设置密码", "already_initialized"), 403);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const username = String(body.username || "").trim();
+    const password = String(body.password || "");
+
+    if (!username || username.length < 3) {
+      return c.json(errorRes("用户名至少需要 3 个字符", "bad_request"), 400);
+    }
+    if (password.length < 8) {
+      return c.json(errorRes("密码至少需要 8 个字符", "bad_request"), 400);
+    }
+
+    await dbManager.setPassword(username, password);
+    await dbManager.writeLog("success", "auth", `系统完成首次初始化，已创建管理员账户 [${username}]`);
+
+    // 初始化后直接签发 Session，免去再登录一次
+    const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
+    await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+
+    return c.json(successRes({
+      session_token: sessionToken,
+      message: "🎉 初始化成功！管理员账户已创建并自动登录",
+    }));
+  } catch (e: any) {
+    console.error("Setup process error:", e);
+    return c.json(errorRes(`初始化失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+/**
+ * 0-c. 登录接口 — 用户名 + 密码为主，若开启 2FA 则额外校验 6 位动态码，成功后换取 Session Token (公开接口)
  */
 app.post("/api/auth/login", async (c) => {
-  const adminToken = c.env.ADMIN_TOKEN || "";
   const dbManager = c.get("db");
-
-  // 未开启鉴权直接通过
-  if (!adminToken) {
-    return c.json(successRes({
-      session_token: "dev_mode_token",
-      message: "未配置 ADMIN_TOKEN，自动放行"
-    }));
-  }
+  const emergencyToken = c.env.ADMIN_TOKEN || "";
 
   try {
+    const cfg = await dbManager.getAuthConfig();
     const body = await c.req.json().catch(() => ({}));
-    const tokenInput = String(body.token || "").trim();
+    const username = String(body.username || "").trim();
+    const password = String(body.password || "");
+    const totpToken = String(body.token || "").trim();
 
-    if (!tokenInput) {
-      return c.json(errorRes("请输入 2FA 动态验证码"), 400);
+    // 尚未初始化：引导前端走首次设置流程
+    if (!cfg.initialized) {
+      return c.json(errorRes("系统尚未初始化，请先设置管理员账户与密码", "not_initialized"), 409);
     }
 
-    const isTotpValid = await verifyTOTP(tokenInput, adminToken);
-    const isStaticValid = tokenInput === adminToken;
-
-    if (isTotpValid || isStaticValid) {
-      // 生成安全的长期 Session Token (当前网页无 30 秒超时，网页关闭后自动清理)
-      const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-      if (dbManager) {
-        try {
-          await dbManager.setSetting(`sess_${sessionToken}`, "valid");
-          await dbManager.writeLog("info", "auth", "管理员通过 2FA 动态鉴权成功登录");
-        } catch (dbErr) {
-          console.error("Session storage DB error (non-fatal):", dbErr);
-        }
+    // 应急令牌通道：单独用 ADMIN_TOKEN（静态或其 TOTP）直接登录，用于忘记密码时找回
+    if (emergencyToken && !username && (totpToken || password)) {
+      const candidate = totpToken || password;
+      const emgTotpValid = await verifyTOTP(candidate, emergencyToken);
+      if (emgTotpValid || timingSafeEqual(candidate, emergencyToken)) {
+        const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
+        await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+        await dbManager.writeLog("warning", "auth", "管理员通过应急令牌 (ADMIN_TOKEN) 登录");
+        return c.json(successRes({
+          session_token: sessionToken,
+          message: "已通过应急令牌登录，建议尽快在设置中重置密码",
+        }));
       }
-
-      return c.json(successRes({
-        session_token: sessionToken,
-        message: "🎉 2FA 动态鉴权成功！已为您生成专属安全会话凭据"
-      }));
-    } else {
-      if (dbManager) {
-        try {
-          await dbManager.writeLog("warning", "auth", "管理员登录失败：2FA 动态验证码错误或已过期");
-        } catch (dbErr) {
-          console.error("Login failure log DB error (non-fatal):", dbErr);
-        }
-      }
-      return c.json(errorRes("2FA 动态验证码错误或已过期，请重新输入手机 APP 最新的 6 位数字"), 401);
     }
+
+    if (!username || !password) {
+      return c.json(errorRes("请输入用户名与密码", "bad_request"), 400);
+    }
+
+    // 1. 校验用户名 + 密码
+    const userMatch = timingSafeEqual(username, cfg.username);
+    const passMatch = await dbManager.verifyPassword(password);
+    if (!userMatch || !passMatch) {
+      await dbManager.writeLog("warning", "auth", `管理员登录失败：用户名或密码错误 (输入用户名: ${username})`);
+      return c.json(errorRes("用户名或密码错误", "invalid_credentials"), 401);
+    }
+
+    // 2. 若开启 2FA，则要求校验动态码
+    if (cfg.twoFaEnabled) {
+      if (!totpToken) {
+        // 密码正确但缺少动态码：提示前端补充 2FA 输入
+        return c.json(errorRes("请输入 6 位动态验证码", "need_2fa"), 401);
+      }
+      const totpValid = await verifyTOTP(totpToken, cfg.twoFaSecret);
+      if (!totpValid) {
+        await dbManager.writeLog("warning", "auth", "管理员登录失败：2FA 动态验证码错误或已过期");
+        return c.json(errorRes("2FA 动态验证码错误或已过期", "invalid_2fa"), 401);
+      }
+    }
+
+    // 3. 全部通过，签发长期 Session Token
+    const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
+    await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+    await dbManager.writeLog("success", "auth", `管理员 [${username}] 登录成功${cfg.twoFaEnabled ? "（含 2FA 校验）" : ""}`);
+
+    return c.json(successRes({
+      session_token: sessionToken,
+      message: "🎉 登录成功",
+    }));
   } catch (e: any) {
     console.error("Login process error:", e);
     return c.json(errorRes(`登录鉴权失败: ${e?.message || "服务端内部错误"}`), 500);
@@ -268,18 +377,14 @@ app.post("/api/auth/login", async (c) => {
 });
 
 /**
- * 鉴权中间件 — 验证受保护 API 的 Session 会话 Token 或 2FA 6位动态验证码
+ * 鉴权中间件 — 验证受保护 API 的 Session 会话 Token
+ *
+ * NOTE: 公开接口（登录 / 初始化 / 状态查询）显式放行；
+ * 其余接口一律要求携带登录成功后签发的 Session Token（或应急令牌）。
  */
 app.use("/api/*", async (c, next) => {
-  // 显式放行 2FA 登录与二维码配置等公开接口
-  if (c.req.path === "/api/auth/login" || c.req.path === "/api/auth/totp-setup") {
-    return next();
-  }
-
-  const adminToken = c.env.ADMIN_TOKEN;
-
-  // 未配置 ADMIN_TOKEN 时跳过鉴权，便于本地开发调试
-  if (!adminToken) {
+  const publicPaths = ["/api/auth/login", "/api/auth/setup", "/api/auth/status"];
+  if (publicPaths.includes(c.req.path)) {
     return next();
   }
 
@@ -290,33 +395,148 @@ app.use("/api/*", async (c, next) => {
 
   const token = authHeader.substring(7).trim();
   const dbManager = c.get("db");
+  const emergencyToken = c.env.ADMIN_TOKEN || "";
 
-  // 1. 优先校验登录成功后签发的 Session Token (畅通无阻，无 30 秒超时问题)
+  // 1. 校验登录成功后签发的 Session Token
   if (token.startsWith("dnshe_sess_")) {
-    if (dbManager) {
-      try {
-        const storedSess = await dbManager.getSetting(`sess_${token}`);
-        if (storedSess === "valid") {
-          return next();
-        }
-      } catch (e) {}
-    } else {
+    try {
+      const storedSess = await dbManager.getSetting(`sess_${token}`);
+      if (storedSess === "valid") {
+        return next();
+      }
+    } catch (e) {}
+  }
+
+  // 2. 应急令牌通道：允许直接用 ADMIN_TOKEN（静态或其 TOTP）访问，用于登录系统异常时的兜底
+  if (emergencyToken) {
+    if (timingSafeEqual(token, emergencyToken) || await verifyTOTP(token, emergencyToken)) {
       return next();
     }
   }
 
-  // 2. 校验 6 位 TOTP 动态验证码
-  const isTotpValid = await verifyTOTP(token, adminToken);
-  if (isTotpValid) {
-    return next();
-  }
+  return c.json(errorRes("认证失败：会话凭据已失效，请重新登录", "forbidden"), 403);
+});
 
-  // 3. 兼容传统静态 ADMIN_TOKEN
-  if (token === adminToken) {
-    return next();
-  }
+/**
+ * 账户安全 API — 修改密码与 2FA 开关（均需已登录）
+ */
 
-  return c.json(errorRes("认证失败：会话凭据已失效或 2FA 动态验证码无效，请重新登录", "forbidden"), 403);
+// A1. 读取当前账户安全状态（用户名 + 2FA 是否开启）
+app.get("/api/auth/account", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const cfg = await dbManager.getAuthConfig();
+    return c.json(successRes({
+      username: cfg.username,
+      two_fa_enabled: cfg.twoFaEnabled,
+    }));
+  } catch (e: any) {
+    return c.json(errorRes(`读取账户信息失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+// A2. 修改密码（需校验旧密码）
+app.post("/api/auth/change-password", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const oldPassword = String(body.old_password || "");
+    const newPassword = String(body.new_password || "");
+    const newUsername = body.username !== undefined ? String(body.username).trim() : undefined;
+
+    const cfg = await dbManager.getAuthConfig();
+
+    const oldValid = await dbManager.verifyPassword(oldPassword);
+    if (!oldValid) {
+      await dbManager.writeLog("warning", "auth", "修改密码失败：原密码校验不通过");
+      return c.json(errorRes("原密码错误", "invalid_credentials"), 401);
+    }
+    if (newPassword.length < 8) {
+      return c.json(errorRes("新密码至少需要 8 个字符", "bad_request"), 400);
+    }
+    if (newUsername !== undefined && newUsername.length > 0 && newUsername.length < 3) {
+      return c.json(errorRes("用户名至少需要 3 个字符", "bad_request"), 400);
+    }
+
+    const finalUsername = (newUsername && newUsername.length >= 3) ? newUsername : cfg.username;
+    await dbManager.setPassword(finalUsername, newPassword);
+    await dbManager.writeLog("success", "auth", `管理员 [${finalUsername}] 修改了登录密码`);
+
+    return c.json(successRes({ message: "密码修改成功，请使用新密码重新登录" }));
+  } catch (e: any) {
+    console.error("Change password error:", e);
+    return c.json(errorRes(`修改密码失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+// A3. 生成待启用的 2FA 密钥与二维码 URI（不立即开启，需下一步验证）
+app.post("/api/auth/2fa/setup", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const cfg = await dbManager.getAuthConfig();
+    const secret = generateBase32Secret();
+    // 暂存待启用密钥（加密），开启前不置 enabled 标志
+    await dbManager.setTwoFaSecret(secret);
+    const otpauthUri = buildOtpAuthUri(secret, cfg.username);
+    return c.json(successRes({
+      secret,
+      otpauth_uri: otpauthUri,
+      message: "请用身份验证器扫码或手动录入密钥，然后输入动态码完成开启",
+    }));
+  } catch (e: any) {
+    console.error("2FA setup error:", e);
+    return c.json(errorRes(`生成 2FA 密钥失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+// A4. 用一次动态码验证后正式开启 2FA
+app.post("/api/auth/2fa/enable", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const token = String(body.token || "").trim();
+    if (!token) {
+      return c.json(errorRes("请输入身份验证器上的 6 位动态码", "bad_request"), 400);
+    }
+
+    const cfg = await dbManager.getAuthConfig();
+    if (!cfg.twoFaSecret) {
+      return c.json(errorRes("尚未生成 2FA 密钥，请先执行密钥生成步骤", "bad_request"), 400);
+    }
+
+    const valid = await verifyTOTP(token, cfg.twoFaSecret);
+    if (!valid) {
+      return c.json(errorRes("动态码校验失败，请确认时间同步后重试", "invalid_2fa"), 401);
+    }
+
+    await dbManager.setTwoFaEnabled(true);
+    await dbManager.writeLog("success", "auth", "管理员已开启两步验证 (2FA)");
+    return c.json(successRes({ message: "🎉 两步验证已开启，下次登录需输入动态码" }));
+  } catch (e: any) {
+    console.error("2FA enable error:", e);
+    return c.json(errorRes(`开启 2FA 失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+// A5. 关闭 2FA（需校验密码）
+app.post("/api/auth/2fa/disable", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const password = String(body.password || "");
+
+    const passValid = await dbManager.verifyPassword(password);
+    if (!passValid) {
+      return c.json(errorRes("密码错误，无法关闭 2FA", "invalid_credentials"), 401);
+    }
+
+    await dbManager.setTwoFaEnabled(false);
+    await dbManager.writeLog("warning", "auth", "管理员已关闭两步验证 (2FA)");
+    return c.json(successRes({ message: "两步验证已关闭" }));
+  } catch (e: any) {
+    console.error("2FA disable error:", e);
+    return c.json(errorRes(`关闭 2FA 失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
 });
 
 /**
@@ -720,7 +940,7 @@ app.post("/api/settings", async (c) => {
     // 允许写入的配置键
     const allowedKeys = [
       "webhook_url", "webhook_type", "tg_token", "tg_chat_id",
-      "renew_threshold_days", "notify_days", "auto_renew"
+      "renew_threshold_days", "auto_renew"
     ];
     // 敏感字段：若值为空或仍是打码值（以 **** 开头），则跳过不覆盖
     const sensitiveKeys = ["tg_token", "webhook_url"];

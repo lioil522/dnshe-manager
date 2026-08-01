@@ -75,6 +75,62 @@ export async function decryptText(encryptedText: string, aesKeyStr?: string): Pr
   return new TextDecoder().decode(decrypted);
 }
 
+/**
+ * 使用 PBKDF2-HMAC-SHA256 派生密码哈希（10 万轮）
+ *
+ * NOTE: 返回十六进制的 32 字节派生密钥。盐值由调用方生成并单独存储，
+ * 校验时使用相同盐值重新派生并做恒定时间比较，避免时序侧信道。
+ */
+export async function hashPassword(password: string, saltHex: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const salt = new Uint8Array(saltHex.match(/.{1,2}/g)!.map((b) => parseInt(b, 16)));
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+  const derived = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
+    keyMaterial,
+    256
+  );
+  return Array.from(new Uint8Array(derived))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * 生成 16 字节随机盐值的十六进制字符串
+ */
+export function generateSalt(): string {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(salt).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * 恒定时间字符串比较，防止基于响应耗时的时序攻击
+ */
+export function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+/** 鉴权配置（读取后的解密/明文形态） */
+export interface AuthConfig {
+  username: string;
+  passHash: string;
+  passSalt: string;
+  twoFaEnabled: boolean;
+  twoFaSecret: string; // 已解密的 TOTP 密钥（Base32），未开启则为空
+  initialized: boolean; // 是否已完成首次密码设置
+}
+
 export interface DBAccount {
   id: number;
   alias: string;
@@ -244,6 +300,78 @@ export class DatabaseManager {
       }
     }
     await this.setSetting(`cfg_${shortKey}`, stored);
+  }
+
+  /**
+   * 读取管理员鉴权配置
+   *
+   * NOTE: 鉴权相关配置以 auth_ 前缀独立存储于 settings 表。
+   * TOTP 密钥使用 AES-GCM 加密，读取时自动解密为原文。
+   */
+  async getAuthConfig(): Promise<AuthConfig> {
+    const username = (await this.getSetting("auth_username")) || "admin";
+    const passHash = (await this.getSetting("auth_pass_hash")) || "";
+    const passSalt = (await this.getSetting("auth_pass_salt")) || "";
+    const twoFaEnabled = (await this.getSetting("auth_2fa_enabled")) === "1";
+    const encryptedSecret = (await this.getSetting("auth_2fa_secret")) || "";
+
+    let twoFaSecret = "";
+    if (encryptedSecret) {
+      try {
+        twoFaSecret = await decryptText(encryptedSecret, this.aesKey);
+      } catch (e) {
+        console.error("Failed to decrypt 2FA secret:", e);
+      }
+    }
+
+    return {
+      username,
+      passHash,
+      passSalt,
+      twoFaEnabled,
+      twoFaSecret,
+      initialized: !!passHash,
+    };
+  }
+
+  /**
+   * 设置/修改管理员密码（自动生成新盐值并哈希存储）
+   */
+  async setPassword(username: string, password: string): Promise<void> {
+    const salt = generateSalt();
+    const hash = await hashPassword(password, salt);
+    await this.setSetting("auth_username", username);
+    await this.setSetting("auth_pass_hash", hash);
+    await this.setSetting("auth_pass_salt", salt);
+  }
+
+  /**
+   * 校验管理员密码
+   */
+  async verifyPassword(password: string): Promise<boolean> {
+    const cfg = await this.getAuthConfig();
+    if (!cfg.passHash || !cfg.passSalt) return false;
+    const hash = await hashPassword(password, cfg.passSalt);
+    return timingSafeEqual(hash, cfg.passHash);
+  }
+
+  /**
+   * 保存（加密）待启用的 2FA TOTP 密钥
+   */
+  async setTwoFaSecret(secretBase32: string): Promise<void> {
+    const encrypted = await encryptText(secretBase32, this.aesKey);
+    await this.setSetting("auth_2fa_secret", encrypted);
+  }
+
+  /**
+   * 开启/关闭 2FA
+   */
+  async setTwoFaEnabled(enabled: boolean): Promise<void> {
+    await this.setSetting("auth_2fa_enabled", enabled ? "1" : "0");
+    if (!enabled) {
+      // 关闭时清除密钥，避免残留
+      await this.setSetting("auth_2fa_secret", "");
+    }
   }
 
   /**

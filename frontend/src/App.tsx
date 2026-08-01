@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import {
   Globe,
   Key,
@@ -25,7 +26,6 @@ import {
   Bell,
   Sun,
   Moon,
-  CalendarClock,
   Activity,
   LogIn,
   Send,
@@ -128,7 +128,6 @@ export default function App() {
     tg_token: string;
     tg_chat_id: string;
     renew_threshold_days: string;
-    notify_days: string;
     auto_renew: string;
   }
   const [settings, setSettings] = useState<AppSettings>({
@@ -137,7 +136,6 @@ export default function App() {
     tg_token: "",
     tg_chat_id: "",
     renew_threshold_days: "180",
-    notify_days: "7",
     auto_renew: "1",
   });
   const [settingsConfigured, setSettingsConfigured] = useState<{ tg_token: boolean; webhook_url: boolean }>({ tg_token: false, webhook_url: false });
@@ -278,19 +276,55 @@ export default function App() {
     return `https://api-${host}`;
   };
 
-  // 管理员访问 2FA 动态鉴权与后端 Worker 地址状态
-  const [authModalOpen, setAuthModalOpen] = useState(false);
-  const authTokenInputRef = useRef<HTMLInputElement>(null);
+  // 后端 Worker 地址
   const backendUrl = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
+
+  // ===== 鉴权与登录状态 =====
+  // 当前会话 Token（登录成功后签发；存在即视为已登录）
+  const [sessionToken, setSessionToken] = useState<string | null>(
+    () => sessionStorage.getItem("DNSHE_SESSION") || localStorage.getItem("DNSHE_SESSION")
+  );
+  // 是否已向后端查询过鉴权状态（决定登录页显示"登录"还是"首次设置"）
+  const [authStatusLoaded, setAuthStatusLoaded] = useState(false);
+  // 系统是否已初始化（设置过管理员密码）
+  const [authInitialized, setAuthInitialized] = useState(true);
+  // 本次登录是否需要 2FA 动态码（后端返回 need_2fa 时置真）
+  const [loginNeeds2fa, setLoginNeeds2fa] = useState(false);
+
+  // 登录表单状态
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginTotp, setLoginTotp] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginError, setLoginError] = useState("");
+
+  // 首次初始化表单状态
+  const [setupUsername, setSetupUsername] = useState("");
+  const [setupPassword, setSetupPassword] = useState("");
+  const [setupPassword2, setSetupPassword2] = useState("");
+
+  // ===== 账户安全（设置页）状态 =====
+  // 当前账户信息（用户名 + 2FA 是否开启）
+  const [accountInfo, setAccountInfo] = useState<{ username: string; two_fa_enabled: boolean }>({ username: "", two_fa_enabled: false });
+  // 修改密码表单
+  const [pwOld, setPwOld] = useState("");
+  const [pwNew, setPwNew] = useState("");
+  const [pwNew2, setPwNew2] = useState("");
+  const [pwNewUsername, setPwNewUsername] = useState("");
+  // 2FA 开启流程：生成的密钥与二维码 URI，以及验证动态码
+  const [twoFaSetup, setTwoFaSetup] = useState<{ secret: string; otpauth_uri: string } | null>(null);
+  const [twoFaEnableToken, setTwoFaEnableToken] = useState("");
+  // 关闭 2FA 时的密码确认
+  const [twoFaDisablePw, setTwoFaDisablePw] = useState("");
 
   /**
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
    */
   const apiFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
-    // 优先从 sessionStorage 获取单次网页会话凭据，兼容 localStorage
-    const token = sessionStorage.getItem("DNSHE_ADMIN_TOKEN") || localStorage.getItem("DNSHE_ADMIN_TOKEN");
+    // 从会话存储获取登录后签发的 Session Token
+    const token = sessionStorage.getItem("DNSHE_SESSION") || localStorage.getItem("DNSHE_SESSION");
     const storedBackend = backendUrl || localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL;
-    
+
     // 如果传入相对路径以 /api 开头，智能补全后端基准域名
     let finalUrl = url;
     if (url.startsWith("/api")) {
@@ -311,10 +345,13 @@ export default function App() {
     try {
       const res = await fetch(finalUrl, { ...options, headers });
       if (res.status === 401 || res.status === 403) {
-        // 遇 401/403 立即清理已过期的单次凭据并唤起鉴权弹窗
-        sessionStorage.removeItem("DNSHE_ADMIN_TOKEN");
-        localStorage.removeItem("DNSHE_ADMIN_TOKEN");
-        setAuthModalOpen(true);
+        // 会话失效：清理凭据并回到登录页（登录/初始化/状态接口自身除外，避免误清）
+        const isAuthEndpoint = url.startsWith("/api/auth/login") || url.startsWith("/api/auth/setup") || url.startsWith("/api/auth/status");
+        if (!isAuthEndpoint) {
+          sessionStorage.removeItem("DNSHE_SESSION");
+          localStorage.removeItem("DNSHE_SESSION");
+          setSessionToken(null);
+        }
       }
       return res;
     } catch (err) {
@@ -324,57 +361,267 @@ export default function App() {
     }
   };
 
-  // 提交 2FA 动态码登录鉴权与换取 Session Token
-  const handleSaveAuthToken = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const tokenVal = authTokenInputRef.current?.value || "";
+  // 查询后端鉴权状态：决定登录页展示"登录"还是"首次设置密码"
+  const checkAuthStatus = async () => {
+    try {
+      const res = await apiFetch("/api/auth/status");
+      const data = await res.json();
+      if (data.success) {
+        setAuthInitialized(!!data.initialized);
+      }
+    } catch (e) {
+      // 后端不可达时默认按已初始化处理，仍展示登录页
+      setAuthInitialized(true);
+    } finally {
+      setAuthStatusLoaded(true);
+    }
+  };
 
-    if (!tokenVal.trim()) {
-      showToast("error", "请输入 2FA 动态验证码");
+  // 应用启动时查询一次鉴权状态
+  useEffect(() => {
+    checkAuthStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 保存会话 Token 并进入系统
+  const persistSession = (token: string) => {
+    sessionStorage.setItem("DNSHE_SESSION", token);
+    setSessionToken(token);
+    if (backendUrl.trim()) {
+      localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
+    }
+  };
+
+  // 提交登录（用户名 + 密码，若后端要求则附带 2FA 动态码）
+  const handleLogin = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setLoginError("");
+
+    if (!loginUsername.trim() || !loginPassword) {
+      setLoginError("请输入用户名与密码");
+      return;
+    }
+    if (loginNeeds2fa && !loginTotp.trim()) {
+      setLoginError("请输入 6 位动态验证码");
       return;
     }
 
+    setLoginLoading(true);
     try {
-      setActionLoading("login");
       const res = await apiFetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: tokenVal.trim() })
+        body: JSON.stringify({
+          username: loginUsername.trim(),
+          password: loginPassword,
+          token: loginTotp.trim() || undefined,
+        }),
       });
-
-      const rawText = await res.text();
-      let data: any = {};
-      try {
-        data = JSON.parse(rawText);
-      } catch (parseErr) {
-        console.error("Non-JSON API Response:", rawText);
-        showToast("error", `鉴权处理响应失败 (${res.status}): ${rawText.substring(0, 60)}`);
-        return;
-      }
+      const data = await res.json();
 
       if (data.success && data.session_token) {
-        // 存储长期 Session 会话 Token (当前网页无 30 秒超时，网页关闭后自动清理)
-        sessionStorage.setItem("DNSHE_ADMIN_TOKEN", data.session_token);
-        if (authTokenInputRef.current) {
-          authTokenInputRef.current.value = "";
-        }
-
-        if (backendUrl.trim()) {
-          localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
-        } else {
-          localStorage.removeItem("DNSHE_BACKEND_URL");
-        }
-
-        showToast("success", data.message || "🎉 2FA 动态鉴权成功！");
-        setAuthModalOpen(false);
-        fetchDomains();
-        fetchAccounts();
+        persistSession(data.session_token);
+        setLoginPassword("");
+        setLoginTotp("");
+        setLoginNeeds2fa(false);
+        showToast("success", data.message || "🎉 登录成功");
+      } else if (data.error_code === "need_2fa") {
+        // 密码正确但需要补充动态码
+        setLoginNeeds2fa(true);
+        setLoginError("请输入身份验证器上的 6 位动态验证码");
+      } else if (data.error_code === "not_initialized") {
+        setAuthInitialized(false);
+        setLoginError("系统尚未初始化，请先设置管理员账户");
       } else {
-        showToast("error", data.message || "动态 2FA 验证码错误或已过期");
+        setLoginError(data.message || "登录失败");
       }
     } catch (err: any) {
-      console.error("Auth login error:", err);
-      showToast("error", `登录鉴权请求失败: ${err?.message || "网络异常，请检查域名 DNS 解析"}`);
+      console.error("Login error:", err);
+      setLoginError(`登录请求失败：${err?.message || "网络异常，请检查后端地址与 DNS 解析"}`);
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  // 提交首次初始化（自行设置管理员用户名与密码）
+  const handleSetup = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setLoginError("");
+
+    if (!setupUsername.trim() || setupUsername.trim().length < 3) {
+      setLoginError("用户名至少需要 3 个字符");
+      return;
+    }
+    if (setupPassword.length < 8) {
+      setLoginError("密码至少需要 8 个字符");
+      return;
+    }
+    if (setupPassword !== setupPassword2) {
+      setLoginError("两次输入的密码不一致");
+      return;
+    }
+
+    setLoginLoading(true);
+    try {
+      const res = await apiFetch("/api/auth/setup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: setupUsername.trim(), password: setupPassword }),
+      });
+      const data = await res.json();
+
+      if (data.success && data.session_token) {
+        persistSession(data.session_token);
+        setSetupPassword("");
+        setSetupPassword2("");
+        setAuthInitialized(true);
+        showToast("success", data.message || "🎉 初始化成功");
+      } else {
+        setLoginError(data.message || "初始化失败");
+      }
+    } catch (err: any) {
+      console.error("Setup error:", err);
+      setLoginError(`初始化请求失败：${err?.message || "网络异常"}`);
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  // 退出登录
+  const handleLogout = () => {
+    sessionStorage.removeItem("DNSHE_SESSION");
+    localStorage.removeItem("DNSHE_SESSION");
+    setSessionToken(null);
+    setLoginUsername("");
+    setLoginPassword("");
+    setLoginTotp("");
+    setLoginNeeds2fa(false);
+    showToast("info", "已退出登录");
+  };
+
+  // 读取账户安全信息（用户名 + 2FA 状态）
+  const fetchAccountInfo = async () => {
+    try {
+      const res = await apiFetch("/api/auth/account");
+      const data = await res.json();
+      if (data.success) {
+        setAccountInfo({ username: data.username || "", two_fa_enabled: !!data.two_fa_enabled });
+      }
+    } catch (e) {
+      // 静默失败，设置页其余部分仍可用
+    }
+  };
+
+  // 修改密码（可选同时改用户名）
+  const handleChangePassword = async () => {
+    if (!pwOld) {
+      showToast("error", "请输入原密码");
+      return;
+    }
+    if (pwNew.length < 8) {
+      showToast("error", "新密码至少需要 8 个字符");
+      return;
+    }
+    if (pwNew !== pwNew2) {
+      showToast("error", "两次输入的新密码不一致");
+      return;
+    }
+    setActionLoading("change-pw");
+    try {
+      const payload: Record<string, string> = { old_password: pwOld, new_password: pwNew };
+      if (pwNewUsername.trim()) payload.username = pwNewUsername.trim();
+      const res = await apiFetch("/api/auth/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "密码修改成功，请重新登录");
+        setPwOld(""); setPwNew(""); setPwNew2(""); setPwNewUsername("");
+        // 密码已变更，当前会话作废，强制重新登录
+        setTimeout(() => handleLogout(), 1500);
+      } else {
+        showToast("error", data.message || "修改密码失败");
+      }
+    } catch (e) {
+      showToast("error", "修改密码请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 第一步：生成 2FA 密钥与二维码
+  const handleStart2faSetup = async () => {
+    setActionLoading("2fa-setup");
+    try {
+      const res = await apiFetch("/api/auth/2fa/setup", { method: "POST" });
+      const data = await res.json();
+      if (data.success) {
+        setTwoFaSetup({ secret: data.secret, otpauth_uri: data.otpauth_uri });
+        setTwoFaEnableToken("");
+      } else {
+        showToast("error", data.message || "生成 2FA 密钥失败");
+      }
+    } catch (e) {
+      showToast("error", "生成 2FA 密钥请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 第二步：输入动态码正式开启 2FA
+  const handleEnable2fa = async () => {
+    if (!twoFaEnableToken.trim()) {
+      showToast("error", "请输入身份验证器上的 6 位动态码");
+      return;
+    }
+    setActionLoading("2fa-enable");
+    try {
+      const res = await apiFetch("/api/auth/2fa/enable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: twoFaEnableToken.trim() }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "两步验证已开启");
+        setTwoFaSetup(null);
+        setTwoFaEnableToken("");
+        fetchAccountInfo();
+      } else {
+        showToast("error", data.message || "开启 2FA 失败");
+      }
+    } catch (e) {
+      showToast("error", "开启 2FA 请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 关闭 2FA（需密码确认）
+  const handleDisable2fa = async () => {
+    if (!twoFaDisablePw) {
+      showToast("error", "请输入密码以确认关闭 2FA");
+      return;
+    }
+    setActionLoading("2fa-disable");
+    try {
+      const res = await apiFetch("/api/auth/2fa/disable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: twoFaDisablePw }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "两步验证已关闭");
+        setTwoFaDisablePw("");
+        fetchAccountInfo();
+      } else {
+        showToast("error", data.message || "关闭 2FA 失败");
+      }
+    } catch (e) {
+      showToast("error", "关闭 2FA 请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -662,7 +909,6 @@ export default function App() {
         webhook_type: settings.webhook_type,
         tg_chat_id: settings.tg_chat_id,
         renew_threshold_days: settings.renew_threshold_days,
-        notify_days: settings.notify_days,
         auto_renew: settings.auto_renew,
       };
       if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
@@ -724,8 +970,31 @@ export default function App() {
     setTimeout(() => window.location.reload(), 1200);
   };
 
-  // 根据当前 ActiveTab 初始化拉取数据
+  // 未登录时向后端查询鉴权状态，决定登录页展示"登录"还是"首次设置"
   useEffect(() => {
+    if (sessionToken) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch("/api/auth/status");
+        const data = await res.json();
+        if (!cancelled && data.success) {
+          setAuthInitialized(!!data.initialized);
+        }
+      } catch (e) {
+        // 网络异常时保持默认（已初始化），仍展示登录表单
+      } finally {
+        if (!cancelled) setAuthStatusLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionToken]);
+
+  // 根据当前 ActiveTab 初始化拉取数据（仅在已登录时触发）
+  useEffect(() => {
+    if (!sessionToken) return;
     fetchAccounts();
     if (activeTab === "dashboard") {
       fetchDomains();
@@ -740,8 +1009,9 @@ export default function App() {
       fetchLogs();
     } else if (activeTab === "settings") {
       fetchSettings();
+      fetchAccountInfo();
     }
-  }, [activeTab]);
+  }, [activeTab, sessionToken]);
 
   // 按账号分组处理域名列表
   const groupedDomains = useMemo(() => {
@@ -1468,7 +1738,6 @@ export default function App() {
   // Dashboard 概览统计（纯前端计算）
   const dashboardStats = useMemo(() => {
     const now = Date.now();
-    const day = 24 * 60 * 60 * 1000;
     let active = 0;
     let expired = 0;
     domains.forEach((d) => {
@@ -1482,20 +1751,12 @@ export default function App() {
       .filter((d) => d.created_at)
       .sort((a, b) => new Date(b.created_at!).getTime() - new Date(a.created_at!).getTime())
       .slice(0, 6);
-    // 未来 7 天到期（升序）
-    const expiringSoon = domains
-      .map((d) => ({ d, exp: d.expires_at ? new Date(d.expires_at).getTime() : NaN }))
-      .filter(({ exp }) => !isNaN(exp) && exp >= now && exp - now <= 7 * day)
-      .sort((a, b) => a.exp - b.exp)
-      .map(({ d }) => d)
-      .slice(0, 8);
     return {
       total: domains.length,
       active,
       expired,
       accounts: accounts.length,
       recent,
-      expiringSoon,
     };
   }, [domains, accounts]);
 
@@ -1503,6 +1764,170 @@ export default function App() {
   const handleGlobalSearchSubmit = () => {
     if (activeTab !== "domains") setActiveTab("domains");
   };
+
+  // ===== 未登录：展示登录 / 首次初始化页面 =====
+  if (!sessionToken) {
+    // 鉴权状态尚未加载完成时，先展示加载态，避免登录/初始化界面闪烁
+    if (!authStatusLoaded) {
+      return (
+        <div className="flex h-screen items-center justify-center bg-base text-content-primary">
+          <RefreshCw className="w-6 h-6 animate-spin text-indigo-500" />
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex h-screen items-center justify-center bg-base text-content-primary px-4">
+        <div className="w-full max-w-sm bg-surface border border-border-base rounded-2xl shadow-2xl p-7 space-y-6">
+          {/* 头部 LOGO */}
+          <div className="flex flex-col items-center gap-2 text-center">
+            <div className="w-12 h-12 rounded-2xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/30">
+              <Globe className="w-7 h-7 text-white" />
+            </div>
+            <h1 className="text-xl font-black text-content-primary">DNSHE 集控台</h1>
+            <p className="text-xs text-content-muted">
+              {authInitialized ? "请登录以管理您的免费域名资产" : "首次使用，请设置管理员账户"}
+            </p>
+          </div>
+
+          {/* 错误提示 */}
+          {loginError && (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-xs">
+              <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <span>{loginError}</span>
+            </div>
+          )}
+
+          {authInitialized ? (
+            /* ── 登录表单 ── */
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-content-secondary">用户名</label>
+                <input
+                  type="text"
+                  autoComplete="username"
+                  value={loginUsername}
+                  onChange={(e) => setLoginUsername(e.target.value)}
+                  placeholder="管理员用户名"
+                  className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-content-secondary">密码</label>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  placeholder="登录密码"
+                  className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                />
+              </div>
+              {loginNeeds2fa && (
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-content-secondary flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" /> 两步验证动态码
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    value={loginTotp}
+                    onChange={(e) => setLoginTotp(e.target.value)}
+                    placeholder="身份验证器上的 6 位数字"
+                    className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm font-mono text-content-primary placeholder:text-content-muted"
+                  />
+                </div>
+              )}
+              <button
+                type="submit"
+                disabled={loginLoading}
+                className="btn-primary w-full py-2.5 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {loginLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}
+                {loginLoading ? "登录中..." : "登录"}
+              </button>
+            </form>
+          ) : (
+            /* ── 首次初始化表单 ── */
+            <form onSubmit={handleSetup} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-content-secondary">设置用户名</label>
+                <input
+                  type="text"
+                  autoComplete="username"
+                  value={setupUsername}
+                  onChange={(e) => setSetupUsername(e.target.value)}
+                  placeholder="至少 3 个字符"
+                  className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-content-secondary">设置密码</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={setupPassword}
+                  onChange={(e) => setSetupPassword(e.target.value)}
+                  placeholder="至少 8 个字符"
+                  className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-content-secondary">确认密码</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={setupPassword2}
+                  onChange={(e) => setSetupPassword2(e.target.value)}
+                  placeholder="再次输入密码"
+                  className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={loginLoading}
+                className="btn-primary w-full py-2.5 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {loginLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
+                {loginLoading ? "创建中..." : "创建管理员账户并进入"}
+              </button>
+            </form>
+          )}
+
+          {/* 后端地址配置（折叠在底部，便于跨域部署时指定 Worker） */}
+          <details className="text-xs text-content-muted">
+            <summary className="cursor-pointer hover:text-content-secondary select-none">后端地址设置（跨域部署时使用）</summary>
+            <div className="flex gap-2 mt-2">
+              <input
+                value={backendUrlInput}
+                onChange={(e) => setBackendUrlInput(e.target.value)}
+                placeholder="https://api-dnshe.example.com"
+                className="form-input flex-1 px-3 py-2 rounded-lg text-xs text-content-primary placeholder:text-content-muted"
+              />
+              <button
+                onClick={handleSaveBackendUrl}
+                className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-xs font-semibold"
+              >
+                保存
+              </button>
+            </div>
+          </details>
+        </div>
+
+        {/* 登录页也需要 Toast 通知 */}
+        {toast && (
+          <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-lg shadow-2xl border text-sm font-semibold bg-surface text-content-primary border-border-base">
+            {toast.type === "success" && <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0" />}
+            {toast.type === "error" && <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0" />}
+            {toast.type === "info" && <Info className="w-5 h-5 text-indigo-500 flex-shrink-0" />}
+            {toast.type === "warning" && <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0" />}
+            <span>{toast.message}</span>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen overflow-hidden bg-base text-content-primary">
@@ -1636,14 +2061,14 @@ export default function App() {
             {theme === "dark" ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
           </button>
 
-          {/* 口令 / 鉴权 */}
+          {/* 退出登录 */}
           <button
-            onClick={() => setAuthModalOpen(true)}
+            onClick={handleLogout}
             className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-all"
-            title="配置管理访问口令 (ADMIN_TOKEN)"
+            title="退出登录"
           >
-            <Key className="w-4 h-4 text-amber-400" />
-            <span className="hidden md:inline">{localStorage.getItem("DNSHE_ADMIN_TOKEN") ? "已锁屏鉴权" : "设置口令"}</span>
+            <LogIn className="w-4 h-4 text-amber-400" />
+            <span className="hidden md:inline">退出登录</span>
           </button>
         </header>
 
@@ -1682,48 +2107,23 @@ export default function App() {
               ))}
             </div>
 
-            {/* 中间：最近注册 + 未来 7 天到期 */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* 最近注册 */}
-              <div className="bg-surface border border-border-base rounded-2xl overflow-hidden">
-                <div className="px-5 py-3.5 border-b border-border-base flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-indigo-400" />
-                  <h3 className="font-bold text-content-primary text-sm">最近注册</h3>
-                </div>
-                <div className="divide-y divide-border-soft">
-                  {dashboardStats.recent.length === 0 ? (
-                    <div className="px-5 py-10 text-center text-content-muted text-sm">暂无数据</div>
-                  ) : (
-                    dashboardStats.recent.map((d) => (
-                      <div key={d.id} className="px-5 py-3 flex items-center justify-between hover:bg-hovered transition-colors">
-                        <span className="font-mono text-sm text-content-primary">{d.full_domain}</span>
-                        <span className="text-xs text-content-muted">{d.account_alias}</span>
-                      </div>
-                    ))
-                  )}
-                </div>
+            {/* 中间：最近注册 */}
+            <div className="bg-surface border border-border-base rounded-2xl overflow-hidden">
+              <div className="px-5 py-3.5 border-b border-border-base flex items-center gap-2">
+                <Activity className="w-4 h-4 text-indigo-400" />
+                <h3 className="font-bold text-content-primary text-sm">最近注册</h3>
               </div>
-
-              {/* 未来 7 天到期 */}
-              <div className="bg-surface border border-border-base rounded-2xl overflow-hidden">
-                <div className="px-5 py-3.5 border-b border-border-base flex items-center gap-2">
-                  <CalendarClock className="w-4 h-4 text-amber-400" />
-                  <h3 className="font-bold text-content-primary text-sm">未来 7 天到期</h3>
-                </div>
-                <div className="divide-y divide-border-soft">
-                  {dashboardStats.expiringSoon.length === 0 ? (
-                    <div className="px-5 py-10 text-center text-content-muted text-sm">近 7 天无域名到期 🎉</div>
-                  ) : (
-                    dashboardStats.expiringSoon.map((d) => (
-                      <div key={d.id} className="px-5 py-3 flex items-center justify-between hover:bg-hovered transition-colors">
-                        <span className="font-mono text-sm text-content-primary">{d.full_domain}</span>
-                        <span className="text-xs text-amber-400 font-semibold">
-                          {new Date(d.expires_at).toLocaleDateString("zh-CN")}
-                        </span>
-                      </div>
-                    ))
-                  )}
-                </div>
+              <div className="divide-y divide-border-soft">
+                {dashboardStats.recent.length === 0 ? (
+                  <div className="px-5 py-10 text-center text-content-muted text-sm">暂无数据</div>
+                ) : (
+                  dashboardStats.recent.map((d) => (
+                    <div key={d.id} className="px-5 py-3 flex items-center justify-between hover:bg-hovered transition-colors">
+                      <span className="font-mono text-sm text-content-primary">{d.full_domain}</span>
+                      <span className="text-xs text-content-muted">{d.account_alias}</span>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           </div>
@@ -2139,7 +2539,7 @@ export default function App() {
                     <div className="space-y-3 pt-2">
                       <h4 className="text-sm font-bold text-content-primary flex items-center gap-2">
                         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                        发现未注册可用域名大盘 (点击一键注册)
+                        发现未注册域名 (点击注册)
                       </h4>
 
                       {availableDomainsList.length === 0 ? (
@@ -2195,7 +2595,7 @@ export default function App() {
                       <div className="flex items-center justify-between">
                         <h4 className="text-sm font-bold text-content-primary flex items-center gap-2">
                           <ScrollText className="w-4 h-4 text-indigo-400" />
-                          实时爆破扫描中文日志 (自动滚动最新 50 条)
+                          实时查询日志 (自动滚动最新 50 条)
                         </h4>
                         <span className="text-xs text-content-muted font-mono">
                           {scanLogs.length > 0 ? `最新推送: ${scanLogs[0].time}` : "等待扫码响应..."}
@@ -2671,10 +3071,10 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* 后端 & 鉴权 */}
+                {/* 后端地址 */}
                 <div className="bg-surface border border-border-base rounded-2xl p-5 space-y-4">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
-                    <Server className="w-4 h-4 text-indigo-400" /> 后端 & 鉴权
+                    <Server className="w-4 h-4 text-indigo-400" /> 后端地址
                   </h3>
                   <div>
                     <label className="text-sm font-semibold text-content-primary">后端 Worker 地址</label>
@@ -2691,17 +3091,160 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                  <div className="flex items-center justify-between pt-2 border-t border-border-soft">
-                    <div>
-                      <div className="text-sm font-semibold text-content-primary">管理访问口令</div>
-                      <div className="text-xs text-content-muted mt-0.5">真正的 ADMIN_TOKEN 需在 Cloudflare 后台/CI 配置，此处仅录入本地口令</div>
+                </div>
+
+                {/* 账户安全：修改密码 + 两步验证 */}
+                <div className="bg-surface border border-border-base rounded-2xl p-5 space-y-5">
+                  <h3 className="font-bold text-content-primary flex items-center gap-2">
+                    <ShieldCheck className="w-4 h-4 text-emerald-400" /> 账户安全
+                  </h3>
+
+                  {/* 当前账户 */}
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-content-muted">当前管理员</span>
+                    <span className="font-mono font-semibold text-content-primary flex items-center gap-1.5">
+                      <UserCheck className="w-4 h-4 text-indigo-400" />
+                      {accountInfo.username || "—"}
+                    </span>
+                  </div>
+
+                  {/* 修改密码 */}
+                  <div className="space-y-3 pt-3 border-t border-border-soft">
+                    <div className="text-sm font-semibold text-content-primary flex items-center gap-1.5">
+                      <Key className="w-4 h-4 text-amber-400" /> 修改登录密码
                     </div>
-                    <button
-                      onClick={() => setAuthModalOpen(true)}
-                      className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-sm font-semibold flex items-center gap-2"
-                    >
-                      <Key className="w-4 h-4 text-amber-400" /> 录入口令
-                    </button>
+                    <input
+                      type="password"
+                      value={pwOld}
+                      onChange={(e) => setPwOld(e.target.value)}
+                      placeholder="原密码"
+                      className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                    />
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <input
+                        type="password"
+                        value={pwNew}
+                        onChange={(e) => setPwNew(e.target.value)}
+                        placeholder="新密码（至少 8 位）"
+                        className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                      />
+                      <input
+                        type="password"
+                        value={pwNew2}
+                        onChange={(e) => setPwNew2(e.target.value)}
+                        placeholder="确认新密码"
+                        className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                      />
+                    </div>
+                    <input
+                      type="text"
+                      value={pwNewUsername}
+                      onChange={(e) => setPwNewUsername(e.target.value)}
+                      placeholder={`同时修改用户名（可选，当前：${accountInfo.username || "admin"}）`}
+                      className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                    />
+                    <div className="flex justify-end">
+                      <button
+                        onClick={handleChangePassword}
+                        disabled={actionLoading === "change-pw"}
+                        className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
+                      >
+                        <Save className="w-4 h-4" /> 保存新密码
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-content-muted">修改成功后当前会话将失效，需用新凭据重新登录。</p>
+                  </div>
+
+                  {/* 两步验证 (2FA) */}
+                  <div className="space-y-3 pt-3 border-t border-border-soft">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-sm font-semibold text-content-primary flex items-center gap-1.5">
+                          <ShieldCheck className="w-4 h-4 text-emerald-400" /> 两步验证 (2FA / TOTP)
+                        </div>
+                        <div className="text-xs text-content-muted mt-0.5">开启后登录需额外输入身份验证器的 6 位动态码</div>
+                      </div>
+                      <span className={`text-xs px-2.5 py-1 rounded-full font-semibold ${accountInfo.two_fa_enabled ? "bg-emerald-500/20 text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
+                        {accountInfo.two_fa_enabled ? "已开启" : "未开启"}
+                      </span>
+                    </div>
+
+                    {/* 未开启：走生成密钥 → 验证动态码 流程 */}
+                    {!accountInfo.two_fa_enabled && (
+                      <div className="space-y-3">
+                        {!twoFaSetup ? (
+                          <button
+                            onClick={handleStart2faSetup}
+                            disabled={actionLoading === "2fa-setup"}
+                            className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                          >
+                            <ShieldCheck className="w-4 h-4 text-emerald-400" /> 开启两步验证
+                          </button>
+                        ) : (
+                          <div className="bg-elevated border border-border-base rounded-xl p-4 space-y-3">
+                            <p className="text-xs text-content-secondary leading-relaxed">
+                              1. 用身份验证器（Google / Microsoft Authenticator）扫描下方二维码：
+                            </p>
+                            <div className="flex justify-center py-2">
+                              <div className="bg-white p-3 rounded-xl">
+                                <QRCodeSVG value={twoFaSetup.otpauth_uri} size={176} level="M" includeMargin={false} />
+                              </div>
+                            </div>
+                            <p className="text-[11px] text-content-muted">
+                              无法扫码时，可在验证器中手动录入以下密钥：
+                            </p>
+                            <div className="font-mono text-sm bg-surface border border-border-base rounded-lg px-3 py-2 break-all text-indigo-400 select-all text-center tracking-wider">
+                              {twoFaSetup.secret}
+                            </div>
+                            <p className="text-xs text-content-secondary">2. 输入验证器当前显示的 6 位动态码以完成开启：</p>
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                maxLength={6}
+                                value={twoFaEnableToken}
+                                onChange={(e) => setTwoFaEnableToken(e.target.value.replace(/\D/g, ""))}
+                                placeholder="6 位动态码"
+                                className="form-input flex-1 px-3 py-2 rounded-lg text-sm font-mono text-content-primary placeholder:text-content-muted"
+                              />
+                              <button
+                                onClick={handleEnable2fa}
+                                disabled={actionLoading === "2fa-enable"}
+                                className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
+                              >
+                                <CheckCircle2 className="w-4 h-4" /> 确认开启
+                              </button>
+                              <button
+                                onClick={() => { setTwoFaSetup(null); setTwoFaEnableToken(""); }}
+                                className="bg-elevated hover:bg-hovered text-content-muted border border-border-base px-3 py-2 rounded-lg text-sm"
+                              >
+                                取消
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 已开启：输入密码确认关闭 */}
+                    {accountInfo.two_fa_enabled && (
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          value={twoFaDisablePw}
+                          onChange={(e) => setTwoFaDisablePw(e.target.value)}
+                          placeholder="输入登录密码以关闭 2FA"
+                          className="form-input flex-1 px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                        />
+                        <button
+                          onClick={handleDisable2fa}
+                          disabled={actionLoading === "2fa-disable"}
+                          className="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
+                        >
+                          关闭 2FA
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -2722,27 +3265,15 @@ export default function App() {
                       <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${settings.auto_renew === "1" ? "left-6" : "left-0.5"}`} />
                     </button>
                   </div>
-                  <div className="grid grid-cols-2 gap-4 pt-2 border-t border-border-soft">
-                    <div>
-                      <label className="text-sm font-semibold text-content-primary">续期阈值（天）</label>
-                      <p className="text-xs text-content-muted mt-0.5 mb-2">剩余有效期低于此值时触发续期</p>
-                      <input
-                        type="number"
-                        value={settings.renew_threshold_days}
-                        onChange={(e) => setSettings((s) => ({ ...s, renew_threshold_days: e.target.value }))}
-                        className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-sm font-semibold text-content-primary">到期提醒（天）</label>
-                      <p className="text-xs text-content-muted mt-0.5 mb-2">提前多少天在概览页预警</p>
-                      <input
-                        type="number"
-                        value={settings.notify_days}
-                        onChange={(e) => setSettings((s) => ({ ...s, notify_days: e.target.value }))}
-                        className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary"
-                      />
-                    </div>
+                  <div className="pt-2 border-t border-border-soft">
+                    <label className="text-sm font-semibold text-content-primary">续期阈值（天）</label>
+                    <p className="text-xs text-content-muted mt-0.5 mb-2">剩余有效期低于此值时触发续期；续期结果（成功 / 失败）会通过通知渠道推送</p>
+                    <input
+                      type="number"
+                      value={settings.renew_threshold_days}
+                      onChange={(e) => setSettings((s) => ({ ...s, renew_threshold_days: e.target.value }))}
+                      className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary"
+                    />
                   </div>
                 </div>
 
@@ -3158,78 +3689,6 @@ export default function App() {
                 完成
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* 管理员口令 (ADMIN_TOKEN) 与 2FA 动态鉴权模态框 */}
-      {authModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/90 snapshot-blur backdrop-blur-md">
-          <div className="bg-surface border border-border-base w-full max-w-md rounded-2xl overflow-hidden shadow-2xl p-6 space-y-4">
-            <div className="flex items-center gap-3 text-amber-400">
-              <Key className="w-7 h-7" />
-              <div>
-                <h3 className="text-lg font-bold text-content-primary">管理员安全鉴权</h3>
-                <span className="text-[10px] text-emerald-400 font-mono font-semibold">支持 2FA 动态验证码 (TOTP) / 静态 Secret</span>
-              </div>
-            </div>
-
-            <p className="text-content-muted text-xs leading-relaxed">
-              后端设置了 <code className="bg-elevated text-amber-300 px-1.5 py-0.5 rounded font-mono">ADMIN_TOKEN</code>。支持直接在手机身份验证器 (Google / Microsoft Authenticator) 中绑定秘钥并输入 <strong>6 位动态验证码</strong> 登录！
-            </p>
-
-            <form onSubmit={handleSaveAuthToken} className="space-y-4 pt-1">
-              <div>
-                <label className="block text-xs font-medium text-content-secondary mb-1.5">
-                  安全凭据 (6位 2FA 动态码 或 ADMIN_TOKEN):
-                </label>
-                <input
-                  type="password"
-                  ref={authTokenInputRef}
-                  defaultValue=""
-                  placeholder="请输入 6 位动态验证码 (如 584920) 或 Token"
-                  className="w-full bg-elevated border border-border-base focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-sm text-content-primary focus:outline-none transition-colors font-mono"
-                />
-                <p className="text-[11px] text-content-muted mt-1.5 leading-normal">
-                  🔒 防 DOM 审查安全机制：凭据由加密 Ref 受控，HTML 节点绝无明文 value 露显。
-                </p>
-              </div>
-
-
-
-
-
-              <div className="flex items-center justify-end gap-3 pt-2">
-                {(sessionStorage.getItem("DNSHE_ADMIN_TOKEN") || localStorage.getItem("DNSHE_ADMIN_TOKEN")) && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (authTokenInputRef.current) authTokenInputRef.current.value = "";
-                      sessionStorage.removeItem("DNSHE_ADMIN_TOKEN");
-                      localStorage.removeItem("DNSHE_ADMIN_TOKEN");
-                      setAuthModalOpen(false);
-                      showToast("info", "已清除本地 2FA 凭据");
-                    }}
-                    className="text-xs text-content-muted hover:text-content-primary underline px-2 py-1"
-                  >
-                    清除凭据
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setAuthModalOpen(false)}
-                  className="bg-elevated hover:bg-hovered text-content-secondary text-xs font-semibold px-3.5 py-2 rounded-lg"
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  className="bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white px-4 py-2 rounded-lg transition-all shadow-md"
-                >
-                  验证并保存
-                </button>
-              </div>
-            </form>
           </div>
         </div>
       )}

@@ -76,6 +76,23 @@ export interface CreateDnsRecordResponse extends BaseResponse {
   record?: DnsRecordInfo;
 }
 
+/** API 密钥信息 */
+export interface ApiKeyInfo {
+  id: number;
+  key_name?: string;
+  api_key: string;
+  status: string;
+  request_count?: number;
+  last_used_at?: string;
+  created_at?: string;
+}
+
+/** 列出 API 密钥响应 */
+export interface ListApiKeysResponse extends BaseResponse {
+  keys?: ApiKeyInfo[];
+  count?: number;
+}
+
 /** 通用操作响应（用于更新、删除等不返回额外数据的操作） */
 export interface ActionResponse extends BaseResponse {}
 
@@ -182,6 +199,14 @@ export class DNSHEClient {
    */
   async getQuota(): Promise<QuotaResponse> {
     return this.request<QuotaResponse>("quota", "", "GET");
+  }
+
+  /**
+   * 列出当前账号的 API 密钥列表
+   * 可用于校验密钥有效性，并从中读取密钥名称 (key_name) 作为账户别名
+   */
+  async listApiKeys(): Promise<ListApiKeysResponse> {
+    return this.request<ListApiKeysResponse>("keys", "list", "GET");
   }
 
   /**

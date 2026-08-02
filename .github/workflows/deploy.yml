@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+  secrets: write
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -136,18 +140,37 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: '3.91.0'
 
-      - name: Sync Optional Secrets to Worker (if set)
+      - name: Auto-Configure & Sync AES_KEY Secret
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           AES_KEY: ${{ secrets.AES_KEY }}
+        run: |
+          # 1. GitHub Secrets 已配置 AES_KEY → 优先使用用户自定义密钥
+          if [ -n "$AES_KEY" ]; then
+            echo "🔐 使用 GitHub Secret 中配置的 AES_KEY 同步到 Worker..."
+            echo "$AES_KEY" | npx wrangler secret put AES_KEY
+          # 2. Worker 上已有 AES_KEY → 保持稳定，不重新生成（否则已加密数据将无法解密）
+          elif npx wrangler secret list 2>/dev/null | grep -q "AES_KEY"; then
+            echo "🔐 AES_KEY 已存在于 Worker，保持现有密钥不变..."
+          # 3. 首次部署 → 自动生成随机 AES_KEY 并写入 Worker
+          else
+            echo "🔐 首次部署，自动生成 AES_KEY 并写入 Worker..."
+            NEW_KEY=$(openssl rand -hex 32)
+            echo "$NEW_KEY" | npx wrangler secret put AES_KEY
+            # 尽力写回 GitHub Secrets，便于本地开发参考（失败不影响部署）
+            if command -v gh >/dev/null 2>&1; then
+              echo "$NEW_KEY" | gh secret set AES_KEY --repo "${GITHUB_REPOSITORY}" || true
+            fi
+          fi
+
+      - name: Sync Optional Secrets to Worker (if set)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          if [ -n "$AES_KEY" ]; then
-            echo "🔐 正在同步更新 AES_KEY 密钥到 Cloudflare Worker..."
-            echo "$AES_KEY" | npx wrangler secret put AES_KEY || true
-          fi
           if [ -n "$ADMIN_TOKEN" ]; then
             echo "🔑 正在同步更新 ADMIN_TOKEN 口令到 Cloudflare Worker..."
             echo "$ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN || true

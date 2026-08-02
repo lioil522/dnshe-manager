@@ -516,34 +516,76 @@ export class DatabaseManager {
   }
 
   /**
-   * 添加 API 账户
+   * 通过 keys/list 接口校验 API 密钥有效性，并尝试自动解析密钥名称 (key_name) 作为账户别名
+   * @returns 解析出的别名；密钥无效时抛出异常；有效但未找到名称时返回 null
    */
-  async addAccount(alias: string, apiKey: string, apiSecret: string): Promise<DBAccount> {
-    // 验证秘钥是否可用
-    const client = new DNSHEClient(apiKey, apiSecret);
+  async resolveAliasFromKey(client: DNSHEClient, apiKey: string): Promise<string | null> {
     try {
-      await client.getQuota();
+      const res = await client.listApiKeys();
+      if (res && res.success && Array.isArray(res.keys)) {
+        const match = res.keys.find((k) => k.api_key === apiKey);
+        const keyName = match && match.key_name ? String(match.key_name).trim() : "";
+        if (keyName) return keyName;
+      }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       throw new Error(`无法验证 API 密钥有效性: ${message}`);
     }
+    return null;
+  }
 
-    const encryptedSecret = await encryptText(apiSecret, this.aesKey);
-    
-    // 如果没有配置 AES_KEY 并且使用 plain 存储，记录一条 Warning 日志
-    if (!this.aesKey) {
-      await this.writeLog("warning", "operation", `账户 [${alias}] 已绑定，但由于未配置 AES_KEY，秘钥将以不安全的方式（弱 Base64 编码）存储在 D1 中！`);
+  /**
+   * 添加 API 账户
+   * alias 可留空，留空时自动通过 keys/list 接口解析密钥名称 (key_name) 作为别名
+   */
+  async addAccount(alias: string, apiKey: string, apiSecret: string): Promise<DBAccount> {
+    const client = new DNSHEClient(apiKey, apiSecret);
+
+    // 别名处理：为空时调用 keys/list 同时完成校验与别名解析（一次请求）
+    let finalAlias = (alias || "").trim();
+    if (!finalAlias) {
+      const resolved = await this.resolveAliasFromKey(client, apiKey);
+      if (!resolved) {
+        throw new Error("API 密钥有效但未能自动获取密钥名称作为别名，请手动填写别名");
+      }
+      finalAlias = resolved;
     } else {
-      await this.writeLog("success", "operation", `账户 [${alias}] 绑定成功，已启用 AES-GCM 安全加密`);
+      // 显式提供别名时，仍需校验密钥是否可用
+      try {
+        await client.getQuota();
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : "未知错误";
+        throw new Error(`无法验证 API 密钥有效性: ${message}`);
+      }
     }
 
-    await this.db.prepare(
-      "INSERT INTO accounts (alias, api_key, api_secret) VALUES (?, ?, ?)"
-    ).bind(alias, apiKey, encryptedSecret).run();
+    const encryptedSecret = await encryptText(apiSecret, this.aesKey);
+
+    // NOTE: 先执行写库（api_key 有 UNIQUE 约束），只有真正入库成功后才写"绑定成功"日志，
+    // 避免重复绑定等失败场景下 INSERT 抛异常、成功日志却已落库导致的"失败却显示成功"问题。
+    try {
+      await this.db.prepare(
+        "INSERT INTO accounts (alias, api_key, api_secret) VALUES (?, ?, ?)"
+      ).bind(finalAlias, apiKey, encryptedSecret).run();
+    } catch (e: unknown) {
+      const raw = e instanceof Error ? e.message : String(e);
+      // 唯一约束冲突（重复绑定同一 api_key）翻译为友好中文提示
+      if (raw.includes("UNIQUE") || raw.toLowerCase().includes("unique constraint")) {
+        throw new Error(`该 API Key 已被绑定，请勿重复绑定（别名: ${finalAlias}）`);
+      }
+      throw new Error(`账户入库失败: ${raw}`);
+    }
 
     const result = await this.db.prepare(
       "SELECT id, alias, api_key, created_at FROM accounts WHERE api_key = ?"
     ).bind(apiKey).first<DBAccount>();
+
+    // 入库成功后再记录日志：区分是否启用了 AES-GCM 加密
+    if (!this.aesKey) {
+      await this.writeLog("warning", "operation", `账户 [${finalAlias}] 已绑定，但由于未配置 AES_KEY，秘钥将以不安全的方式（弱 Base64 编码）存储在 D1 中！`);
+    } else {
+      await this.writeLog("success", "operation", `账户 [${finalAlias}] 绑定成功，已启用 AES-GCM 安全加密`);
+    }
 
     return result as DBAccount;
   }
@@ -556,6 +598,60 @@ export class DatabaseManager {
       "SELECT id, alias, api_key, created_at FROM accounts ORDER BY id ASC"
     ).all<DBAccount>();
     return results || [];
+  }
+
+  /**
+   * 更新 API 账户（可仅修改别名，或同时更换 API Key/Secret）
+   */
+  async updateAccount(id: number, alias: string, apiKey?: string, apiSecret?: string): Promise<DBAccount> {
+    const existing = await this.db.prepare(
+      "SELECT alias, api_key, api_secret FROM accounts WHERE id = ?"
+    ).bind(id).first();
+    if (!existing) {
+      throw new Error(`未找到 ID 为 ${id} 的账户`);
+    }
+    const existingRow = existing as { alias: string; api_key: string; api_secret: string };
+
+    const finalAlias = (alias || "").trim() || existingRow.alias;
+    let finalApiKey = existingRow.api_key;
+    let finalEncryptedSecret = existingRow.api_secret;
+
+    // 若提供了新的 API Key/Secret，则校验有效性并加密替换；留空表示保持不变
+    const newKey = (apiKey || "").trim();
+    const newSecret = (apiSecret || "").trim();
+    if (newKey || newSecret) {
+      if (!newKey || !newSecret) {
+        throw new Error("更换 API 密钥时，API Key 与 API Secret 必须同时填写");
+      }
+      const client = new DNSHEClient(newKey, newSecret);
+      try {
+        await client.getQuota();
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : "未知错误";
+        throw new Error(`无法验证新 API 密钥有效性: ${message}`);
+      }
+      finalApiKey = newKey;
+      finalEncryptedSecret = await encryptText(newSecret, this.aesKey);
+    }
+
+    try {
+      await this.db.prepare(
+        "UPDATE accounts SET alias = ?, api_key = ?, api_secret = ? WHERE id = ?"
+      ).bind(finalAlias, finalApiKey, finalEncryptedSecret, id).run();
+    } catch (e: unknown) {
+      const raw = e instanceof Error ? e.message : String(e);
+      if (raw.includes("UNIQUE") || raw.toLowerCase().includes("unique constraint")) {
+        throw new Error("该 API Key 已被其他账号绑定，请勿重复使用");
+      }
+      throw new Error(`账户更新失败: ${raw}`);
+    }
+
+    const result = await this.db.prepare(
+      "SELECT id, alias, api_key, created_at FROM accounts WHERE id = ?"
+    ).bind(id).first<DBAccount>();
+
+    await this.writeLog("success", "operation", `账户 [${finalAlias}] 信息已更新`);
+    return result as DBAccount;
   }
 
   /**

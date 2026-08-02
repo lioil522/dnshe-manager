@@ -36,6 +36,70 @@ type Bindings = {
   DEFAULT_API_ALIAS?: string;
 };
 
+// NOTE: 深度同步单个账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
+// 与 cron.ts 中 "同步所有域名" 的逻辑保持一致，供绑定/批量/修改换 Key 后调用
+async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, client: DNSHEClient): Promise<number> {
+  const subdomains = await fetchAllSubdomainsFromClient(client);
+
+  // 并发拉取每个子域名的 DNS 记录，自动计算真实状态
+  const enriched = await Promise.all(
+    subdomains.map(async (sub) => {
+      try {
+        const recordsRes = await client.listDnsRecords(sub.id);
+        const records = recordsRes.records || [];
+        const customNsRecord = records.find(
+          (r) => r.type === "NS" && !String(r.content || "").toLowerCase().includes("dnshe.com")
+        );
+
+        let computedStatus = sub.status;
+        let hasDnsVal = 1;
+        if (customNsRecord) {
+          computedStatus = "已委派";
+          hasDnsVal = 0;
+        } else if (records.length > 0) {
+          computedStatus = "已解析";
+          hasDnsVal = 1;
+        } else {
+          computedStatus = "未解析";
+          hasDnsVal = 1;
+        }
+
+        // 深度同步拿到的真实解析记录一并回填缓存，后续打开 DNS 面板直接命中、零上游调用
+        await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
+
+        return { ...sub, status: computedStatus, has_dns: hasDnsVal };
+      } catch (e: unknown) {
+        console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
+        return { ...sub, has_dns: 1 };
+      }
+    })
+  );
+
+  if (enriched.length > 0) {
+    await dbManager.syncAccountDomains(accountId, enriched);
+  }
+  return subdomains.length;
+}
+
+// NOTE: 批量绑定后逐个账号深度同步域名（间隔 1.2s 规避 DNSHE 速率限制）
+async function syncDomainsForAccounts(dbManager: DatabaseManager, accountIds: number[]) {
+  for (const id of accountIds) {
+    try {
+      const { client } = await dbManager.getClientForAccount(id);
+      const synced = await deepSyncAccountDomains(dbManager, id, client);
+      console.log(`Deep sync finished for account ${id}: ${synced} domains`);
+    } catch (e: unknown) {
+      console.error(`Background domain deep sync failed for account ${id}:`, e);
+    }
+    await sleep(1200);
+  }
+}
+
+// NOTE: 简易异步等待工具
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // NOTE: 辅助函数 - 如果在环境变量中配置了 DEFAULT_API_KEY 和 DEFAULT_API_SECRET，自动进行初始化绑定
 async function ensureDefaultAccount(c: any, dbManager: DatabaseManager) {
   const apiKey = c.env.DEFAULT_API_KEY;
@@ -48,13 +112,10 @@ async function ensureDefaultAccount(c: any, dbManager: DatabaseManager) {
       const exists = existingAccounts.some(acc => acc.api_key === apiKey);
       if (!exists) {
         const newAcc = await dbManager.addAccount(alias, apiKey, apiSecret);
-        // 同步一次域名
+        // 深度同步一次域名，保证自动分类（已委派/已解析/未解析）
         try {
           const { client } = await dbManager.getClientForAccount(newAcc.id);
-          const res = await client.listSubdomains(1, 500);
-          if (res && res.success && Array.isArray(res.subdomains)) {
-            await dbManager.syncAccountDomains(newAcc.id, res.subdomains);
-          }
+          await deepSyncAccountDomains(dbManager, newAcc.id, client);
         } catch (syncErr) {
           console.error("Default account auto-sync failed:", syncErr);
         }
@@ -518,16 +579,25 @@ app.post("/api/auth/2fa/enable", async (c) => {
   }
 });
 
-// A5. 关闭 2FA（需校验密码）
+// A5. 关闭 2FA（需校验当前动态码）
 app.post("/api/auth/2fa/disable", async (c) => {
   const dbManager = c.get("db");
   try {
     const body = await c.req.json().catch(() => ({}));
-    const password = String(body.password || "");
+    const token = String(body.token || "").trim();
+    if (!token) {
+      return c.json(errorRes("请输入身份验证器上的 6 位动态码", "bad_request"), 400);
+    }
 
-    const passValid = await dbManager.verifyPassword(password);
-    if (!passValid) {
-      return c.json(errorRes("密码错误，无法关闭 2FA", "invalid_credentials"), 401);
+    const cfg = await dbManager.getAuthConfig();
+    if (!cfg.twoFaEnabled || !cfg.twoFaSecret) {
+      return c.json(errorRes("两步验证当前未开启", "bad_request"), 400);
+    }
+
+    const totpValid = await verifyTOTP(token, cfg.twoFaSecret);
+    if (!totpValid) {
+      await dbManager.writeLog("warning", "auth", "关闭 2FA 失败：动态验证码错误或已过期");
+      return c.json(errorRes("动态验证码错误或已过期，无法关闭 2FA", "invalid_2fa"), 401);
     }
 
     await dbManager.setTwoFaEnabled(false);
@@ -556,28 +626,22 @@ app.get("/api/accounts", async (c) => {
   }
 });
 
-// 2. 绑定新账号
+// 2. 绑定新账号（alias 可选，留空时自动从 API Key 解析密钥名称作为别名）
 app.post("/api/accounts", async (c) => {
   const dbManager = c.get("db");
   try {
     const body = await c.req.json();
     const { alias, api_key, api_secret } = body;
     
-    if (!alias || !api_key || !api_secret) {
-      return c.json(errorRes("参数缺失：alias, api_key, api_secret 均为必填项", "bad_request"), 400);
+    if (!api_key || !api_secret) {
+      return c.json(errorRes("参数缺失：api_key, api_secret 为必填项（alias 可选，留空将自动解析）", "bad_request"), 400);
     }
 
-    const newAccount = await dbManager.addAccount(alias, api_key, api_secret);
+    const newAccount = await dbManager.addAccount(String(alias || "").trim(), String(api_key), String(api_secret));
     
-    // 绑定成功后，在后台触发一次该账号的域名同步，防止页面上显示为空
-    try {
-      const { client } = await dbManager.getClientForAccount(newAccount.id);
-      const res = await client.listSubdomains(1, 500);
-      if (res && res.success && Array.isArray(res.subdomains)) {
-        await dbManager.syncAccountDomains(newAccount.id, res.subdomains);
-      }
-    } catch (syncErr: unknown) {
-      console.error("Initial domain sync failed for new account:", syncErr);
+    // 绑定成功后，后台深度同步该账号域名（逐个拉取 DNS 记录自动分类），不阻塞响应
+    if (newAccount && newAccount.id) {
+      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, [newAccount.id]));
     }
 
     return c.json(successRes({ account: newAccount }));
@@ -587,7 +651,92 @@ app.post("/api/accounts", async (c) => {
   }
 });
 
-// 3. 解绑账号
+// 3. 批量绑定新账号（仅需 API Key + API Secret，别名留空自动解析）
+app.post("/api/accounts/batch", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const items = Array.isArray(body.accounts) ? body.accounts : [];
+    if (items.length === 0) {
+      return c.json(errorRes("请至少提供一条账号信息（api_key + api_secret）", "bad_request"), 400);
+    }
+    if (items.length > 50) {
+      return c.json(errorRes("单次最多批量绑定 50 个账号", "bad_request"), 400);
+    }
+
+    const results: Array<{ api_key: string; alias?: string; success: boolean; message: string }> = [];
+    const newAccountIds: number[] = [];
+    let successCount = 0;
+    let failCount = 0;
+
+    // 串行处理每个账号，间隔 800ms 以规避 DNSHE 速率限制（默认 30-60 请求/分钟）
+    for (const item of items) {
+      const apiKey = String(item?.api_key || "").trim();
+      const apiSecret = String(item?.api_secret || "").trim();
+      const alias = String(item?.alias || "").trim();
+
+      if (!apiKey || !apiSecret) {
+        failCount++;
+        results.push({ api_key: apiKey || "(未填写)", success: false, message: "缺少 API Key 或 API Secret" });
+        continue;
+      }
+
+      try {
+        const newAccount = await dbManager.addAccount(alias, apiKey, apiSecret);
+        newAccountIds.push(newAccount.id);
+        successCount++;
+        results.push({ api_key: apiKey, alias: newAccount.alias, success: true, message: "绑定成功" });
+      } catch (e: unknown) {
+        failCount++;
+        const message = e instanceof Error ? e.message : "未知错误";
+        results.push({ api_key: apiKey, success: false, message });
+      }
+
+      await sleep(800);
+    }
+
+    // 绑定完成后在后台逐个同步域名（间隔 1.2s 限频），不阻塞 HTTP 响应
+    if (newAccountIds.length > 0) {
+      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, newAccountIds));
+    }
+
+    return c.json(successRes({
+      success_count: successCount,
+      fail_count: failCount,
+      results,
+      message: `批量绑定完成：成功 ${successCount} 个，失败 ${failCount} 个，域名同步已在后台进行中`,
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(`批量绑定失败: ${message}`), 400);
+  }
+});
+
+// 4. 修改账号信息（可仅改别名，或同时更换 API Key/Secret）
+app.put("/api/accounts/:id", async (c) => {
+  const dbManager = c.get("db");
+  const id = parseInt(c.req.param("id"), 10);
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const alias = String(body.alias || "");
+    const apiKey = body.api_key !== undefined ? String(body.api_key) : undefined;
+    const apiSecret = body.api_secret !== undefined ? String(body.api_secret) : undefined;
+
+    const updatedAccount = await dbManager.updateAccount(id, alias, apiKey, apiSecret);
+
+    // 若更换了 API Key，则后台深度重新同步该账号的域名缓存（拉取 DNS 记录自动分类）
+    if (apiKey && apiSecret) {
+      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, [updatedAccount.id]));
+    }
+
+    return c.json(successRes({ account: updatedAccount, message: "账号信息已更新" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+// 5. 解绑账号
 app.delete("/api/accounts/:id", async (c) => {
   const dbManager = c.get("db");
   const id = parseInt(c.req.param("id"), 10);

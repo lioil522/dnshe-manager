@@ -29,7 +29,8 @@ import {
   Activity,
   LogIn,
   Send,
-  Save
+  Save,
+  Pencil
 } from "lucide-react";
 
 // API 响应基本接口
@@ -104,9 +105,14 @@ interface AppLog {
  * 主应用组件 - 提供 DNSHE 域名管理控制面板
  */
 export default function App() {
-  // 当前处于的选项卡
+  // 当前处于的选项卡（通过 URL hash 持久化，刷新/前进后退保持所在页面）
   type TabKey = "dashboard" | "domains" | "accounts" | "register" | "quota" | "logs" | "settings";
-  const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
+  const TAB_KEYS: TabKey[] = ["dashboard", "domains", "accounts", "register", "quota", "logs", "settings"];
+  const tabFromHash = (): TabKey => {
+    const h = window.location.hash.replace(/^#\/?/, "") as TabKey;
+    return TAB_KEYS.includes(h) ? h : "dashboard";
+  };
+  const [activeTab, setActiveTab] = useState<TabKey>(tabFromHash);
 
   // 主题（明/暗）与侧栏折叠状态
   const [theme, setTheme] = useState<"light" | "dark">(
@@ -144,6 +150,8 @@ export default function App() {
   const [backendUrlInput, setBackendUrlInput] = useState(
     () => localStorage.getItem("DNSHE_BACKEND_URL") || ""
   );
+  // 后端地址是否处于编辑状态（保存后收起，不常驻显示在输入框）
+  const [backendUrlEditing, setBackendUrlEditing] = useState(false);
 
   // 同步主题到 <html> 类并持久化
   useEffect(() => {
@@ -181,6 +189,19 @@ export default function App() {
   const [newAlias, setNewAlias] = useState("");
   const [newApiKey, setNewApiKey] = useState("");
   const [newApiSecret, setNewApiSecret] = useState("");
+
+  // 批量绑定表单状态
+  const [batchInput, setBatchInput] = useState("");
+  const [batchResults, setBatchResults] = useState<Array<{ api_key: string; alias?: string; success: boolean; message: string }> | null>(null);
+
+  // 绑定面板展开状态（"single" 单个 / "batch" 批量 / null 全部收起）
+  const [expandedBindPanel, setExpandedBindPanel] = useState<"single" | "batch" | null>(null);
+
+  // 修改账号表单状态
+  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [editAlias, setEditAlias] = useState("");
+  const [editApiKey, setEditApiKey] = useState("");
+  const [editApiSecret, setEditApiSecret] = useState("");
 
   // 选中的域名与 DNS 记录管理模态框状态
   const [selectedDomain, setSelectedDomain] = useState<Domain | null>(null);
@@ -316,8 +337,8 @@ export default function App() {
   // 2FA 开启流程：生成的密钥与二维码 URI，以及验证动态码
   const [twoFaSetup, setTwoFaSetup] = useState<{ secret: string; otpauth_uri: string } | null>(null);
   const [twoFaEnableToken, setTwoFaEnableToken] = useState("");
-  // 关闭 2FA 时的密码确认
-  const [twoFaDisablePw, setTwoFaDisablePw] = useState("");
+  // 关闭 2FA 时的动态码确认
+  const [twoFaDisableToken, setTwoFaDisableToken] = useState("");
 
   /**
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
@@ -602,10 +623,10 @@ export default function App() {
     }
   };
 
-  // 关闭 2FA（需密码确认）
+  // 关闭 2FA（需输入当前动态码确认）
   const handleDisable2fa = async () => {
-    if (!twoFaDisablePw) {
-      showToast("error", "请输入密码以确认关闭 2FA");
+    if (!twoFaDisableToken) {
+      showToast("error", "请输入身份验证器上的 6 位动态码以确认关闭 2FA");
       return;
     }
     setActionLoading("2fa-disable");
@@ -613,12 +634,12 @@ export default function App() {
       const res = await apiFetch("/api/auth/2fa/disable", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: twoFaDisablePw }),
+        body: JSON.stringify({ token: twoFaDisableToken }),
       });
       const data = await res.json();
       if (data.success) {
         showToast("success", data.message || "两步验证已关闭");
-        setTwoFaDisablePw("");
+        setTwoFaDisableToken("");
         fetchAccountInfo();
       } else {
         showToast("error", data.message || "关闭 2FA 失败");
@@ -970,7 +991,14 @@ export default function App() {
       localStorage.removeItem("DNSHE_BACKEND_URL");
       showToast("info", "已清除自定义后端地址");
     }
+    setBackendUrlEditing(false);
     setTimeout(() => window.location.reload(), 1200);
+  };
+
+  // 取消编辑，恢复已保存的值并收起输入框
+  const handleCancelBackendUrl = () => {
+    setBackendUrlInput(localStorage.getItem("DNSHE_BACKEND_URL") || "");
+    setBackendUrlEditing(false);
   };
 
   // 未登录时向后端查询鉴权状态，决定登录页展示"登录"还是"首次设置"
@@ -996,17 +1024,31 @@ export default function App() {
     };
   }, [sessionToken]);
 
+  // 切换选项卡时同步 URL hash；浏览器前进/后退或手动改 hash 时同步回 state
+  useEffect(() => {
+    const syncFromHash = () => {
+      const next = tabFromHash();
+      setActiveTab((prev) => (prev === next ? prev : next));
+    };
+    window.addEventListener("hashchange", syncFromHash);
+    return () => window.removeEventListener("hashchange", syncFromHash);
+  }, []);
+
+  useEffect(() => {
+    const want = `#${activeTab}`;
+    if (window.location.hash !== want) {
+      window.location.hash = want;
+    }
+  }, [activeTab]);
+
   // 根据当前 ActiveTab 初始化拉取数据（仅在已登录时触发）
   useEffect(() => {
     if (!sessionToken) return;
     fetchAccounts();
+    // 域名数量用于全局侧栏徽标，任何页面都需保持有值
+    fetchDomains();
     if (activeTab === "dashboard") {
-      fetchDomains();
       fetchLogs();
-    } else if (activeTab === "domains") {
-      fetchDomains();
-    } else if (activeTab === "accounts") {
-      fetchAccounts();
     } else if (activeTab === "quota") {
       fetchQuotas();
     } else if (activeTab === "logs") {
@@ -1057,11 +1099,11 @@ export default function App() {
     }
   };
 
-  // 绑定新账号
+  // 绑定新账号（别名可选，留空时后端自动从 API Key 解析密钥名称）
   const handleAddAccount = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newAlias.trim() || !newApiKey.trim() || !newApiSecret.trim()) {
-      showToast("error", "所有字段均为必填项！");
+    if (!newApiKey.trim() || !newApiSecret.trim()) {
+      showToast("error", "API Key 与 API Secret 为必填项！");
       return;
     }
     setActionLoading("add-account");
@@ -1077,7 +1119,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        showToast("success", `账号 [${newAlias}] 验证并绑定成功！`);
+        showToast("success", `账号 [${data.account?.alias || newAlias || newApiKey}] 验证并绑定成功！`);
         setNewAlias("");
         setNewApiKey("");
         setNewApiSecret("");
@@ -1088,6 +1130,87 @@ export default function App() {
       }
     } catch (err) {
       showToast("error", "绑定请求发送失败，请检查网络");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 批量绑定账号（每行一条：API Key + API Secret，支持空格/逗号/Tab 等分隔，别名留空自动解析）
+  const handleBatchAddAccounts = async () => {
+    const lines = batchInput
+      .split(/[\n;；]+/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
+      showToast("error", "请先粘贴至少一条 API Key 与 API Secret");
+      return;
+    }
+    if (lines.length > 50) {
+      showToast("error", "单次最多批量绑定 50 个账号");
+      return;
+    }
+
+    let parsed: Array<{ alias: string; api_key: string; api_secret: string }> = [];
+
+    // 兼容 JSON 数组格式：[{"api_key":"cfsd_xx","api_secret":"yy","alias":"可选"}]
+    try {
+      const jsonParsed = JSON.parse(batchInput.trim());
+      if (Array.isArray(jsonParsed) && jsonParsed.length > 0 && jsonParsed[0]?.api_key) {
+        parsed = jsonParsed.map((it) => ({
+          alias: it.alias ? String(it.alias).trim() : "",
+          api_key: String(it.api_key).trim(),
+          api_secret: String(it.api_secret).trim(),
+        }));
+      }
+    } catch (e) {
+      // 非 JSON，走逐行解析
+    }
+
+    // 逐行解析：key 与 secret 用空格 / Tab / 逗号 / 竖线 分隔
+    if (parsed.length === 0) {
+      let invalidLines = 0;
+      for (const line of lines) {
+        const parts = line.split(/[\s,，|]+/).map((p) => p.trim()).filter(Boolean);
+        if (parts.length >= 2) {
+          parsed.push({
+            api_key: parts[0],
+            api_secret: parts[1],
+            alias: parts.length >= 3 ? parts.slice(2).join(" ") : "",
+          });
+        } else {
+          invalidLines++;
+        }
+      }
+      if (invalidLines > 0) {
+        showToast("warning", `${invalidLines} 行格式不正确（每行需包含 API Key 与 API Secret），已自动跳过`);
+      }
+    }
+
+    if (parsed.length === 0) {
+      showToast("error", "未能解析出任何有效的账号信息，请检查输入格式");
+      return;
+    }
+
+    setActionLoading("batch-add-accounts");
+    setBatchResults(null);
+    try {
+      const res = await apiFetch("/api/accounts/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accounts: parsed }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setBatchResults(data.results || []);
+        showToast("success", data.message || "批量绑定完成");
+        setBatchInput("");
+        fetchAccounts();
+        fetchDomains();
+      } else {
+        showToast("error", data.message || "批量绑定失败");
+      }
+    } catch (err) {
+      showToast("error", "批量绑定请求发送失败，请检查网络");
     } finally {
       setActionLoading(null);
     }
@@ -1109,6 +1232,53 @@ export default function App() {
       }
     } catch (e) {
       showToast("error", "解绑请求发送失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 打开修改账号弹窗
+  const openEditAccount = (acc: Account) => {
+    setEditingAccount(acc);
+    setEditAlias(acc.alias);
+    setEditApiKey("");
+    setEditApiSecret("");
+  };
+
+  // 提交修改账号（可仅改别名，或同时更换 API Key/Secret）
+  const handleUpdateAccount = async () => {
+    if (!editingAccount) return;
+    if (!editAlias.trim()) {
+      showToast("error", "账户别名不能为空");
+      return;
+    }
+    if (Boolean(editApiKey.trim()) !== Boolean(editApiSecret.trim())) {
+      showToast("error", "更换 API 密钥时，API Key 与 API Secret 需同时填写（留空则保持不变）");
+      return;
+    }
+    setActionLoading(`update-account-${editingAccount.id}`);
+    try {
+      const body: Record<string, string> = { alias: editAlias.trim() };
+      if (editApiKey.trim() && editApiSecret.trim()) {
+        body.api_key = editApiKey.trim();
+        body.api_secret = editApiSecret.trim();
+      }
+      const res = await apiFetch(`/api/accounts/${editingAccount.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "账号信息已更新");
+        setEditingAccount(null);
+        fetchAccounts();
+        fetchDomains();
+      } else {
+        showToast("error", data.message || "更新账号失败");
+      }
+    } catch (e) {
+      showToast("error", "更新账号请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -2766,66 +2936,155 @@ export default function App() {
 
         {/* Tab 2: 账号管理 */}
         {activeTab === "accounts" && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            {/* 左侧：绑定新账号 */}
-            <div className="lg:col-span-1 bg-surface border border-border-base rounded-xl p-6 h-fit">
-              <h2 className="text-lg font-bold text-content-primary mb-4 flex items-center gap-2">
-                <Plus className="w-5 h-5 text-indigo-500" /> 绑定新 DNSHE 账号
-              </h2>
-              
-              <form onSubmit={handleAddAccount} className="space-y-4">
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (备注标识)</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="如：主账号、测试组"
-                    value={newAlias}
-                    onChange={(e) => setNewAlias(e.target.value)}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="cfsd_xxxxxxxxxx"
-                    value={newApiKey}
-                    onChange={(e) => setNewApiKey(e.target.value)}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret</label>
-                  <input
-                    type="password"
-                    required
-                    placeholder="请输入 API Secret"
-                    value={newApiSecret}
-                    onChange={(e) => setNewApiSecret(e.target.value)}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={actionLoading === "add-account"}
-                  className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
-                >
-                  {actionLoading === "add-account" ? (
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                  ) : (
-                    "验证并绑定账号"
-                  )}
-                </button>
-              </form>
+          <div className="space-y-6">
+            {/* 顶部：绑定按钮（横排） */}
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => setExpandedBindPanel((prev) => (prev === "single" ? null : "single"))}
+                className={`flex-1 py-3 rounded-xl text-sm font-semibold border flex items-center justify-center gap-2 transition-all ${
+                  expandedBindPanel === "single"
+                    ? "bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-900/40"
+                    : "bg-surface border-border-base text-content-secondary hover:bg-hovered"
+                }`}
+              >
+                <Plus className={`w-5 h-5 ${expandedBindPanel === "single" ? "text-white" : "text-indigo-500"}`} />
+                绑定单个账号
+              </button>
+              <button
+                type="button"
+                onClick={() => setExpandedBindPanel((prev) => (prev === "batch" ? null : "batch"))}
+                className={`flex-1 py-3 rounded-xl text-sm font-semibold border flex items-center justify-center gap-2 transition-all ${
+                  expandedBindPanel === "batch"
+                    ? "bg-emerald-600 border-emerald-500 text-white shadow-lg shadow-emerald-900/40"
+                    : "bg-surface border-border-base text-content-secondary hover:bg-hovered"
+                }`}
+              >
+                <Sparkles className={`w-5 h-5 ${expandedBindPanel === "batch" ? "text-white" : "text-emerald-500"}`} />
+                批量绑定账号
+              </button>
             </div>
 
-            {/* 右侧：账号列表 */}
-            <div className="lg:col-span-2 space-y-4">
+            {/* 展开：绑定单个账号 */}
+            {expandedBindPanel === "single" && (
+              <div className="bg-surface border border-border-base rounded-xl p-6">
+                <h2 className="text-lg font-bold text-content-primary mb-4 flex items-center gap-2">
+                  <Plus className="w-5 h-5 text-indigo-500" /> 绑定单个账号
+                </h2>
+
+                <form onSubmit={handleAddAccount} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (可选，留空自动解析)</label>
+                    <input
+                      type="text"
+                      placeholder="如：主账号、测试组"
+                      value={newAlias}
+                      onChange={(e) => setNewAlias(e.target.value)}
+                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="cfsd_xxxxxxxxxx"
+                      value={newApiKey}
+                      onChange={(e) => setNewApiKey(e.target.value)}
+                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret</label>
+                    <input
+                      type="password"
+                      required
+                      placeholder="请输入 API Secret"
+                      value={newApiSecret}
+                      onChange={(e) => setNewApiSecret(e.target.value)}
+                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={actionLoading === "add-account"}
+                    className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {actionLoading === "add-account" ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      "验证并绑定账号"
+                    )}
+                  </button>
+                  <p className="text-[11px] text-content-muted leading-relaxed">别名留空时，系统会自动调用 DNSHE 密钥列表接口获取该 Key 的名称作为别名。</p>
+                </form>
+              </div>
+            )}
+
+            {/* 展开：批量绑定账号 */}
+            {expandedBindPanel === "batch" && (
+              <div className="bg-surface border border-border-base rounded-xl p-6">
+                <h2 className="text-lg font-bold text-content-primary mb-4 flex items-center gap-2">
+                  <Sparkles className="w-5 h-5 text-emerald-400" /> 批量绑定账号
+                </h2>
+                <p className="text-xs text-content-muted mb-3 leading-relaxed">
+                  每行填入一组 <span className="font-mono text-indigo-400">API Key + API Secret</span>（用空格 / Tab / 逗号分隔），别名自动从 API Key 解析，无需填写。
+                </p>
+                <textarea
+                  value={batchInput}
+                  onChange={(e) => setBatchInput(e.target.value)}
+                  rows={6}
+                  spellCheck={false}
+                  placeholder={"cfsd_xxxxxxxx1 你的secret1\ncfsd_xxxxxxxx2 你的secret2\ncfsd_xxxxxxxx3,你的secret3"}
+                  className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-y"
+                />
+                <button
+                  onClick={handleBatchAddAccounts}
+                  disabled={actionLoading === "batch-add-accounts"}
+                  className="w-full btn-primary mt-3 py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {actionLoading === "batch-add-accounts" ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" /> 正在批量验证绑定…
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4" /> 开始批量绑定 ({batchInput.split(/[\n;；]+/).map((l) => l.trim()).filter(Boolean).length} 条)
+                    </>
+                  )}
+                </button>
+
+                {batchResults && batchResults.length > 0 && (
+                  <div className="mt-4 space-y-2 max-h-64 overflow-y-auto pr-1">
+                    {batchResults.map((r, idx) => (
+                      <div
+                        key={idx}
+                        className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
+                          r.success
+                            ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                            : "bg-red-500/10 border-red-500/30 text-red-300"
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <div className="font-mono truncate">{r.api_key}</div>
+                          {r.alias && <div className="text-content-muted truncate">别名: {r.alias}</div>}
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0">
+                          {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                          <span>{r.success ? "成功" : r.message}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 已绑定的 API 账号 */}
+            <div>
               <h2 className="text-lg font-bold text-content-primary mb-4">已绑定的 API 账号 ({accounts.length})</h2>
-              
+
               {loadingAccounts ? (
                 <div className="flex justify-center py-10">
                   <RefreshCw className="w-6 h-6 animate-spin text-indigo-500" />
@@ -2848,19 +3107,106 @@ export default function App() {
                           绑定于: {new Date(acc.created_at).toLocaleString("zh-CN")}
                         </p>
                       </div>
-                      
-                      <button
-                        onClick={() => handleDeleteAccount(acc.id)}
-                        disabled={actionLoading === `delete-account-${acc.id}`}
-                        className="bg-red-950/60 hover:bg-red-900/60 text-red-400 hover:text-red-200 border border-red-900/50 p-2 rounded-lg transition-all"
-                        title="删除账号"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+
+                      <div className="flex flex-col gap-2">
+                        <button
+                          onClick={() => openEditAccount(acc)}
+                          disabled={actionLoading === `update-account-${acc.id}`}
+                          className="bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-400 hover:text-indigo-200 border border-indigo-900/50 p-2 rounded-lg transition-all"
+                          title="修改账号"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteAccount(acc.id)}
+                          disabled={actionLoading === `delete-account-${acc.id}`}
+                          className="bg-red-950/60 hover:bg-red-900/60 text-red-400 hover:text-red-200 border border-red-900/50 p-2 rounded-lg transition-all"
+                          title="删除账号"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* 修改账号弹窗 */}
+        {editingAccount && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-md rounded-xl overflow-hidden shadow-2xl">
+              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  <Settings className="w-5 h-5 text-indigo-400" /> 修改账号
+                </h3>
+                <button
+                  onClick={() => setEditingAccount(null)}
+                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名</label>
+                  <input
+                    type="text"
+                    value={editAlias}
+                    onChange={(e) => setEditAlias(e.target.value)}
+                    placeholder="账户别名"
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key（留空保持不变）</label>
+                  <input
+                    type="text"
+                    value={editApiKey}
+                    onChange={(e) => setEditApiKey(e.target.value)}
+                    placeholder={`当前: ${editingAccount.api_key.substring(0, 8)}***${editingAccount.api_key.substring(editingAccount.api_key.length - 4)}`}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret（留空保持不变）</label>
+                  <input
+                    type="password"
+                    value={editApiSecret}
+                    onChange={(e) => setEditApiSecret(e.target.value)}
+                    placeholder="如需更换密钥则填写新的 API Secret"
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  />
+                </div>
+                <p className="text-[11px] text-content-muted leading-relaxed">
+                  仅修改别名时无需填写密钥；更换 API Key/Secret 会校验新密钥有效性，并自动重新同步该账号的域名缓存。
+                </p>
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={() => setEditingAccount(null)}
+                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={handleUpdateAccount}
+                    disabled={actionLoading === `update-account-${editingAccount.id}`}
+                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                  >
+                    {actionLoading === `update-account-${editingAccount.id}` ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <>
+                        <Save className="w-4 h-4" /> 保存修改
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -3096,21 +3442,49 @@ export default function App() {
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <Server className="w-4 h-4 text-indigo-400" /> 后端地址
                   </h3>
-                  <div>
-                    <label className="text-sm font-semibold text-content-primary">后端 Worker 地址</label>
-                    <p className="text-xs text-content-muted mt-0.5 mb-2">留空则自动推演；修改后将刷新页面生效</p>
-                    <div className="flex gap-2">
-                      <input
-                        value={backendUrlInput}
-                        onChange={(e) => setBackendUrlInput(e.target.value)}
-                        placeholder="https://api-dnshe.example.com"
-                        className="form-input flex-1 px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
-                      />
-                      <button onClick={handleSaveBackendUrl} className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5">
-                        <Save className="w-4 h-4" /> 保存
+
+                  {backendUrlEditing ? (
+                    <div>
+                      <label className="text-sm font-semibold text-content-primary">后端 Worker 地址</label>
+                      <div className="flex gap-2 mt-2">
+                        <input
+                          value={backendUrlInput}
+                          onChange={(e) => setBackendUrlInput(e.target.value)}
+                          placeholder="https://api-dnshe.example.com"
+                          className="form-input flex-1 px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                        />
+                        <button onClick={handleSaveBackendUrl} className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5">
+                          <Save className="w-4 h-4" /> 保存
+                        </button>
+                        <button onClick={handleCancelBackendUrl} className="bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm">
+                          取消
+                        </button>
+                      </div>
+                      <p className="text-xs text-content-muted mt-2">保存后刷新页面生效；清空保存可恢复自动推演。</p>
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-sm min-w-0">
+                        {backendUrl ? (
+                          <>
+                            <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                            <span className="text-content-primary">已配置自定义后端地址</span>
+                          </>
+                        ) : (
+                          <>
+                            <Info className="w-4 h-4 text-content-muted flex-shrink-0" />
+                            <span className="text-content-muted">未配置，使用自动推演</span>
+                          </>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => { setBackendUrlInput(localStorage.getItem("DNSHE_BACKEND_URL") || ""); setBackendUrlEditing(true); }}
+                        className="bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-400 hover:text-indigo-200 border border-indigo-900/50 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 flex-shrink-0"
+                      >
+                        <Pencil className="w-3.5 h-3.5" /> {backendUrl ? "修改" : "配置"}
                       </button>
                     </div>
-                  </div>
+                  )}
                 </div>
 
                 {/* 账户安全：修改密码 + 两步验证 */}
@@ -3246,15 +3620,17 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* 已开启：输入密码确认关闭 */}
+                    {/* 已开启：输入当前动态码确认关闭 */}
                     {accountInfo.two_fa_enabled && (
                       <div className="flex gap-2">
                         <input
-                          type="password"
-                          value={twoFaDisablePw}
-                          onChange={(e) => setTwoFaDisablePw(e.target.value)}
-                          placeholder="输入登录密码以关闭 2FA"
-                          className="form-input flex-1 px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={6}
+                          value={twoFaDisableToken}
+                          onChange={(e) => setTwoFaDisableToken(e.target.value.replace(/\D/g, ""))}
+                          placeholder="输入身份验证器当前 6 位动态码"
+                          className="form-input flex-1 px-3 py-2 rounded-lg text-sm font-mono text-content-primary placeholder:text-content-muted"
                         />
                         <button
                           onClick={handleDisable2fa}

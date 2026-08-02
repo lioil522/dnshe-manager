@@ -126,7 +126,7 @@
 | **`CLOUDFLARE_API_TOKEN`** | **必要 🔴** | 无 | Cloudflare API Token。需要在 Cloudflare 后台创建，至少具备 `Workers:编辑`、`Pages:编辑`、`D1:编辑` 权限。 |
 | **`CLOUDFLARE_ACCOUNT_ID`** | **必要 🔴** | 无 | 您的 Cloudflare 账户 ID。登录 Cloudflare 控制台在右侧侧边栏即可获取。 |
 | **`CLOUDFLARE_D1_DATABASE_ID`** | **非必要 🟢** | 自动查询/自动创建 | 绑定的 D1 数据库 UUID。如果不配置，GitHub Actions 将会自动检测或在您的 Cloudflare 账户中一键创建名为 `dnshe-manager-db` 的 D1 数据库并自动注入绑定。 |
-| **`AES_KEY`** | **非必要 🟢** | 自动生成 | 数据库敏感数据加密密钥（AES-GCM）。**不配置也无需担心**：GitHub Actions 首次部署时会自动生成随机密钥并写入 Worker，且之后保持稳定不变（不会每次部署重新生成，避免已加密数据无法解密），同时写回本仓库 GitHub Secrets 供本地参考。如已有自定义密钥，填入即可优先使用。 |
+| **`AES_KEY`** | **非必要 🟢** | 自动生成 | 数据库敏感数据加密密钥（AES-GCM）。**不配置也无需担心**：GitHub Actions 首次部署时会自动生成随机密钥并写入 Cloudflare Worker（Secret），且之后保持稳定不变（不会每次部署重新生成，避免已加密数据无法解密）。注意：该密钥**不会自动回填到本仓库 GitHub Secrets**（受限于 GITHUB_TOKEN 权限），如需在本地开发使用，可登录 Cloudflare 控制台查看或自行记录。如已有自定义密钥，填入即可优先使用。 |
 | **`ADMIN_TOKEN`** | **非必要 🟢** | 无 | 应急后门 Token。忘记管理员登录密码时的救援凭证。 |
 | **`WEBHOOK_URL`** | **非必要 🟢** | 无 | 域名自动续期通知推送的 Webhook 地址。 |
 
@@ -190,7 +190,7 @@
    - 依次添加以下两个变量：
      - `CLOUDFLARE_API_TOKEN`: 填入准备工作中获取的 Token。
      - `CLOUDFLARE_ACCOUNT_ID`: 填入准备工作中获取的 Account ID。
-     - `AES_KEY`: (可选) 自定义加密密钥。**不填也可以**——首次部署时工作流会自动生成随机 AES_KEY 并写入 Worker，且写回本仓库 Secrets。
+     - `AES_KEY`: (可选) 自定义加密密钥。**不填也可以**——首次部署时工作流会自动生成随机 AES_KEY 并写入 Cloudflare Worker（不会自动回填 GitHub Secrets）。
 2. **推送代码或手动触发**：
    - 提交代码并 `git push main`，或者进入 GitHub 仓库的 **Actions** 选项卡 -> 点击 **Deploy to Cloudflare** -> 点击 **Run workflow**。
 3. **等待部署完成**：

@@ -194,8 +194,29 @@ export default function App() {
   const [batchInput, setBatchInput] = useState("");
   const [batchResults, setBatchResults] = useState<Array<{ api_key: string; alias?: string; success: boolean; message: string }> | null>(null);
 
-  // 绑定面板展开状态（"single" 单个 / "batch" 批量 / null 全部收起）
-  const [expandedBindPanel, setExpandedBindPanel] = useState<"single" | "batch" | null>(null);
+  // 绑定弹窗状态（"single" 单个 / "batch" 批量 / null 关闭）
+  const [bindModal, setBindModal] = useState<"single" | "batch" | null>(null);
+  // 批量输入框引用（自绘拖拽调整高度用）
+  const batchTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // 批量输入框自绘拖拽手柄：直接改 DOM 高度，不走 React 渲染，保证跟手
+  const handleBatchResizeStart = (e: React.PointerEvent<HTMLDivElement>) => {
+    const ta = batchTextareaRef.current;
+    if (!ta) return;
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = ta.offsetHeight;
+    const move = (ev: PointerEvent) => {
+      const h = Math.max(96, Math.min(480, startH + (ev.clientY - startY)));
+      ta.style.height = `${h}px`;
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
 
   // 修改账号表单状态
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -1123,6 +1144,7 @@ export default function App() {
         setNewAlias("");
         setNewApiKey("");
         setNewApiSecret("");
+        setBindModal(null);
         fetchAccounts();
         fetchDomains();
       } else {
@@ -2937,149 +2959,25 @@ export default function App() {
         {/* Tab 2: 账号管理 */}
         {activeTab === "accounts" && (
           <div className="space-y-6">
-            {/* 顶部：绑定按钮（横排） */}
+            {/* 顶部：绑定按钮（横排，点击打开弹窗） */}
             <div className="flex gap-3">
               <button
                 type="button"
-                onClick={() => setExpandedBindPanel((prev) => (prev === "single" ? null : "single"))}
-                className={`flex-1 py-3 rounded-xl text-sm font-semibold border flex items-center justify-center gap-2 transition-all ${
-                  expandedBindPanel === "single"
-                    ? "bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-900/40"
-                    : "bg-surface border-border-base text-content-secondary hover:bg-hovered"
-                }`}
+                onClick={() => setBindModal("single")}
+                className="flex-1 py-3 rounded-xl text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-500 shadow-lg shadow-indigo-900/40 flex items-center justify-center gap-2 transition-all"
               >
-                <Plus className={`w-5 h-5 ${expandedBindPanel === "single" ? "text-white" : "text-indigo-500"}`} />
+                <Plus className="w-5 h-5" />
                 绑定单个账号
               </button>
               <button
                 type="button"
-                onClick={() => setExpandedBindPanel((prev) => (prev === "batch" ? null : "batch"))}
-                className={`flex-1 py-3 rounded-xl text-sm font-semibold border flex items-center justify-center gap-2 transition-all ${
-                  expandedBindPanel === "batch"
-                    ? "bg-emerald-600 border-emerald-500 text-white shadow-lg shadow-emerald-900/40"
-                    : "bg-surface border-border-base text-content-secondary hover:bg-hovered"
-                }`}
+                onClick={() => setBindModal("batch")}
+                className="flex-1 py-3 rounded-xl text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-500 shadow-lg shadow-emerald-900/40 flex items-center justify-center gap-2 transition-all"
               >
-                <Sparkles className={`w-5 h-5 ${expandedBindPanel === "batch" ? "text-white" : "text-emerald-500"}`} />
+                <Sparkles className="w-5 h-5" />
                 批量绑定账号
               </button>
             </div>
-
-            {/* 展开：绑定单个账号 */}
-            {expandedBindPanel === "single" && (
-              <div className="bg-surface border border-border-base rounded-xl p-6">
-                <h2 className="text-lg font-bold text-content-primary mb-4 flex items-center gap-2">
-                  <Plus className="w-5 h-5 text-indigo-500" /> 绑定单个账号
-                </h2>
-
-                <form onSubmit={handleAddAccount} className="space-y-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (可选，留空自动解析)</label>
-                    <input
-                      type="text"
-                      placeholder="如：主账号、测试组"
-                      value={newAlias}
-                      onChange={(e) => setNewAlias(e.target.value)}
-                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key</label>
-                    <input
-                      type="text"
-                      required
-                      placeholder="cfsd_xxxxxxxxxx"
-                      value={newApiKey}
-                      onChange={(e) => setNewApiKey(e.target.value)}
-                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret</label>
-                    <input
-                      type="password"
-                      required
-                      placeholder="请输入 API Secret"
-                      value={newApiSecret}
-                      onChange={(e) => setNewApiSecret(e.target.value)}
-                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={actionLoading === "add-account"}
-                    className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
-                  >
-                    {actionLoading === "add-account" ? (
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                    ) : (
-                      "验证并绑定账号"
-                    )}
-                  </button>
-                  <p className="text-[11px] text-content-muted leading-relaxed">别名留空时，系统会自动调用 DNSHE 密钥列表接口获取该 Key 的名称作为别名。</p>
-                </form>
-              </div>
-            )}
-
-            {/* 展开：批量绑定账号 */}
-            {expandedBindPanel === "batch" && (
-              <div className="bg-surface border border-border-base rounded-xl p-6">
-                <h2 className="text-lg font-bold text-content-primary mb-4 flex items-center gap-2">
-                  <Sparkles className="w-5 h-5 text-emerald-400" /> 批量绑定账号
-                </h2>
-                <p className="text-xs text-content-muted mb-3 leading-relaxed">
-                  每行填入一组 <span className="font-mono text-indigo-400">API Key + API Secret</span>（用空格 / Tab / 逗号分隔），别名自动从 API Key 解析，无需填写。
-                </p>
-                <textarea
-                  value={batchInput}
-                  onChange={(e) => setBatchInput(e.target.value)}
-                  rows={6}
-                  spellCheck={false}
-                  placeholder={"cfsd_xxxxxxxx1 你的secret1\ncfsd_xxxxxxxx2 你的secret2\ncfsd_xxxxxxxx3,你的secret3"}
-                  className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-y"
-                />
-                <button
-                  onClick={handleBatchAddAccounts}
-                  disabled={actionLoading === "batch-add-accounts"}
-                  className="w-full btn-primary mt-3 py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
-                >
-                  {actionLoading === "batch-add-accounts" ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 animate-spin" /> 正在批量验证绑定…
-                    </>
-                  ) : (
-                    <>
-                      <Play className="w-4 h-4" /> 开始批量绑定 ({batchInput.split(/[\n;；]+/).map((l) => l.trim()).filter(Boolean).length} 条)
-                    </>
-                  )}
-                </button>
-
-                {batchResults && batchResults.length > 0 && (
-                  <div className="mt-4 space-y-2 max-h-64 overflow-y-auto pr-1">
-                    {batchResults.map((r, idx) => (
-                      <div
-                        key={idx}
-                        className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
-                          r.success
-                            ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
-                            : "bg-red-500/10 border-red-500/30 text-red-300"
-                        }`}
-                      >
-                        <div className="min-w-0">
-                          <div className="font-mono truncate">{r.api_key}</div>
-                          {r.alias && <div className="text-content-muted truncate">别名: {r.alias}</div>}
-                        </div>
-                        <div className="flex items-center gap-1 shrink-0">
-                          {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
-                          <span>{r.success ? "成功" : r.message}</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
 
             {/* 已绑定的 API 账号 */}
             <div>
@@ -3206,6 +3104,170 @@ export default function App() {
                     )}
                   </button>
                 </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 绑定单个账号弹窗 */}
+        {bindModal === "single" && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-md rounded-xl overflow-hidden shadow-2xl">
+              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  <Plus className="w-5 h-5 text-indigo-400" /> 绑定单个账号
+                </h3>
+                <button
+                  onClick={() => setBindModal(null)}
+                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleAddAccount} className="p-6 space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (可选，留空自动解析)</label>
+                  <input
+                    type="text"
+                    placeholder="如：主账号、测试组"
+                    value={newAlias}
+                    onChange={(e) => setNewAlias(e.target.value)}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="cfsd_xxxxxxxxxx"
+                    value={newApiKey}
+                    onChange={(e) => setNewApiKey(e.target.value)}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret</label>
+                  <input
+                    type="password"
+                    required
+                    placeholder="请输入 API Secret"
+                    value={newApiSecret}
+                    onChange={(e) => setNewApiSecret(e.target.value)}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  />
+                </div>
+                <p className="text-[11px] text-content-muted leading-relaxed">
+                  别名留空时，系统会自动调用 DNSHE 密钥列表接口获取该 Key 的名称作为别名。
+                </p>
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setBindModal(null)}
+                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={actionLoading === "add-account"}
+                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                  >
+                    {actionLoading === "add-account" ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <>
+                        <Plus className="w-4 h-4" /> 验证并绑定账号
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* 批量绑定账号弹窗 */}
+        {bindModal === "batch" && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85">
+            <div className="bg-surface border border-border-base w-full max-w-lg rounded-xl overflow-hidden shadow-2xl">
+              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  <Sparkles className="w-5 h-5 text-emerald-400" /> 批量绑定账号
+                </h3>
+                <button
+                  onClick={() => setBindModal(null)}
+                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <p className="text-xs text-content-muted leading-relaxed">
+                  每行填入一组 <span className="font-mono text-indigo-400">API Key + API Secret</span>（用空格 / Tab / 逗号分隔），别名自动从 API Key 解析，无需填写。
+                </p>
+                <div className="relative">
+                  <textarea
+                    ref={batchTextareaRef}
+                    value={batchInput}
+                    onChange={(e) => setBatchInput(e.target.value)}
+                    rows={6}
+                    spellCheck={false}
+                    placeholder={"cfsd_xxxxxxxx1 你的secret1\ncfsd_xxxxxxxx2 你的secret2\ncfsd_xxxxxxxx3,你的secret3"}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-none"
+                    style={{ height: 160, transition: "none" }}
+                  />
+                  <div
+                    onPointerDown={handleBatchResizeStart}
+                    className="absolute bottom-0 right-1 h-4 w-10 cursor-ns-resize touch-none select-none flex items-center justify-center gap-[3px]"
+                    title="拖拽调整高度"
+                  >
+                    <span className="block w-3.5 h-[3px] rounded-full bg-current opacity-50" />
+                    <span className="block w-3.5 h-[3px] rounded-full bg-current opacity-50" />
+                  </div>
+                </div>
+                <button
+                  onClick={handleBatchAddAccounts}
+                  disabled={actionLoading === "batch-add-accounts"}
+                  className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {actionLoading === "batch-add-accounts" ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" /> 正在批量验证绑定…
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4" /> 开始批量绑定 ({batchInput.split(/[\n;；]+/).map((l) => l.trim()).filter(Boolean).length} 条)
+                    </>
+                  )}
+                </button>
+
+                {batchResults && batchResults.length > 0 && (
+                  <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                    {batchResults.map((r, idx) => (
+                      <div
+                        key={idx}
+                        className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
+                          r.success
+                            ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                            : "bg-red-500/10 border-red-500/30 text-red-300"
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <div className="font-mono truncate">{r.api_key}</div>
+                          {r.alias && <div className="text-content-muted truncate">别名: {r.alias}</div>}
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0">
+                          {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                          <span>{r.success ? "成功" : r.message}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>

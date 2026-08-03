@@ -30,8 +30,23 @@ import {
   LogIn,
   Send,
   Save,
-  Pencil
+  Pencil,
+  ChevronDown,
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown
 } from "lucide-react";
+import { toASCII, hasNonASCII, toUnicode } from "./punycode";
+import {
+  loadWordBanks,
+  saveWordBanks,
+  makeBankId,
+  buildDefaultBanks,
+  parseWords,
+  BANK_KIND_META,
+  type WordBank,
+  type BankKind
+} from "./wordbanks";
 
 // API 响应基本接口
 export interface ApiResponse {
@@ -230,6 +245,43 @@ export default function App() {
   const [loadingDns, setLoadingDns] = useState(false);
   const [dnsModalOpen, setDnsModalOpen] = useState(false);
 
+  // 域名列表中被收起的账号分组集合（存 accountId，持久化于本地，刷新后保持上次布局）
+  const [collapsedAccounts, setCollapsedAccounts] = useState<Set<number>>(() => {
+    try {
+      const raw = localStorage.getItem("DNSHE_COLLAPSED_ACCOUNTS");
+      const parsed = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(parsed) ? parsed : []);
+    } catch {
+      return new Set();
+    }
+  });
+
+  // 折叠状态落盘
+  const persistCollapsed = (next: Set<number>) => {
+    setCollapsedAccounts(next);
+    localStorage.setItem("DNSHE_COLLAPSED_ACCOUNTS", JSON.stringify([...next]));
+  };
+
+  // 切换单个账号分组展开/收起
+  const toggleAccountCollapse = (accountId: number) => {
+    const next = new Set(collapsedAccounts);
+    if (next.has(accountId)) {
+      next.delete(accountId);
+    } else {
+      next.add(accountId);
+    }
+    persistCollapsed(next);
+  };
+
+  // 展开/收起全部账号分组
+  const toggleAllAccounts = () => {
+    if (collapsedAccounts.size > 0) {
+      persistCollapsed(new Set()); // 存在收起的 → 全部展开
+    } else {
+      persistCollapsed(new Set(groupedDomains.map(g => g.accountId))); // 全部收起
+    }
+  };
+
   // NS 修改模态框状态
   const [nsModalOpen, setNsModalOpen] = useState(false);
   const [nsModalDomain, setNsModalDomain] = useState<Domain | null>(null);
@@ -297,6 +349,74 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState<{ total: number; checked: number; available: number }>({ total: 0, checked: 0, available: 0 });
   const [availableDomainsList, setAvailableDomainsList] = useState<Array<{ fullDomain: string; subdomain: string; rootdomain: string; time: string }>>([]);
   const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" }>>([]);
+
+  // ===== 顺序检测（进位递增）与断点续查状态 =====
+  // 顺序模式开关：开启后忽略规则框，按字符集进位顺序惰性生成候选（如 aaa→aab→...）
+  const [seqMode, setSeqMode] = useState(false);
+  // 顺序模式的字符集与长度
+  const [seqCharset, setSeqCharset] = useState<"字母" | "数字" | "字母数字">("字母");
+  const [seqLength, setSeqLength] = useState<number>(3);
+  // 顺序模式的起始串（留空则从最小串开始，如 aaa）
+  const [seqStart, setSeqStart] = useState<string>("");
+  // 已保存的断点光标（从 localStorage 恢复，供「继续上次」提示使用）
+  const [scanCursor, setScanCursor] = useState<{
+    seqMode: boolean;
+    charset: string;
+    length: number;
+    lastCandidate: string;
+    taskIndex: number;
+    checked: number;
+    savedAt: string;
+  } | null>(() => {
+    try {
+      const raw = localStorage.getItem("DNSHE_SCAN_CURSOR");
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+  // 扫描运行期间实时记录当前进度，供暂停/限流时落盘
+  const scanCursorRef = useRef<{ lastCandidate: string; taskIndex: number; checked: number }>({
+    lastCandidate: "",
+    taskIndex: 0,
+    checked: 0
+  });
+
+  // 查重池：是否忽略池子强制全部重查（用于刷新可能已过期的结论）
+  const [ignorePool, setIgnorePool] = useState(false);
+
+  // ===== 官方保留前缀排除名单 =====
+  // DNSHE 官方设置为不可注册的前缀（整词匹配，如 ai 不可注册但 ailu 可以）。
+  // 查重前直接剔除，避免浪费 API 配额。名单可编辑并持久化。
+  const DEFAULT_RESERVED_PREFIXES = ["ai", "jd", "qq", "mail"];
+  const [reservedPrefixes, setReservedPrefixes] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("DNSHE_RESERVED_PREFIXES");
+      if (!raw) return DEFAULT_RESERVED_PREFIXES;
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : DEFAULT_RESERVED_PREFIXES;
+    } catch {
+      return DEFAULT_RESERVED_PREFIXES;
+    }
+  });
+  // 是否启用保留前缀排除
+  const [enableReservedFilter, setEnableReservedFilter] = useState(
+    () => localStorage.getItem("DNSHE_RESERVED_FILTER_OFF") !== "1"
+  );
+  // 新增保留前缀的输入框
+  const [newReservedInput, setNewReservedInput] = useState("");
+
+  // ===== 可编辑词库状态 =====
+  // 词库分组列表（首次从内置种子导入，之后持久化在 localStorage）
+  const [wordBanks, setWordBanks] = useState<WordBank[]>(() => loadWordBanks());
+  // 词库管理弹窗开关
+  const [bankModalOpen, setBankModalOpen] = useState(false);
+  // 正在编辑的分组（null 表示新建）
+  const [editingBank, setEditingBank] = useState<WordBank | null>(null);
+  // 编辑表单字段
+  const [bankFormName, setBankFormName] = useState("");
+  const [bankFormKind, setBankFormKind] = useState<BankKind>("cn");
+  const [bankFormWords, setBankFormWords] = useState("");
 
   /**
    * 动态智能推演当前环境对应的后端 Worker API 地址 (适应任意新域名)
@@ -756,18 +876,33 @@ export default function App() {
   };
 
   // 渲染单个域名卡片
-  const renderDomainCard = (dom: Domain) => (
-    <div 
-      key={dom.id} 
-      className="bg-surface border border-border-base hover:border-border-base rounded-2xl p-5 flex flex-col justify-between transition-all duration-200 shadow-xl"
-    >
-      {/* 顶部：域名名称与状态 */}
-      <div className="flex items-center justify-between gap-2">
-        <span className="font-mono text-base font-bold text-content-primary tracking-wide truncate" title={dom.full_domain}>
-          {dom.full_domain}
-        </span>
-        {renderStatusBadge(dom)}
-      </div>
+  const renderDomainCard = (dom: Domain) => {
+    const unicodeDomain = toUnicode(dom.full_domain);
+
+    const handleCopyDomain = () => {
+      navigator.clipboard.writeText(dom.full_domain).then(() => {
+        showToast("success", `已复制：${dom.full_domain}`);
+      }).catch(() => {
+        showToast("error", "复制失败，请手动选择");
+      });
+    };
+
+    return (
+      <div
+        key={dom.id}
+        className="bg-surface border border-border-base hover:border-border-base rounded-2xl p-5 flex flex-col justify-between transition-all duration-200 shadow-xl"
+      >
+        {/* 顶部：域名名称与状态 */}
+        <div className="flex items-center justify-between gap-2">
+          <button
+            onClick={handleCopyDomain}
+            className="font-mono text-base font-bold text-content-primary tracking-wide truncate hover:text-indigo-400 transition-colors cursor-pointer text-left"
+            title={`点击复制：${dom.full_domain}`}
+          >
+            {unicodeDomain}
+          </button>
+          {renderStatusBadge(dom)}
+        </div>
 
       {/* 中间：注册时间与到期时间 */}
       <div className="mt-4 space-y-2 text-xs">
@@ -859,6 +994,7 @@ export default function App() {
       </div>
     </div>
   );
+};
 
   // 1. 获取所有域名列表（支持按账号筛选）
   const fetchDomains = async (accountIdFilter?: string) => {
@@ -1549,11 +1685,18 @@ export default function App() {
     overrideRoot?: string
   ) => {
     if (e) e.preventDefault();
-    const sub = (overrideSub !== undefined ? overrideSub : searchSubdomain).trim().toLowerCase();
-    const root = (overrideRoot !== undefined ? overrideRoot : searchRootdomain).trim().toLowerCase();
+    // 中文等非 ASCII 前缀/根域名统一转 Punycode (xn--) 再查询
+    const sub = toASCII((overrideSub !== undefined ? overrideSub : searchSubdomain).trim());
+    const root = toASCII((overrideRoot !== undefined ? overrideRoot : searchRootdomain).trim());
 
     if (!sub) {
       showToast("error", "请输入想要查询的子域名前缀！");
+      return;
+    }
+
+    // 官方保留前缀：直接拦截，不浪费一次上游查询
+    if (enableReservedFilter && reservedPrefixes.some(p => p.toLowerCase() === sub.toLowerCase())) {
+      showToast("error", `前缀 [${sub}] 属于官方保留名单，不可注册（可在批量页的保留名单中调整）`);
       return;
     }
 
@@ -1583,8 +1726,8 @@ export default function App() {
 
   // 提交在线注册免费域名
   const handleRegisterSubdomain = async () => {
-    const sub = searchSubdomain.trim().toLowerCase();
-    const root = searchRootdomain.trim().toLowerCase();
+    const sub = toASCII(searchSubdomain.trim());
+    const root = toASCII(searchRootdomain.trim());
     if (!sub || !root) return;
     if (!registerAccountId) {
       showToast("error", "请先选择用于注册域名的 API 账号！");
@@ -1622,7 +1765,7 @@ export default function App() {
   // 添加与删除自定义根域名 handler
   const handleAddCustomRootDomain = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const cleanRoot = newRootInput.trim().toLowerCase().replace(/^\./, "");
+    const cleanRoot = toASCII(newRootInput.trim().replace(/^\./, ""));
     if (!cleanRoot) return;
     if (allRootDomains.includes(cleanRoot)) {
       showToast("error", `根域名 [.${cleanRoot}] 已在列表中！`);
@@ -1757,8 +1900,206 @@ export default function App() {
     return Array.from(new Set(results));
   };
 
-  // 执行批量扫域名引擎
-  const handleStartBatchScan = async () => {
+  // ===== 顺序检测：进位递增生成器 =====
+  // 取顺序模式对应的字符集
+  const getSeqCharset = (name: string): string[] => {
+    const letters = "abcdefghijklmnopqrstuvwxyz".split("");
+    const digits = "0123456789".split("");
+    if (name === "数字") return digits;
+    if (name === "字母数字") return [...letters, ...digits];
+    return letters;
+  };
+
+  // 进位递增：给定当前串返回下一个串（qwe→qwf，qwz→qxa）；已到最大串则返回 null
+  const nextSeqCandidate = (current: string, charset: string[]): string | null => {
+    const idxMap = new Map(charset.map((c, i) => [c, i]));
+    const chars = current.split("");
+    let pos = chars.length - 1;
+    while (pos >= 0) {
+      const cur = idxMap.get(chars[pos]);
+      if (cur === undefined) return null; // 出现字符集外的字符
+      if (cur < charset.length - 1) {
+        chars[pos] = charset[cur + 1];
+        return chars.join("");
+      }
+      chars[pos] = charset[0]; // 进位：本位归零，继续向前进位
+      pos--;
+    }
+    return null; // 全部进位完毕，空间穷尽
+  };
+
+  // 惰性生成顺序候选：从 start 开始最多取 limit 个（避免 26^4 一次性撑爆内存）
+  const generateSeqPrefixes = (
+    charsetName: string,
+    length: number,
+    start: string,
+    limit: number
+  ): string[] => {
+    const charset = getSeqCharset(charsetName);
+    const min = charset[0].repeat(length);
+    let cur = start && start.length === length ? start.toLowerCase() : min;
+    // 起始串含字符集外字符时回退到最小串
+    if (cur.split("").some(c => !charset.includes(c))) cur = min;
+
+    const out: string[] = [];
+    while (out.length < limit) {
+      out.push(cur);
+      const nxt = nextSeqCandidate(cur, charset);
+      if (nxt === null) break;
+      cur = nxt;
+    }
+    return out;
+  };
+
+  // 保存/清除断点光标
+  const saveScanCursor = (lastCandidate: string, taskIndex: number, checked: number) => {
+    const cursor = {
+      seqMode,
+      charset: seqCharset,
+      length: seqLength,
+      lastCandidate,
+      taskIndex,
+      checked,
+      savedAt: new Date().toLocaleString()
+    };
+    localStorage.setItem("DNSHE_SCAN_CURSOR", JSON.stringify(cursor));
+    setScanCursor(cursor);
+  };
+
+  const clearScanCursor = () => {
+    localStorage.removeItem("DNSHE_SCAN_CURSOR");
+    setScanCursor(null);
+  };
+
+  // ===== 保留前缀名单增删 =====
+  const persistReserved = (next: string[]) => {
+    setReservedPrefixes(next);
+    localStorage.setItem("DNSHE_RESERVED_PREFIXES", JSON.stringify(next));
+  };
+
+  // 添加保留前缀（支持一次粘贴多个，逗号/空格/换行分隔）
+  const handleAddReserved = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const incoming = parseWords(newReservedInput).map(w => w.toLowerCase());
+    if (incoming.length === 0) return;
+
+    const merged = Array.from(new Set([...reservedPrefixes, ...incoming]));
+    const added = merged.length - reservedPrefixes.length;
+    persistReserved(merged);
+    setNewReservedInput("");
+    if (added > 0) {
+      showToast("success", `已添加 ${added} 个保留前缀`);
+    } else {
+      showToast("info", "输入的前缀均已在名单中");
+    }
+  };
+
+  const handleRemoveReserved = (prefix: string) => {
+    persistReserved(reservedPrefixes.filter(p => p !== prefix));
+    showToast("info", `已从名单移除 [${prefix}]`);
+  };
+
+  const handleResetReserved = () => {
+    persistReserved(DEFAULT_RESERVED_PREFIXES);
+    showToast("success", "已恢复官方默认保留前缀名单");
+  };
+
+  // 切换启用状态并持久化
+  const toggleReservedFilter = (enabled: boolean) => {
+    setEnableReservedFilter(enabled);
+    localStorage.setItem("DNSHE_RESERVED_FILTER_OFF", enabled ? "0" : "1");
+  };
+
+  // ===== 词库增删改 =====
+  // 统一落盘：状态与 localStorage 同步更新
+  const persistBanks = (next: WordBank[]) => {
+    setWordBanks(next);
+    saveWordBanks(next);
+  };
+
+  // 打开新建分组弹窗
+  const openCreateBank = () => {
+    setEditingBank(null);
+    setBankFormName("");
+    setBankFormKind("cn");
+    setBankFormWords("");
+    setBankModalOpen(true);
+  };
+
+  // 打开编辑分组弹窗
+  const openEditBank = (bank: WordBank) => {
+    setEditingBank(bank);
+    setBankFormName(bank.name);
+    setBankFormKind(bank.kind);
+    setBankFormWords(bank.words.join(", "));
+    setBankModalOpen(true);
+  };
+
+  // 保存（新建或更新）分组
+  const handleSaveBank = () => {
+    const name = bankFormName.trim();
+    if (!name) {
+      showToast("error", "请填写词库名称！");
+      return;
+    }
+    const words = parseWords(bankFormWords);
+    if (words.length === 0) {
+      showToast("error", "请至少填写一个词条！");
+      return;
+    }
+
+    // 同类型下不允许重名（编辑自身除外）
+    const dup = wordBanks.some(
+      b => b.kind === bankFormKind && b.name === name && b.id !== editingBank?.id
+    );
+    if (dup) {
+      showToast("error", `「${BANK_KIND_META[bankFormKind].label}」下已存在同名词库 [${name}]！`);
+      return;
+    }
+
+    if (editingBank) {
+      persistBanks(
+        wordBanks.map(b =>
+          b.id === editingBank.id ? { ...b, name, kind: bankFormKind, words } : b
+        )
+      );
+      showToast("success", `词库 [${name}] 已更新（${words.length} 个词）`);
+    } else {
+      persistBanks([...wordBanks, { id: makeBankId(), kind: bankFormKind, name, words }]);
+      showToast("success", `已新建词库 [${name}]（${words.length} 个词）`);
+    }
+    setBankModalOpen(false);
+  };
+
+  // 删除分组
+  const handleDeleteBank = (bank: WordBank) => {
+    if (!confirm(`确定要删除词库 [${bank.name}] 吗？该分组下 ${bank.words.length} 个词条将一并移除。`)) return;
+    persistBanks(wordBanks.filter(b => b.id !== bank.id));
+    showToast("info", `已删除词库 [${bank.name}]`);
+  };
+
+  // 恢复内置默认词库（覆盖当前全部自定义内容）
+  const handleResetBanks = () => {
+    if (!confirm("确定要恢复内置默认词库吗？您当前所有的自定义词库分组与修改都将被覆盖！")) return;
+    const defaults = buildDefaultBanks();
+    persistBanks(defaults);
+    showToast("success", `已恢复内置默认词库（${defaults.length} 个分组）`);
+  };
+
+  // 把一整类词库追加进批量规则框（去重后以逗号拼接，走自定义前缀模式）
+  const appendWordbank = (words: string[], label: string) => {
+    setBatchRules(prev => {
+      const existing = prev.trim()
+        ? prev.trim().split(/[+,;\s\n]+/).map(s => s.trim()).filter(Boolean)
+        : [];
+      const merged = Array.from(new Set([...existing, ...words]));
+      return merged.join(", ");
+    });
+    showToast("success", `已追加「${label}」词库（${words.length} 个词）到规则框`);
+  };
+
+  // 执行批量扫域名引擎（resumeFrom 非空时表示从断点续查）
+  const handleStartBatchScan = async (resumeFrom?: string) => {
     if (scanControlRef.current === "paused") {
       updateScanStatus("running");
       showToast("info", "▶️ 已恢复批量扫描任务！");
@@ -1770,20 +2111,90 @@ export default function App() {
       return;
     }
 
-    const prefixes = generatePrefixesFromRule(batchRules, batchLength, excludeChars);
-    if (prefixes.length === 0) {
-      showToast("error", "根据当前规则未能生成有效的前缀词库，请修改规则！");
-      return;
-    }
-    if (prefixes.length >= 20000) {
-      showToast("warning", "⚠️ 规则组合量过大，已按安全上限截断为 20000 个前缀，建议缩小字符集或使用排除字符。");
+    // 顺序模式：按字符集进位递增惰性生成；否则走原有规则词库生成
+    let prefixes: string[];
+    if (seqMode) {
+      const startFrom = resumeFrom || seqStart;
+      prefixes = generateSeqPrefixes(seqCharset, seqLength, startFrom, 20000);
+      if (prefixes.length === 0) {
+        showToast("error", "顺序模式未能生成候选，请检查字符集与长度设置！");
+        return;
+      }
+      showToast(
+        "info",
+        `🔢 顺序模式：从 [${prefixes[0]}] 开始，本轮生成 ${prefixes.length} 个候选前缀`
+      );
+    } else {
+      prefixes = generatePrefixesFromRule(batchRules, batchLength, excludeChars);
+      if (prefixes.length === 0) {
+        showToast("error", "根据当前规则未能生成有效的前缀词库，请修改规则！");
+        return;
+      }
+      if (prefixes.length >= 20000) {
+        showToast("warning", "⚠️ 规则组合量过大，已按安全上限截断为 20000 个前缀，建议缩小字符集或使用排除字符。");
+      }
     }
 
-    const totalTasks: Array<{ sub: string; root: string; full: string }> = [];
+    // ── 官方保留前缀过滤：整词匹配剔除不可注册的前缀，避免浪费 API 配额 ──
+    if (enableReservedFilter && reservedPrefixes.length > 0) {
+      const reservedSet = new Set(reservedPrefixes.map(p => p.toLowerCase()));
+      const before = prefixes.length;
+      prefixes = prefixes.filter(p => !reservedSet.has(p.toLowerCase()));
+      const removed = before - prefixes.length;
+      if (removed > 0) {
+        showToast("info", `🚫 已排除 ${removed} 个官方保留前缀（不可注册）`);
+      }
+      if (prefixes.length === 0) {
+        showToast("error", "全部候选前缀都属于官方保留名单，无可查询项！");
+        return;
+      }
+    }
+
+    // 生成任务：中文等非 ASCII 前缀转 Punycode 用于实际查询(queryFull)，
+    // 同时保留中文原文(full)用于日志与结果展示
+    const allTasks: Array<{ sub: string; root: string; full: string; queryFull: string }> = [];
     for (const sub of prefixes) {
       for (const root of selectedRoots) {
-        totalTasks.push({ sub, root, full: `${sub}.${root}` });
+        const full = `${sub}.${root}`;
+        allTasks.push({ sub, root, full, queryFull: toASCII(full) });
       }
+    }
+
+    // ── 查重池过滤：先批量问后端哪些已确认「已注册」，直接跳过不再消耗上游 API ──
+    let totalTasks = allTasks;
+    if (!ignorePool) {
+      try {
+        const skipSet = new Set<string>();
+        // 分批查询（后端单次上限 500）
+        const BATCH = 500;
+        for (let i = 0; i < allTasks.length; i += BATCH) {
+          const chunk = allTasks.slice(i, i + BATCH);
+          const res = await apiFetch(
+            `/api/whois/pool?domains=${encodeURIComponent(chunk.map(t => t.queryFull).join(","))}`
+          );
+          const data = await res.json();
+          if (data.success && Array.isArray(data.registered)) {
+            data.registered.forEach((d: string) => skipSet.add(d));
+          }
+        }
+
+        if (skipSet.size > 0) {
+          totalTasks = allTasks.filter(t => !skipSet.has(t.queryFull));
+          showToast(
+            "info",
+            `🗂️ 查重池命中 ${skipSet.size} 个已注册域名，已跳过（剩余 ${totalTasks.length} 个待查）`
+          );
+        }
+      } catch (e) {
+        // 池子查询失败不阻断扫描，退化为全量查询
+        console.error("查重池查询失败，将全量扫描:", e);
+      }
+    }
+
+    if (totalTasks.length === 0) {
+      showToast("success", "🎉 本轮全部候选均已在查重池中确认为已注册，无需重复查询！");
+      updateScanStatus("completed");
+      return;
     }
 
     // 多账号并发查重：
@@ -1806,15 +2217,27 @@ export default function App() {
 
     // 单个域名的查询与日志上报逻辑
     const processTask = async (
-      task: { sub: string; root: string; full: string },
+      task: { sub: string; root: string; full: string; queryFull: string },
       account: (typeof workerAccounts)[number]
     ) => {
       const accountQuery = account ? `&account_id=${account.id}` : "";
       const accAlias = account ? account.alias : "公共轮询";
       const nowTime = new Date().toLocaleTimeString();
       try {
-        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.full)}${accountQuery}`);
+        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.queryFull)}${accountQuery}`);
         const data = await res.json();
+
+        // 限流感知：撞到 429 / 配额耗尽时自动暂停，保住断点光标供稍后继续
+        if (res.status === 429 || data.error_code === "rate_limited" || data.error_code === "quota_exceeded") {
+          saveScanCursor(task.sub, nextTaskIndex, checkedCount);
+          updateScanStatus("paused");
+          setScanLogs(prev => [
+            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] ⛔ 触发 API 限流/配额上限，已自动暂停（断点已保存至 ${task.sub}）`, status: "error" },
+            ...prev.slice(0, 49)
+          ]);
+          showToast("warning", "⛔ 触发 API 限流，已自动暂停并保存断点，稍后可点击继续");
+          return;
+        }
 
         if (data.success && data.whois && data.whois.registered === false) {
           setAvailableDomainsList(prev => [
@@ -1861,6 +2284,13 @@ export default function App() {
         const idx = nextTaskIndex++;
         if (idx >= totalTasks.length) return;
 
+        // 实时记录进度，供暂停/限流时落盘为断点光标
+        scanCursorRef.current = {
+          lastCandidate: totalTasks[idx].sub,
+          taskIndex: idx,
+          checked: checkedCount
+        };
+
         const startedAt = Date.now();
         await processTask(totalTasks[idx], account);
 
@@ -1877,6 +2307,7 @@ export default function App() {
 
     if (scanControlRef.current === "running") {
       updateScanStatus("completed");
+      clearScanCursor(); // 正常跑完，断点光标不再需要
       showToast("success", "🎉 所有生成的域名字典查询完毕！");
     }
   };
@@ -2379,7 +2810,7 @@ export default function App() {
                       </label>
                       <input
                         type="text"
-                        placeholder="例如: myapp"
+                        placeholder="例如: myapp 或 中文域名"
                         value={searchSubdomain}
                         onChange={(e) => setSearchSubdomain(e.target.value)}
                         className="w-full bg-elevated border border-border-base focus:border-indigo-500 rounded-xl px-4 py-3 text-sm text-content-primary placeholder-content-muted focus:outline-none"
@@ -2414,6 +2845,13 @@ export default function App() {
                       </button>
                     </div>
                   </form>
+
+                  {/* 中文前缀实时 Punycode 预览（置于表单外，避免撑乱 grid 行高） */}
+                  {hasNonASCII(searchSubdomain) && (
+                    <p className="text-[11px] text-indigo-400 -mt-2 font-mono">
+                      将以 Punycode 提交：<span className="font-bold">{toASCII(searchSubdomain.trim())}.{searchRootdomain}</span>
+                    </p>
+                  )}
                 </div>
 
                 {/* 2. WHOIS 查询结果展示 */}
@@ -2522,9 +2960,22 @@ export default function App() {
                   
                   {/* 1. 生成规则输入框 */}
                   <div className="space-y-2">
-                    <label className="block text-sm font-semibold text-content-secondary">
-                      生成规则:
-                    </label>
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="block text-sm font-semibold text-content-secondary">
+                        生成规则:
+                      </label>
+                      <button
+                        onClick={() => {
+                          setBatchRules("");
+                          showToast("info", "已清空生成规则");
+                        }}
+                        disabled={!batchRules}
+                        className="text-xs font-semibold text-content-muted hover:text-red-400 border border-border-base hover:border-red-500/40 bg-elevated hover:bg-red-950/30 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        一键清空
+                      </button>
+                    </div>
                     <div className="flex items-center bg-elevated border border-border-base rounded-xl px-4 focus-within:border-indigo-500 transition-colors">
                       <input
                         type="text"
@@ -2585,6 +3036,256 @@ export default function App() {
                         </button>
                       ))}
                     </div>
+                  </div>
+
+                  {/* 3.5 词库分类（点击追加到规则框；支持增删改） */}
+                  <div className="space-y-3 border-t border-border-base pt-5">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <label className="block text-xs font-semibold text-content-muted">
+                        词库 (点击标签追加整类词到规则框，中文将自动转 Punycode 提交):
+                      </label>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={openCreateBank}
+                          className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 border border-indigo-500/40 hover:border-indigo-500 bg-indigo-950/30 hover:bg-indigo-950/60 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          新建词库
+                        </button>
+                        <button
+                          onClick={handleResetBanks}
+                          className="text-xs font-semibold text-content-muted hover:text-content-primary border border-border-base hover:border-content-muted bg-elevated hover:bg-hovered px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          恢复默认
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 按分组类型分栏渲染 */}
+                    {(Object.keys(BANK_KIND_META) as BankKind[]).map((kind) => {
+                      const banks = wordBanks.filter((b) => b.kind === kind);
+                      const meta = BANK_KIND_META[kind];
+                      return (
+                        <div key={kind} className="space-y-1.5">
+                          <span className={`text-[11px] font-semibold ${meta.titleClass}`}>
+                            {meta.label}
+                            <span className="text-content-muted font-normal ml-1">({banks.length})</span>
+                          </span>
+                          {banks.length === 0 ? (
+                            <div className="text-[11px] text-content-muted italic">
+                              该分类下暂无词库，可点击右上「新建词库」添加
+                            </div>
+                          ) : (
+                            <div className="flex flex-wrap gap-2">
+                              {banks.map((bank) => (
+                                <div
+                                  key={bank.id}
+                                  className={`group flex items-center bg-elevated border border-border-base ${meta.hoverBorderClass} rounded-lg overflow-hidden transition-all`}
+                                >
+                                  {/* 主体：点击追加到规则框 */}
+                                  <button
+                                    onClick={() => appendWordbank(bank.words, bank.name)}
+                                    className={`text-content-secondary ${meta.hoverTextClass} text-xs px-3 py-1.5 transition-all`}
+                                    title={`点击追加 ${bank.words.length} 个词到规则框`}
+                                  >
+                                    {bank.name}
+                                    <span className="ml-1 text-[10px] text-content-muted">
+                                      {bank.words.length}
+                                    </span>
+                                  </button>
+                                  {/* 编辑 / 删除 */}
+                                  <button
+                                    onClick={() => openEditBank(bank)}
+                                    className="px-1.5 py-1.5 text-content-muted hover:text-indigo-400 hover:bg-hovered transition-all border-l border-border-base"
+                                    title="编辑该词库"
+                                  >
+                                    <Pencil className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteBank(bank)}
+                                    className="px-1.5 py-1.5 text-content-muted hover:text-red-400 hover:bg-hovered transition-all border-l border-border-base"
+                                    title="删除该词库"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* 3.55 官方保留前缀排除名单 */}
+                  <div className="space-y-3 border-t border-border-base pt-5">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={enableReservedFilter}
+                          onChange={(e) => toggleReservedFilter(e.target.checked)}
+                          className="w-4 h-4 accent-red-500"
+                        />
+                        <span className="text-xs font-semibold text-content-secondary">
+                          启用官方保留前缀排除
+                          <span className="text-content-muted font-normal ml-1">
+                            (整词匹配，如 ai 被排除但 ailu 仍会查询)
+                          </span>
+                        </span>
+                      </label>
+                      <button
+                        onClick={handleResetReserved}
+                        className="text-xs font-semibold text-content-muted hover:text-content-primary border border-border-base hover:border-content-muted bg-elevated hover:bg-hovered px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 shrink-0"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        恢复默认
+                      </button>
+                    </div>
+
+                    {enableReservedFilter && (
+                      <div className="space-y-2.5 pl-6">
+                        {/* 已有名单标签 */}
+                        <div className="flex flex-wrap gap-2">
+                          {reservedPrefixes.length === 0 ? (
+                            <span className="text-[11px] text-content-muted italic">
+                              名单为空，当前不会排除任何前缀
+                            </span>
+                          ) : (
+                            reservedPrefixes.map((p) => (
+                              <span
+                                key={p}
+                                className="group flex items-center bg-red-950/30 border border-red-500/30 text-red-300 text-xs rounded-lg overflow-hidden"
+                              >
+                                <span className="px-2.5 py-1 font-mono">{p}</span>
+                                <button
+                                  onClick={() => handleRemoveReserved(p)}
+                                  className="px-1.5 py-1 text-red-400/60 hover:text-red-300 hover:bg-red-900/40 transition-all border-l border-red-500/30"
+                                  title={`从名单移除 ${p}`}
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              </span>
+                            ))
+                          )}
+                        </div>
+
+                        {/* 添加输入框 */}
+                        <form onSubmit={handleAddReserved} className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={newReservedInput}
+                            onChange={(e) => setNewReservedInput(e.target.value)}
+                            placeholder="添加保留前缀，可一次粘贴多个（逗号/空格分隔）"
+                            className="flex-1 bg-elevated border border-border-base rounded-xl px-3 py-2 text-content-primary text-xs focus:border-red-500/60 focus:outline-none"
+                          />
+                          <button
+                            type="submit"
+                            disabled={!newReservedInput.trim()}
+                            className="bg-elevated hover:bg-hovered text-content-secondary hover:text-content-primary border border-border-base text-xs font-semibold px-3 py-2 rounded-xl transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            添加
+                          </button>
+                        </form>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 3.6 顺序检测模式（进位递增 + 断点续查） */}
+                  <div className="space-y-3 border-t border-border-base pt-5">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={seqMode}
+                        onChange={(e) => setSeqMode(e.target.checked)}
+                        className="w-4 h-4 accent-indigo-500"
+                      />
+                      <span className="text-xs font-semibold text-content-secondary">
+                        启用顺序检测模式（按字符集进位递增，如 aaa → aab → aac…，开启后忽略上方规则框）
+                      </span>
+                    </label>
+
+                    {seqMode && (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pl-6">
+                        <div className="space-y-1.5">
+                          <label className="block text-[11px] font-semibold text-content-muted">字符集:</label>
+                          <select
+                            value={seqCharset}
+                            onChange={(e) => setSeqCharset(e.target.value as typeof seqCharset)}
+                            className="w-full bg-elevated border border-border-base rounded-xl px-3 py-2 text-content-primary text-xs focus:border-indigo-500 focus:outline-none"
+                          >
+                            <option value="字母">纯字母 (a-z)</option>
+                            <option value="数字">纯数字 (0-9)</option>
+                            <option value="字母数字">字母+数字 (a-z0-9)</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="block text-[11px] font-semibold text-content-muted">长度:</label>
+                          <select
+                            value={seqLength}
+                            onChange={(e) => setSeqLength(Number(e.target.value))}
+                            className="w-full bg-elevated border border-border-base rounded-xl px-3 py-2 text-content-primary text-xs focus:border-indigo-500 focus:outline-none"
+                          >
+                            <option value={2}>2 位</option>
+                            <option value={3}>3 位</option>
+                            <option value={4}>4 位</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="block text-[11px] font-semibold text-content-muted">起始串 (可选):</label>
+                          <input
+                            type="text"
+                            value={seqStart}
+                            onChange={(e) => setSeqStart(e.target.value)}
+                            placeholder="如 qwe，留空从头开始"
+                            className="w-full bg-elevated border border-border-base rounded-xl px-3 py-2 text-content-primary text-xs focus:border-indigo-500 focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 查重池开关 */}
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={ignorePool}
+                        onChange={(e) => setIgnorePool(e.target.checked)}
+                        className="w-4 h-4 accent-amber-500"
+                      />
+                      <span className="text-xs font-semibold text-content-secondary">
+                        忽略查重池，强制全部重查
+                        <span className="text-content-muted font-normal ml-1">
+                          （默认会跳过池中 7 天内已确认「已注册」的域名以节省 API 配额；勾选此项可刷新过期结论）
+                        </span>
+                      </span>
+                    </label>
+
+                    {/* 断点续查提示条 */}
+                    {scanCursor && scanStatus !== "running" && (
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-amber-950/30 border border-amber-500/30 rounded-xl px-4 py-3">
+                        <div className="text-xs text-amber-300">
+                          🔖 检测到上次未完成的扫描断点：
+                          <span className="font-mono font-bold mx-1">{scanCursor.lastCandidate || "起点"}</span>
+                          （已查 {scanCursor.checked} 个 · 保存于 {scanCursor.savedAt}）
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            onClick={() => handleStartBatchScan(scanCursor.lastCandidate)}
+                            className="bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition-all"
+                          >
+                            从断点继续
+                          </button>
+                          <button
+                            onClick={clearScanCursor}
+                            className="text-xs text-content-muted hover:text-content-primary px-2 py-1.5"
+                          >
+                            清除断点
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* 4. 根域名后缀多选组 (支持添加自定义根域名) */}
@@ -2677,7 +3378,7 @@ export default function App() {
                   {/* 5. 主控制按钮条 */}
                   <div className="flex flex-wrap items-center gap-3 border-t border-border-base pt-5">
                     <button
-                      onClick={handleStartBatchScan}
+                      onClick={() => handleStartBatchScan()}
                       disabled={scanStatus === "running"}
                       className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 disabled:opacity-50"
                     >
@@ -2687,8 +3388,10 @@ export default function App() {
 
                     <button
                       onClick={() => {
+                        const c = scanCursorRef.current;
+                        saveScanCursor(c.lastCandidate, c.taskIndex, c.checked);
                         updateScanStatus("paused");
-                        showToast("info", "⏸️ 域名查重已暂停");
+                        showToast("info", `⏸️ 已暂停并保存断点（当前位置：${c.lastCandidate || "起点"}）`);
                       }}
                       disabled={scanStatus !== "running"}
                       className="bg-elevated hover:bg-hovered text-content-secondary font-semibold text-sm px-5 py-3 rounded-xl transition-all disabled:opacity-50"
@@ -2702,7 +3405,8 @@ export default function App() {
                         setAvailableDomainsList([]);
                         setScanLogs([]);
                         setScanProgress({ total: 0, checked: 0, available: 0 });
-                        showToast("info", "🔄 已重置查重逻辑");
+                        clearScanCursor();
+                        showToast("info", "🔄 已重置查重逻辑（断点已清除）");
                       }}
                       className="bg-elevated hover:bg-hovered text-content-secondary font-semibold text-sm px-5 py-3 rounded-xl transition-all"
                     >
@@ -2877,9 +3581,29 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="text-xs text-content-muted font-mono">
-                已绑定账户: <span className="text-indigo-400 font-bold">{accounts.length}</span> | 
-                托管域名: <span className="text-emerald-400 font-bold">{domains.length}</span> 个
+              <div className="flex items-center gap-4">
+                <div className="text-xs text-content-muted font-mono">
+                  已绑定账户: <span className="text-indigo-400 font-bold">{accounts.length}</span> |
+                  托管域名: <span className="text-emerald-400 font-bold">{domains.length}</span> 个
+                </div>
+                {domains.length > 0 && (
+                  <button
+                    onClick={toggleAllAccounts}
+                    className="px-3 py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {collapsedAccounts.size > 0 ? (
+                      <>
+                        <ChevronsUpDown className="w-3.5 h-3.5" />
+                        展开全部
+                      </>
+                    ) : (
+                      <>
+                        <ChevronsDownUp className="w-3.5 h-3.5" />
+                        收起全部
+                      </>
+                    )}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2900,27 +3624,48 @@ export default function App() {
                 </p>
               </div>
             ) : (
-              <div className="space-y-10">
-                {groupedDomains.map((group) => {
+              <div className="space-y-6">
+                {groupedDomains.map((group, index) => {
                   const defaultDomains = group.domains.filter(checkHasDns);
                   const externalDomains = group.domains.filter((d) => !checkHasDns(d));
 
                   const showDefault = nsTypeFilter === "all" || nsTypeFilter === "default";
                   const showExternal = nsTypeFilter === "all" || nsTypeFilter === "external";
+                  const isCollapsed = collapsedAccounts.has(group.accountId);
 
                   return (
-                    <div key={group.accountId} className="space-y-6 bg-hovered p-6 rounded-2xl border border-border-base">
-                      {/* 账号大标题 */}
-                      <div className="flex items-center justify-between border-b border-border-base pb-4">
-                        <h3 className="text-lg font-bold text-content-primary flex items-center gap-2">
-                          <Key className="w-4 h-4 text-indigo-400" />
-                          账号：<span className="text-indigo-300">{group.alias}</span>
+                    <div
+                      key={group.accountId}
+                      className={`bg-hovered p-6 rounded-2xl border border-border-base ${
+                        isCollapsed ? "" : "space-y-6"
+                      }`}
+                    >
+                      {/* 账号大标题（可点击展开/收起）；收起时去掉分隔线与下边距，保持上下留白对称 */}
+                      <button
+                        onClick={() => toggleAccountCollapse(group.accountId)}
+                        className={`w-full flex items-center justify-between hover:opacity-80 transition-opacity text-left ${
+                          isCollapsed ? "" : "border-b border-border-base pb-4"
+                        }`}
+                      >
+                        <h3 className="text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap">
+                          {isCollapsed ? (
+                            <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
+                          ) : (
+                            <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
+                          )}
+                          <Key className="w-4 h-4 text-indigo-400 shrink-0" />
+                          <span className="text-emerald-400">账号 {index + 1}</span>
+                          <span className="text-content-muted">·</span>
+                          <span className="text-indigo-300">{group.alias}</span>
                           <span className="text-xs bg-indigo-950/80 text-indigo-300 border border-indigo-900/60 px-2.5 py-0.5 rounded-full font-normal">
                             共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
                           </span>
                         </h3>
-                      </div>
+                      </button>
 
+                      {/* 域名内容区（收起时隐藏） */}
+                      {!isCollapsed && (
+                      <>
                       {/* 子分块 1：系统默认 DNS 域名 */}
                       {showDefault && defaultDomains.length > 0 && (
                         <div className="space-y-3">
@@ -2947,6 +3692,8 @@ export default function App() {
                             {externalDomains.map(renderDomainCard)}
                           </div>
                         </div>
+                      )}
+                      </>
                       )}
                     </div>
                   );
@@ -3110,6 +3857,100 @@ export default function App() {
         )}
 
         {/* 绑定单个账号弹窗 */}
+        {/* 词库新建 / 编辑模态框 */}
+        {bankModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-lg rounded-xl overflow-hidden shadow-2xl">
+              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  {editingBank ? (
+                    <>
+                      <Pencil className="w-5 h-5 text-indigo-400" /> 编辑词库
+                    </>
+                  ) : (
+                    <>
+                      <Plus className="w-5 h-5 text-indigo-400" /> 新建词库
+                    </>
+                  )}
+                </h3>
+                <button
+                  onClick={() => setBankModalOpen(false)}
+                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">
+                    词库类型
+                  </label>
+                  <select
+                    value={bankFormKind}
+                    onChange={(e) => setBankFormKind(e.target.value as BankKind)}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  >
+                    {(Object.keys(BANK_KIND_META) as BankKind[]).map((k) => (
+                      <option key={k} value={k}>
+                        {BANK_KIND_META[k].label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">
+                    词库名称
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="如：热门城市 / 5字母单词 / 我的收藏"
+                    value={bankFormName}
+                    onChange={(e) => setBankFormName(e.target.value)}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">
+                    词条内容
+                    <span className="font-normal ml-1">
+                      (用逗号、空格或换行分隔，保存时自动去重)
+                    </span>
+                  </label>
+                  <textarea
+                    rows={8}
+                    placeholder={"如：\n北京, 上海, 广州\n或每行一个词"}
+                    value={bankFormWords}
+                    onChange={(e) => setBankFormWords(e.target.value)}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono resize-y"
+                  />
+                  <p className="text-[11px] text-content-muted mt-1.5">
+                    当前解析出 <span className="text-indigo-400 font-bold">{parseWords(bankFormWords).length}</span> 个词条
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-elevated px-6 py-4 flex items-center justify-end gap-3 border-t border-border-base">
+                <button
+                  onClick={() => setBankModalOpen(false)}
+                  className="px-4 py-2 text-sm font-semibold text-content-secondary hover:text-content-primary bg-surface hover:bg-hovered border border-border-base rounded-lg transition-all"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleSaveBank}
+                  className="px-5 py-2 text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-all shadow-lg flex items-center gap-2"
+                >
+                  <Save className="w-4 h-4" />
+                  {editingBank ? "保存修改" : "创建词库"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {bindModal === "single" && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
             <div className="bg-surface border border-border-base w-full max-w-md rounded-xl overflow-hidden shadow-2xl">

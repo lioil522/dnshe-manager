@@ -330,17 +330,54 @@ export class DatabaseManager {
 
   /**
    * 写入缓存（默认 1 年后过期，作为极端兜底；正常由写操作主动失效/重填）
+   *
+   * @param ttlSeconds 可选的自定义存活秒数。查重池等需要主动过期的场景传入较短 TTL
+   *                   （如 7 天），以便结论到期后自动重新验证。
    */
-  async setCache(key: string, value: string): Promise<void> {
+  async setCache(key: string, value: string, ttlSeconds?: number): Promise<void> {
     try {
-      // 366 天后的绝对过期时间，保证"不过期"语义的同时不会永久占用 D1 存储
-      const expiresAt = Math.floor(Date.now() / 1000) + 366 * 24 * 3600;
+      // 默认 366 天的绝对过期时间，保证"不过期"语义的同时不会永久占用 D1 存储
+      const ttl = ttlSeconds && ttlSeconds > 0 ? ttlSeconds : 366 * 24 * 3600;
+      const expiresAt = Math.floor(Date.now() / 1000) + ttl;
       await this.db.prepare(
         "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at"
       ).bind(key, value, expiresAt).run();
     } catch (e) {
       console.error("setCache error:", e);
     }
+  }
+
+  /**
+   * 批量查询查重池：返回其中「已确认已注册且尚未过期」的域名集合。
+   *
+   * 池子只缓存"已注册"这一相对稳定的结论（未注册域名随时可能被抢注，缓存无意义），
+   * 并带 7 天 TTL，以覆盖"他人续费释放 / 用户主动删除后重新可注册"的场景。
+   */
+  async getWhoisPool(domains: string[]): Promise<string[]> {
+    if (domains.length === 0) return [];
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const keys = domains.map(d => `whois_pool:${d}`);
+      const placeholders = keys.map(() => "?").join(",");
+      const rows = await this.db.prepare(
+        `SELECT key FROM cache WHERE key IN (${placeholders}) AND expires_at > ?`
+      ).bind(...keys, now).all<{ key: string }>();
+      return (rows.results || []).map(r => r.key.replace(/^whois_pool:/, ""));
+    } catch (e) {
+      console.error("getWhoisPool error:", e);
+      return [];
+    }
+  }
+
+  /**
+   * 将一个已确认「已注册」的域名写入查重池（默认 7 天后自动失效需重新验证）
+   */
+  async addToWhoisPool(domain: string, ttlSeconds = 7 * 24 * 3600): Promise<void> {
+    await this.setCache(
+      `whois_pool:${domain}`,
+      JSON.stringify({ registered: true, ts: Math.floor(Date.now() / 1000) }),
+      ttlSeconds
+    );
   }
 
   /**

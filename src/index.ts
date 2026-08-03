@@ -4,6 +4,7 @@ import { DatabaseManager, timingSafeEqual } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams } from "./dnshe";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
+import { toASCII } from "./punycode";
 
 /**
  * 统一成功响应封装 — 将 payload 扁平化后附加 success: true，
@@ -1209,11 +1210,53 @@ app.get("/api/whois", async (c) => {
       }
     }
 
-    const res = await client.whois(domain.trim());
-    await dbManager.writeLog("success", "api", `WHOIS 查询域名 [${domain.trim()}]`);
+    const asciiDomain = toASCII(domain.trim());
+    const res = await client.whois(asciiDomain);
+
+    // 查重池回填：确认已注册的域名写入池子（7 天 TTL），供后续批量扫描直接跳过
+    if (res && res.registered === true) {
+      await dbManager.addToWhoisPool(asciiDomain);
+    }
+
+    await dbManager.writeLog("success", "api", `WHOIS 查询域名 [${asciiDomain}]`);
     return c.json(successRes({ whois: res }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "WHOIS 查询异常";
+    return c.json(errorRes(message), 400);
+  }
+});
+
+/**
+ * 8.5 批量查询查重池 —— 返回其中已确认「已注册」且未过期的域名
+ *
+ * 供前端批量扫描在发起 WHOIS 前先行过滤，避免重复消耗上游 API 配额。
+ * 入参 domains 为逗号分隔的完整域名列表（非 ASCII 会统一转 Punycode 后匹配）。
+ */
+app.get("/api/whois/pool", async (c) => {
+  const domainsParam = c.req.query("domains");
+  if (!domainsParam) {
+    return c.json(errorRes("必须提供 domains 参数（逗号分隔）", "bad_request"), 400);
+  }
+
+  const dbManager = c.get("db");
+  try {
+    const domains = domainsParam
+      .split(",")
+      .map(d => toASCII(d.trim()))
+      .filter(Boolean);
+
+    if (domains.length === 0) {
+      return c.json(successRes({ registered: [] }));
+    }
+    // 单次查询上限，避免 SQL 变量过多
+    if (domains.length > 500) {
+      return c.json(errorRes("单次最多查询 500 个域名", "bad_request"), 400);
+    }
+
+    const registered = await dbManager.getWhoisPool(domains);
+    return c.json(successRes({ registered }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "查重池查询异常";
     return c.json(errorRes(message), 400);
   }
 });
@@ -1231,10 +1274,13 @@ app.post("/api/domains/register", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(account_id);
-    const res = await client.registerSubdomain(subdomain.trim(), rootdomain.trim());
+    // 中文等非 ASCII 域名统一转 Punycode (xn--) 后再送往上游 DNSHE API
+    const asciiSub = toASCII(String(subdomain).trim());
+    const asciiRoot = toASCII(String(rootdomain).trim());
+    const res = await client.registerSubdomain(asciiSub, asciiRoot);
 
     if (res && res.success) {
-      const fullDomain = res.full_domain || `${subdomain.trim()}.${rootdomain.trim()}`;
+      const fullDomain = res.full_domain || `${asciiSub}.${asciiRoot}`;
       await dbManager.writeLog("success", "api", `成功在账号 [ID: ${account_id}] 下注册了免费域名: [${fullDomain}]`);
       // 注册会消耗配额，回源刷新配额缓存，保证后续读操作命中最新数据
       try {

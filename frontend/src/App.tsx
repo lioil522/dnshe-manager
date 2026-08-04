@@ -316,6 +316,11 @@ export default function App() {
   });
   const [newRootInput, setNewRootInput] = useState("");
 
+  // 域名删除确认状态（删除不可逆，必须输入完整域名二次确认）
+  const [deleteModalDomain, setDeleteModalDomain] = useState<Domain | null>(null);
+  const [deleteConfirmInput, setDeleteConfirmInput] = useState("");
+  const [deleteError, setDeleteError] = useState("");
+
   // 域名注册与查重状态
   const [searchSubdomain, setSearchSubdomain] = useState("");
   const [searchRootdomain, setSearchRootdomain] = useState("us.ci");
@@ -348,7 +353,7 @@ export default function App() {
   };
   const [scanProgress, setScanProgress] = useState<{ total: number; checked: number; available: number }>({ total: 0, checked: 0, available: 0 });
   const [availableDomainsList, setAvailableDomainsList] = useState<Array<{ fullDomain: string; subdomain: string; rootdomain: string; time: string }>>([]);
-  const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" }>>([]);
+  const [scanLogs, setScanLogs] = useState<Array<{ id: number; time: string; text: string; status: "available" | "registered" | "error" | "info" }>>([]);
 
   // ===== 顺序检测（进位递增）与断点续查状态 =====
   // 顺序模式开关：开启后忽略规则框，按字符集进位顺序惰性生成候选（如 aaa→aab→...）
@@ -988,6 +993,16 @@ export default function App() {
                 <RefreshCw className={`w-3.5 h-3.5 text-content-muted ${actionLoading === `renew-${dom.id}` ? "animate-spin" : ""}`} />
                 续期域名
               </button>
+
+              <button
+                onClick={() => {
+                  setOpenActionMenuId(null);
+                  handleOpenDeleteModal(dom);
+                }}
+                className="w-full text-left px-3.5 py-2.5 hover:bg-rose-950/40 text-rose-400 hover:text-rose-300 flex items-center gap-2 border-t border-border-base"
+              >
+                <Trash2 className="w-3.5 h-3.5" /> 删除域名
+              </button>
             </div>
           )}
         </div>
@@ -1216,11 +1231,31 @@ export default function App() {
     }
   }, [activeTab, sessionToken]);
 
+  // 域名搜索索引：full_domain 在库中一律以 Punycode(xn--) 存储，
+  // 而列表展示的是解码后的中文，直接拿中文关键词匹配 ASCII 串永远搜不到。
+  // 这里为每个域名预计算「Punycode 原文 + 中文解码」两种形态供匹配。
+  const domainSearchIndex = useMemo(() => {
+    const map = new Map<number, string>();
+    domains.forEach((d) => {
+      const ascii = (d.full_domain || "").toLowerCase();
+      const unicode = toUnicode(d.full_domain || "").toLowerCase();
+      map.set(d.id, ascii === unicode ? ascii : `${ascii} ${unicode}`);
+    });
+    return map;
+  }, [domains]);
+
   // 按账号分组处理域名列表
   const groupedDomains = useMemo(() => {
     const kw = globalSearch.trim().toLowerCase();
+    // 关键词本身也转一次 Punycode：用户粘贴完整中文域名时可直接命中 ASCII 形态。
+    // 注意中文「部分匹配」依赖上面的解码形态，因为半个标签的 Punycode 编码
+    // 并不是整标签编码的子串。
+    const kwAscii = kw ? toASCII(kw).toLowerCase() : "";
     const source = kw
-      ? domains.filter((d) => d.full_domain.toLowerCase().includes(kw))
+      ? domains.filter((d) => {
+          const hay = domainSearchIndex.get(d.id) || "";
+          return hay.includes(kw) || (kwAscii !== kw && hay.includes(kwAscii));
+        })
       : domains;
     const map = new Map<string, { alias: string; accountId: number; domains: Domain[] }>();
     source.forEach((dom) => {
@@ -1235,7 +1270,7 @@ export default function App() {
       map.get(key)!.domains.push(dom);
     });
     return Array.from(map.values());
-  }, [domains, globalSearch]);
+  }, [domains, globalSearch, domainSearchIndex]);
 
   // 立即发起域名同步
   const handleSyncDomains = async () => {
@@ -1456,6 +1491,51 @@ export default function App() {
       }
     } catch (e) {
       showToast("error", "续期网络请求发生异常");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 删除确认校验：中文原文与 Punycode 两种写法都算通过（与后端校验规则保持一致）
+  const isDeleteConfirmed = (domain: Domain, input: string) => {
+    const typed = input.trim().toLowerCase();
+    if (!typed) return false;
+    const expected = (domain.full_domain || "").toLowerCase();
+    return typed === expected || toASCII(typed).toLowerCase() === expected;
+  };
+
+  // 打开删除确认弹窗
+  const handleOpenDeleteModal = (domain: Domain) => {
+    setDeleteModalDomain(domain);
+    setDeleteConfirmInput("");
+    setDeleteError("");
+  };
+
+  // 执行删除域名（不可逆）
+  const handleDeleteDomain = async () => {
+    if (!deleteModalDomain) return;
+    const dom = deleteModalDomain;
+
+    setActionLoading(`delete-${dom.id}`);
+    setDeleteError("");
+    try {
+      const res = await apiFetch(`/api/domains/${dom.id}/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm_domain: deleteConfirmInput.trim() })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", `域名 [${toUnicode(dom.full_domain)}] 已删除`);
+        setDeleteModalDomain(null);
+        setDeleteConfirmInput("");
+        fetchDomains();
+      } else {
+        // 限制类错误（存在解析记录 / 转赠 / ServerHold / PendingDelete）保留弹窗并就地展示原因
+        setDeleteError(data.message || "删除失败");
+      }
+    } catch (e) {
+      setDeleteError("删除请求发生网络异常");
     } finally {
       setActionLoading(null);
     }
@@ -2160,42 +2240,89 @@ export default function App() {
       }
     }
 
-    // ── 查重池过滤：先批量问后端哪些已确认「已注册」，直接跳过不再消耗上游 API ──
-    let totalTasks = allTasks;
-    if (!ignorePool) {
-      try {
-        const skipSet = new Set<string>();
-        // 分批查询（后端单次上限 500）
-        const BATCH = 500;
-        for (let i = 0; i < allTasks.length; i += BATCH) {
-          const chunk = allTasks.slice(i, i + BATCH);
-          const res = await apiFetch(
-            `/api/whois/pool?domains=${encodeURIComponent(chunk.map(t => t.queryFull).join(","))}`
-          );
-          const data = await res.json();
-          if (data.success && Array.isArray(data.registered)) {
-            data.registered.forEach((d: string) => skipSet.add(d));
-          }
-        }
+    // ── 查重池过滤 ──
+    // 池子只用于「跳过已确认已注册的域名」，属于纯优化项，不是扫描的前置依赖。
+    // 因此这里不再阻塞等待全部批次查完（旧实现串行 await 40+ 次往返，
+    // 用户开扫前要白等十几秒），而是：
+    //   1) 先同步查第一批，拿到即可开工；
+    //   2) 其余批次在后台并发补充进 skipSet，worker 领任务时实时查表跳过。
+    const POOL_BATCH = 400; // 与后端单条语句内联上限对齐
+    const skipSet = new Set<string>();
+    let poolFailed = false;
 
-        if (skipSet.size > 0) {
-          totalTasks = allTasks.filter(t => !skipSet.has(t.queryFull));
-          showToast(
-            "info",
-            `🗂️ 查重池命中 ${skipSet.size} 个已注册域名，已跳过（剩余 ${totalTasks.length} 个待查）`
-          );
-        }
+    const fetchPoolChunk = async (chunk: typeof allTasks) => {
+      const res = await apiFetch("/api/whois/pool", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domains: chunk.map(t => t.queryFull) })
+      });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.registered)) {
+        data.registered.forEach((d: string) => skipSet.add(d));
+      }
+    };
+
+    const logPoolFailure = (e: unknown) => {
+      if (poolFailed) return; // 只提示一次，避免日志被刷屏
+      poolFailed = true;
+      console.error("查重池查询失败，将退化为全量扫描:", e);
+      setScanLogs(prev => [
+        {
+          id: Date.now() + Math.random(),
+          time: new Date().toLocaleTimeString(),
+          text: "⚠️ 查重池查询失败，本轮已退化为全量扫描（不影响结果，仅多消耗 API 配额）",
+          status: "error"
+        },
+        ...prev.slice(0, 49)
+      ]);
+      showToast("warning", "⚠️ 查重池查询失败，已退化为全量扫描");
+    };
+
+    if (!ignorePool) {
+      const chunks: Array<typeof allTasks> = [];
+      for (let i = 0; i < allTasks.length; i += POOL_BATCH) {
+        chunks.push(allTasks.slice(i, i + POOL_BATCH));
+      }
+
+      // 第一批同步等待：小规模扫描（单批）到这里池子就已完整
+      try {
+        if (chunks.length > 0) await fetchPoolChunk(chunks[0]);
       } catch (e) {
-        // 池子查询失败不阻断扫描，退化为全量查询
-        console.error("查重池查询失败，将全量扫描:", e);
+        logPoolFailure(e);
+      }
+
+      // 其余批次后台并发补充，不阻塞扫描启动
+      if (chunks.length > 1) {
+        void Promise.all(
+          chunks.slice(1).map(ch => fetchPoolChunk(ch).catch(logPoolFailure))
+        ).then(() => {
+          if (!poolFailed && skipSet.size > 0) {
+            setScanLogs(prev => [
+              {
+                id: Date.now() + Math.random(),
+                time: new Date().toLocaleTimeString(),
+                text: `🗂️ 查重池加载完毕，共命中 ${skipSet.size} 个已注册域名（扫描中自动跳过）`,
+                status: "info"
+              },
+              ...prev.slice(0, 49)
+            ]);
+          }
+        });
+      }
+
+      if (skipSet.size > 0) {
+        showToast("info", `🗂️ 查重池已命中 ${skipSet.size} 个已注册域名，将在扫描中自动跳过`);
       }
     }
 
-    if (totalTasks.length === 0) {
+    // 全部候选都在池中（仅当池子已完整加载时才可能成立）
+    if (allTasks.length > 0 && skipSet.size >= allTasks.length) {
       showToast("success", "🎉 本轮全部候选均已在查重池中确认为已注册，无需重复查询！");
       updateScanStatus("completed");
       return;
     }
+
+    const totalTasks = allTasks;
 
     // 多账号并发查重：
     // 为每个 API 账号开一条独立的流水线（worker），各自绑定固定账号并遵守自身 1.2s (1200ms) 限频。
@@ -2214,6 +2341,7 @@ export default function App() {
     // 共享的任务游标：各 worker 抢占式领取任务，天然实现负载均衡
     let nextTaskIndex = 0;
     let checkedCount = 0;
+    let skippedCount = 0; // 因命中查重池而跳过的数量（未消耗上游 API 配额）
 
     // 单个域名的查询与日志上报逻辑
     const processTask = async (
@@ -2224,7 +2352,7 @@ export default function App() {
       const accAlias = account ? account.alias : "公共轮询";
       const nowTime = new Date().toLocaleTimeString();
       try {
-        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.queryFull)}${accountQuery}`);
+        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.queryFull)}${accountQuery}&batch=1`);
         const data = await res.json();
 
         // 限流感知：撞到 429 / 配额耗尽时自动暂停，保住断点光标供稍后继续
@@ -2291,6 +2419,15 @@ export default function App() {
           checked: checkedCount
         };
 
+        // 查重池命中：直接跳过，既不发请求也不占用该账号的限频窗口。
+        // 池子在后台持续加载，越往后命中率越完整。
+        if (!ignorePool && skipSet.has(totalTasks[idx].queryFull)) {
+          checkedCount++;
+          skippedCount++;
+          setScanProgress(p => ({ ...p, checked: checkedCount }));
+          continue;
+        }
+
         const startedAt = Date.now();
         await processTask(totalTasks[idx], account);
 
@@ -2308,7 +2445,12 @@ export default function App() {
     if (scanControlRef.current === "running") {
       updateScanStatus("completed");
       clearScanCursor(); // 正常跑完，断点光标不再需要
-      showToast("success", "🎉 所有生成的域名字典查询完毕！");
+      showToast(
+        "success",
+        skippedCount > 0
+          ? `🎉 所有生成的域名字典查询完毕！其中 ${skippedCount} 个命中查重池已跳过，节省了同等数量的 API 配额。`
+          : "🎉 所有生成的域名字典查询完毕！"
+      );
     }
   };
 
@@ -4861,6 +5003,109 @@ export default function App() {
       )}
 
       {/* NS 域名服务器修改与重置模态框 (NS Modal) */}
+      {/* 删除域名确认弹窗 —— 不可逆操作，需输入完整域名二次确认 */}
+      {deleteModalDomain && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-surface border border-rose-900/60 w-full max-w-lg rounded-2xl overflow-hidden flex flex-col shadow-2xl">
+            {/* 头部 */}
+            <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+              <div>
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-2">
+                  <Trash2 className="text-rose-400 w-5 h-5" />
+                  删除域名
+                </h3>
+                <p className="text-xs text-content-muted mt-0.5 font-mono">
+                  {toUnicode(deleteModalDomain.full_domain)}
+                </p>
+              </div>
+              <button
+                onClick={() => setDeleteModalDomain(null)}
+                className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* 内容 */}
+            <div className="p-6 space-y-4">
+              <div className="p-4 rounded-xl border border-rose-900/60 bg-rose-950/30 text-sm text-rose-200 flex gap-3">
+                <AlertTriangle className="w-5 h-5 shrink-0 text-rose-400 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="font-bold">此操作不可逆</p>
+                  <p className="text-xs text-rose-300/90 leading-relaxed">
+                    删除后域名将立即释放，可能被他人抢注，且无法恢复。
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-4 rounded-xl border border-border-base bg-hovered text-xs text-content-secondary leading-relaxed">
+                <p className="font-semibold text-content-primary mb-1.5 flex items-center gap-1.5">
+                  <Info className="w-3.5 h-3.5 text-content-muted" /> 上游限制说明
+                </p>
+                <p className="text-content-muted">
+                  域名存在<span className="text-content-secondary font-medium">解析记录历史</span>，
+                  或处于<span className="text-content-secondary font-medium">转赠、ServerHold、PendingDelete</span> 等状态时，
+                  上游不支持删除操作。此限制无法绕过，如被拒绝请按提示处理后重试。
+                </p>
+              </div>
+
+              <div>
+                <label className="text-xs text-content-muted font-medium block mb-1.5">
+                  请输入完整域名以确认删除：
+                  <span className="font-mono text-content-primary ml-1">
+                    {toUnicode(deleteModalDomain.full_domain)}
+                  </span>
+                </label>
+                <input
+                  autoFocus
+                  value={deleteConfirmInput}
+                  onChange={(e) => { setDeleteConfirmInput(e.target.value); setDeleteError(""); }}
+                  placeholder="在此输入完整域名"
+                  className="w-full bg-elevated border border-border-base rounded-lg px-3 py-2 text-sm font-mono text-content-primary focus:outline-none focus:border-rose-700"
+                />
+              </div>
+
+              {deleteError && (
+                <div className="p-3 rounded-lg border border-amber-900/60 bg-amber-950/30 text-xs text-amber-300 flex gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span className="leading-relaxed">{deleteError}</span>
+                </div>
+              )}
+            </div>
+
+            {/* 底部操作 */}
+            <div className="bg-elevated px-6 py-4 flex items-center justify-end gap-3 border-t border-border-base">
+              <button
+                onClick={() => setDeleteModalDomain(null)}
+                className="text-xs font-semibold px-4 py-2 rounded-lg bg-elevated hover:bg-hovered text-content-secondary border border-border-base"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleDeleteDomain}
+                disabled={
+                  actionLoading === `delete-${deleteModalDomain.id}` ||
+                  !isDeleteConfirmed(deleteModalDomain, deleteConfirmInput)
+                }
+                className={`text-xs font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 transition-all ${
+                  isDeleteConfirmed(deleteModalDomain, deleteConfirmInput) &&
+                  actionLoading !== `delete-${deleteModalDomain.id}`
+                    ? "bg-rose-600 hover:bg-rose-500 text-white cursor-pointer"
+                    : "bg-elevated text-content-muted opacity-50 cursor-not-allowed"
+                }`}
+              >
+                {actionLoading === `delete-${deleteModalDomain.id}` ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {nsModalOpen && nsModalDomain && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
           <div className="bg-surface border border-border-base w-full max-w-2xl rounded-2xl overflow-hidden flex flex-col shadow-2xl">

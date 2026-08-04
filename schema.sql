@@ -44,3 +44,5 @@ CREATE TABLE IF NOT EXISTS cache (
 CREATE INDEX IF NOT EXISTS idx_domains_account ON domains_cache(account_id);
 CREATE INDEX IF NOT EXISTS idx_domains_expires ON domains_cache(expires_at);
 CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
+-- 加速查重池的过期过滤与每日过期行清理
+CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);

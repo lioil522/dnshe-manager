@@ -283,6 +283,12 @@ export async function runDailySyncAndRenewal(
   // 自动清理 30 天前的过期日志
   await dbManager.pruneExpiredLogs();
 
+  // 自动清理已过期的缓存行（含 7 天 TTL 的查重池），避免 cache 表只进不出
+  const purgedCache = await dbManager.purgeExpiredCache();
+  if (purgedCache > 0) {
+    await dbManager.writeLog("info", "system", `已清理 ${purgedCache} 条过期缓存记录（含查重池）`);
+  }
+
   // 如果有域名触发了续期，则向配置的通知渠道推送消息
   if (renewLogs.length > 0) {
     const notifyBody = `【DNSHE 域名自动续期报告】\n${summaryMsg}\n\n详细明细：\n${renewLogs.join("\n")}`;

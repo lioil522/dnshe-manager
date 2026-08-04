@@ -355,17 +355,52 @@ export class DatabaseManager {
    */
   async getWhoisPool(domains: string[]): Promise<string[]> {
     if (domains.length === 0) return [];
-    try {
-      const now = Math.floor(Date.now() / 1000);
-      const keys = domains.map(d => `whois_pool:${d}`);
-      const placeholders = keys.map(() => "?").join(",");
+
+    // ⚠️ D1 硬上限：每条查询最多 100 个绑定参数（不是 SQLite 默认的 999）。
+    // 早期实现用 IN (?,?,...) 逐个绑定域名，批量规模下必然超限并抛
+    // "too many SQL variables"，异常又被吞掉 => 池子长期静默失效、白跑往返。
+    //
+    // 域名在入口处已统一经 toASCII() 归一化（必为小写纯 ASCII），
+    // 这里再做一次严格白名单校验后内联为字面量，绑定参数恒定为 1 个。
+    // 字符集限定 [a-z0-9.-] 不含引号/反斜杠，不存在注入面。
+    const safe = domains.filter(d => /^[a-z0-9][a-z0-9.-]{0,252}$/.test(d));
+    if (safe.length === 0) return [];
+
+    const now = Math.floor(Date.now() / 1000);
+    const hits: string[] = [];
+    // D1 单条 SQL 语句上限 100KB；400 个域名内联后约 14KB，留足余量
+    const STMT_CHUNK = 400;
+
+    for (let i = 0; i < safe.length; i += STMT_CHUNK) {
+      const list = safe
+        .slice(i, i + STMT_CHUNK)
+        .map(d => `'whois_pool:${d}'`)
+        .join(",");
       const rows = await this.db.prepare(
-        `SELECT key FROM cache WHERE key IN (${placeholders}) AND expires_at > ?`
-      ).bind(...keys, now).all<{ key: string }>();
-      return (rows.results || []).map(r => r.key.replace(/^whois_pool:/, ""));
+        `SELECT key FROM cache WHERE key IN (${list}) AND expires_at > ?`
+      ).bind(now).all<{ key: string }>();
+      for (const r of rows.results || []) {
+        hits.push(r.key.replace(/^whois_pool:/, ""));
+      }
+    }
+
+    return hits;
+  }
+
+  /**
+   * 清理已过期的缓存行（含查重池），避免 cache 表只进不出无限膨胀
+   *
+   * @returns 被删除的行数
+   */
+  async purgeExpiredCache(): Promise<number> {
+    try {
+      const res = await this.db.prepare(
+        "DELETE FROM cache WHERE expires_at <= ?"
+      ).bind(Math.floor(Date.now() / 1000)).run();
+      return res.meta?.changes ?? 0;
     } catch (e) {
-      console.error("getWhoisPool error:", e);
-      return [];
+      console.error("purgeExpiredCache error:", e);
+      return 0;
     }
   }
 
@@ -858,9 +893,16 @@ export class DatabaseManager {
   async markDomainRenewed(id: number, newExpiresAt: string) {
     const beijingNow = this.getBeijingNow();
     await this.db.prepare(`
-      UPDATE domains_cache 
+      UPDATE domains_cache
       SET expires_at = ?, last_renewed_at = ?, updated_at = ?
       WHERE id = ?
     `).bind(newExpiresAt, beijingNow, beijingNow, id).run();
+  }
+
+  /**
+   * 从本地缓存中移除一条域名记录（上游删除成功后调用，避免列表残留幽灵条目）
+   */
+  async deleteDomainFromCache(id: number): Promise<void> {
+    await this.db.prepare("DELETE FROM domains_cache WHERE id = ?").bind(id).run();
   }
 }

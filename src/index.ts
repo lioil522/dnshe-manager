@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { DatabaseManager, timingSafeEqual } from "./db";
 import { DNSHEClient } from "./dnshe";
@@ -826,6 +827,144 @@ app.post("/api/domains/:id/renew", async (c) => {
   }
 });
 
+/**
+ * 3.5 删除子域名 (代理接口)
+ *
+ * ⚠️ 上游对删除有硬限制，以下情形一律拒绝，且限制不可绕过：
+ *   1. 域名存在 DNS 解析记录历史；
+ *   2. 域名处于「转赠 / ServerHold / PendingDelete」等特殊状态。
+ *
+ * 因此这里做两道防线：
+ *   - 事前拦截：先查状态与解析记录，命中限制直接返回可读原因，不浪费上游调用；
+ *   - 事后兜底：上游仍拒绝时，把它的英文错误翻译成中文原因回传前端。
+ *
+ * 需前端传入 confirm_domain（完整域名）二次确认，防止误删。
+ */
+
+/** 不允许删除的域名状态 → 中文原因 */
+const UNDELETABLE_STATUS: Record<string, string> = {
+  serverhold: "域名处于 ServerHold（服务器暂停）状态",
+  pendingdelete: "域名处于 PendingDelete（等待删除）状态",
+  transferring: "域名处于转赠 / 转移中状态",
+  transfer: "域名处于转赠 / 转移中状态",
+  gifting: "域名处于转赠中状态",
+  pendingtransfer: "域名处于等待转赠状态",
+};
+
+/** 把上游返回的英文限制原因翻译为中文（未知原因原样透传） */
+function translateDeleteError(raw: string): string {
+  const s = (raw || "").toLowerCase();
+  if (s.includes("dns") && (s.includes("record") || s.includes("history"))) {
+    return "该域名存在 DNS 解析记录历史，上游不允许删除";
+  }
+  if (s.includes("serverhold")) return "域名处于 ServerHold 状态，不支持删除";
+  if (s.includes("pendingdelete") || s.includes("pending delete")) {
+    return "域名处于 PendingDelete 状态，不支持删除";
+  }
+  if (s.includes("transfer") || s.includes("gift")) {
+    return "域名处于转赠 / 转移状态，不支持删除";
+  }
+  return raw || "上游拒绝了删除请求";
+}
+
+app.post("/api/domains/:id/delete", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  try {
+    let confirmDomain = "";
+    try {
+      const body = await c.req.json();
+      confirmDomain = String(body?.confirm_domain || "").trim();
+    } catch {
+      // 允许空 body，下方统一按"未确认"处理
+    }
+
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未在缓存中找到该域名的记录，请先同步数据", "not_found"), 404);
+    }
+
+    // 二次确认：必须回填完整域名，避免误删（中文域名两种写法都接受）
+    const expected = domainInfo.full_domain.toLowerCase();
+    const got = toASCII(confirmDomain).toLowerCase();
+    if (!got || (got !== expected && confirmDomain.toLowerCase() !== expected)) {
+      return c.json(
+        errorRes("删除前必须输入完整域名进行确认", "confirm_required"),
+        400
+      );
+    }
+
+    // ── 防线一：状态检查 ──
+    const statusKey = String(domainInfo.status || "").toLowerCase().replace(/[\s_-]/g, "");
+    for (const [bad, reason] of Object.entries(UNDELETABLE_STATUS)) {
+      if (statusKey.includes(bad)) {
+        return c.json(errorRes(`${reason}，不支持删除操作`, "delete_forbidden"), 409);
+      }
+    }
+
+    const { client, alias } = await dbManager.getClientForAccount(domainInfo.account_id);
+
+    // ── 防线二：解析记录历史检查 ──
+    // 只要当前仍存在解析记录就直接拦截；"历史"记录无法从 API 读取，
+    // 交由上游判定（失败时走 translateDeleteError 翻译）。
+    try {
+      const dnsRes = await client.listDnsRecords(domainId);
+      const records = dnsRes?.records || [];
+      if (records.length > 0) {
+        return c.json(
+          errorRes(
+            `该域名存在 ${records.length} 条 DNS 解析记录，存在解析记录历史的域名不支持删除。请先删除全部解析记录后重试（若仍失败则说明上游保留了历史记录，无法删除）`,
+            "delete_forbidden"
+          ),
+          409
+        );
+      }
+    } catch (e) {
+      // 解析记录查询失败不阻断，交由上游最终裁决
+      console.error("删除前检查 DNS 记录失败，转由上游裁决:", e);
+    }
+
+    const res = await client.deleteSubdomain(domainId);
+    if (res && res.success) {
+      // 上游删除成功：同步清理本地缓存，避免列表残留
+      await dbManager.deleteDomainFromCache(domainId);
+      await dbManager.deleteCache(`api_cache:dns:${domainId}`);
+
+      const msg = `域名 [${domainInfo.full_domain}] (账户: ${alias}) 已删除`;
+      await dbManager.writeLog("warning", "operation", msg, res);
+
+      // 删除会释放配额，回源刷新配额缓存
+      try {
+        const { accounts, quotas } = await fetchAllQuotas(dbManager);
+        if (accounts.length > 0) {
+          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+        }
+      } catch (e) {
+        console.error("删除后刷新配额缓存失败:", e);
+      }
+
+      return c.json(successRes({ message: "域名删除成功", full_domain: domainInfo.full_domain }));
+    }
+
+    const reason = translateDeleteError(res?.message || "");
+    await dbManager.writeLog(
+      "error",
+      "operation",
+      `域名 [${domainInfo.full_domain}] 删除失败：${reason}`,
+      res
+    );
+    return c.json(errorRes(reason, "delete_forbidden"), 409);
+  } catch (e: unknown) {
+    const raw = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(translateDeleteError(raw)), 400);
+  }
+});
+
 // 4. 获取子域名下所有的 DNS 解析记录 (代理接口)
 app.get("/api/domains/:id/dns", async (c) => {
   const dbManager = c.get("db");
@@ -1218,7 +1357,14 @@ app.get("/api/whois", async (c) => {
       await dbManager.addToWhoisPool(asciiDomain);
     }
 
-    await dbManager.writeLog("success", "api", `WHOIS 查询域名 [${asciiDomain}]`);
+    // 批量扫描（batch=1）单轮可达数万次查询，逐条写日志会让 logs 表爆炸式增长
+    // 并拖慢整库，这里按 1/50 采样；单次手动查询仍然全量记录。
+    const isBatch = c.req.query("batch") === "1";
+    if (!isBatch) {
+      await dbManager.writeLog("success", "api", `WHOIS 查询域名 [${asciiDomain}]`);
+    } else if (Math.random() < 0.02) {
+      await dbManager.writeLog("info", "api", `批量查重采样：WHOIS 查询域名 [${asciiDomain}]（每 50 次采样记录 1 条）`);
+    }
     return c.json(successRes({ whois: res }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "WHOIS 查询异常";
@@ -1230,25 +1376,24 @@ app.get("/api/whois", async (c) => {
  * 8.5 批量查询查重池 —— 返回其中已确认「已注册」且未过期的域名
  *
  * 供前端批量扫描在发起 WHOIS 前先行过滤，避免重复消耗上游 API 配额。
- * 入参 domains 为逗号分隔的完整域名列表（非 ASCII 会统一转 Punycode 后匹配）。
+ *
+ * 提供 POST（推荐，域名走请求体，不受 URL 长度限制）与 GET（兼容旧前端）两种入口。
+ * 入参域名非 ASCII 会统一转 Punycode 后匹配。
  */
-app.get("/api/whois/pool", async (c) => {
-  const domainsParam = c.req.query("domains");
-  if (!domainsParam) {
-    return c.json(errorRes("必须提供 domains 参数（逗号分隔）", "bad_request"), 400);
-  }
-
+async function queryWhoisPool(
+  c: Context<{ Bindings: Bindings; Variables: Variables }>,
+  rawDomains: string[]
+) {
   const dbManager = c.get("db");
   try {
-    const domains = domainsParam
-      .split(",")
-      .map(d => toASCII(d.trim()))
+    const domains = rawDomains
+      .map(d => toASCII(String(d || "").trim()))
       .filter(Boolean);
 
     if (domains.length === 0) {
       return c.json(successRes({ registered: [] }));
     }
-    // 单次查询上限，避免 SQL 变量过多
+    // 单次查询上限（服务端内部会再按语句长度自动分批）
     if (domains.length > 500) {
       return c.json(errorRes("单次最多查询 500 个域名", "bad_request"), 400);
     }
@@ -1259,6 +1404,27 @@ app.get("/api/whois/pool", async (c) => {
     const message = e instanceof Error ? e.message : "查重池查询异常";
     return c.json(errorRes(message), 400);
   }
+}
+
+app.post("/api/whois/pool", async (c) => {
+  let body: { domains?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json(errorRes("请求体必须为 JSON", "bad_request"), 400);
+  }
+  if (!Array.isArray(body.domains)) {
+    return c.json(errorRes("必须提供 domains 数组", "bad_request"), 400);
+  }
+  return queryWhoisPool(c, body.domains as string[]);
+});
+
+app.get("/api/whois/pool", async (c) => {
+  const domainsParam = c.req.query("domains");
+  if (!domainsParam) {
+    return c.json(errorRes("必须提供 domains 参数（逗号分隔）", "bad_request"), 400);
+  }
+  return queryWhoisPool(c, domainsParam.split(","));
 });
 
 /**

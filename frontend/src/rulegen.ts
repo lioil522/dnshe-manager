@@ -149,7 +149,7 @@ const TOKEN_BUILDERS: Record<string, () => string[]> = {
   城市简写: () => CITY_ABBR,
   省份简写: () => PROVINCE_ABBR,
   区号: () => AREA_CODES,
-  // zipcodes.ts 由 scripts/verify-rules.mjs 从 Words.cs 生成，不手工维护
+  // zipcodes.ts 照搬源码生成，不手工维护
   邮编: () => ZIP_CODES,
 
   // ── 以下为本项目扩展，原客户端没有 ──

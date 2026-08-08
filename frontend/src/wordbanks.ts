@@ -102,6 +102,7 @@ export const EN_WORDBANKS_THEMED: Record<string, string[]> = {
   ],
 };
 
+
 /** 中文词库分类名列表（供 UI 渲染标签） */
 export const CN_CATEGORIES = Object.keys(CN_WORDBANKS);
 
@@ -212,24 +213,98 @@ export function buildDefaultBanks(): WordBank[] {
   return banks;
 }
 
-/** 从 localStorage 读取词库；为空或损坏时回落到内置种子 */
-export function loadWordBanks(): WordBank[] {
+/**
+ * 记录「已经播过种的内置分组名」。
+ *
+ * 用途：老用户的 localStorage 里只有旧版内置分组，新增分组不会自动出现。补种时若简单地
+ * 「补全所有缺失的内置组」，会把用户手动删掉的组也一起复活 —— 所以这里单独记账，
+ * 只补从未播种过的组名，用户删过的组不再回来。
+ */
+const SEEDED_KEY = "DNSHE_WORDBANKS_SEEDED";
+
+function loadSeeded(): Set<string> {
+  try {
+    const raw = localStorage.getItem(SEEDED_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? new Set(arr as string[]) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveSeeded(names: Set<string>): void {
+  try {
+    localStorage.setItem(SEEDED_KEY, JSON.stringify([...names]));
+  } catch {
+    /* 配额溢出等情况忽略：补种失败只是少几个默认分组，不影响使用 */
+  }
+}
+
+/**
+ * 从 localStorage 读取词库；为空或损坏时回落到内置种子。
+ *
+ * 同时做增量补种：把「从未播种过」的内置分组补进来，让老用户也能拿到新增的词性分组，
+ * 且不会复活用户手动删除的分组（见 SEEDED_KEY 说明）。
+ *
+ * @param reservedNames 内置标签名集合，与之同名的旧词库会被清理（由调用方传入以避免循环依赖）
+ */
+export function loadWordBanks(reservedNames?: Set<string>): WordBank[] {
+  const defaults = buildDefaultBanks();
+
+  let existing: WordBank[] | null = null;
   try {
     const raw = localStorage.getItem(WORDBANK_STORAGE_KEY);
-    if (!raw) return buildDefaultBanks();
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) return buildDefaultBanks();
-    // 基本形状校验，过滤掉损坏项
-    return parsed.filter(
-      (b: unknown): b is WordBank =>
-        !!b &&
-        typeof (b as WordBank).id === "string" &&
-        typeof (b as WordBank).name === "string" &&
-        Array.isArray((b as WordBank).words)
-    );
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        // 基本形状校验，过滤掉损坏项
+        existing = parsed.filter(
+          (b: unknown): b is WordBank =>
+            !!b &&
+            typeof (b as WordBank).id === "string" &&
+            typeof (b as WordBank).name === "string" &&
+            Array.isArray((b as WordBank).words)
+        );
+      }
+    }
   } catch {
-    return buildDefaultBanks();
+    existing = null;
   }
+
+  // 首次使用：全量播种，并记账
+  if (!existing || existing.length === 0) {
+    saveSeeded(new Set(defaults.map((b) => b.name)));
+    return defaults;
+  }
+
+  // 剔除与内置标签同名的旧词库。
+  // 这类分组来自早期版本（那时 邮编/名词/动词 等还不是内置标签），如今解析 {名称}
+  // 时内置定义优先，它们永远取不到，留在界面上只会让人以为点了有用。
+  if (reservedNames && reservedNames.size > 0) {
+    const kept = existing.filter((b) => !reservedNames.has(b.name));
+    if (kept.length !== existing.length) {
+      existing = kept;
+      saveWordBanks(existing);
+    }
+  }
+
+  // 老用户：补入从未播种过的内置分组
+  const seeded = loadSeeded();
+  const present = new Set(existing.map((b) => b.name));
+  const toAdd = defaults.filter((b) => !seeded.has(b.name) && !present.has(b.name));
+
+  if (toAdd.length > 0) {
+    const merged = [...existing, ...toAdd];
+    saveWordBanks(merged);
+    saveSeeded(new Set([...seeded, ...defaults.map((b) => b.name)]));
+    return merged;
+  }
+
+  // 首次运行本版本但分组已齐全时，也要把记账补上，避免下次重复判断
+  if (seeded.size === 0) saveSeeded(new Set([...present, ...defaults.map((b) => b.name)]));
+
+  return existing;
 }
 
 /** 保存词库到 localStorage */

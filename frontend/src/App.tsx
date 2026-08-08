@@ -47,6 +47,12 @@ import {
   type WordBank,
   type BankKind
 } from "./wordbanks";
+import {
+  parseRule,
+  countCombos,
+  generateCombos,
+  BUILTIN_TOKENS
+} from "./rulegen";
 
 // API 响应基本接口
 export interface ApiResponse {
@@ -413,7 +419,9 @@ export default function App() {
 
   // ===== 可编辑词库状态 =====
   // 词库分组列表（首次从内置种子导入，之后持久化在 localStorage）
-  const [wordBanks, setWordBanks] = useState<WordBank[]>(() => loadWordBanks());
+  const [wordBanks, setWordBanks] = useState<WordBank[]>(() =>
+    loadWordBanks(new Set(BUILTIN_TOKENS))
+  );
   // 词库管理弹窗开关
   const [bankModalOpen, setBankModalOpen] = useState(false);
   // 正在编辑的分组（null 表示新建）
@@ -1244,6 +1252,16 @@ export default function App() {
     return map;
   }, [domains]);
 
+  // 账号序号：以 accounts 列表的顺序为准，而不是分组数组的下标。
+  //
+  // 分组数组会被搜索/账号筛选裁剪，用它的下标当序号会导致「只看某个账号时永远显示账号 1」。
+  // 锚定到 accounts 后，序号在任何筛选下都保持不变，删除账号后又会自然重排。
+  const accountSeqMap = useMemo(() => {
+    const map = new Map<number, number>();
+    accounts.forEach((a, i) => map.set(a.id, i + 1));
+    return map;
+  }, [accounts]);
+
   // 按账号分组处理域名列表
   const groupedDomains = useMemo(() => {
     const kw = globalSearch.trim().toLowerCase();
@@ -1257,20 +1275,28 @@ export default function App() {
           return hay.includes(kw) || (kwAscii !== kw && hay.includes(kwAscii));
         })
       : domains;
-    const map = new Map<string, { alias: string; accountId: number; domains: Domain[] }>();
+    const map = new Map<string, { alias: string; accountId: number; seq: number; domains: Domain[] }>();
     source.forEach((dom) => {
       const key = String(dom.account_id || 0);
       if (!map.has(key)) {
         map.set(key, {
           alias: dom.account_alias || `账号 ${dom.account_id}`,
           accountId: dom.account_id,
+          // 已解绑账号的历史域名拿不到序号，用 0 表示（渲染处退化为只显示别名）
+          seq: accountSeqMap.get(dom.account_id) ?? 0,
           domains: []
         });
       }
       map.get(key)!.domains.push(dom);
     });
-    return Array.from(map.values());
-  }, [domains, globalSearch, domainSearchIndex]);
+    // 按账号序号排序，让卡片顺序与「账号管理」一致且不随筛选变化；
+    // 无序号的（已解绑账号遗留）排在最后
+    return Array.from(map.values()).sort((a, b) => {
+      if (a.seq === 0) return 1;
+      if (b.seq === 0) return -1;
+      return a.seq - b.seq;
+    });
+  }, [domains, globalSearch, domainSearchIndex, accountSeqMap]);
 
   // 立即发起域名同步
   const handleSyncDomains = async () => {
@@ -1565,20 +1591,56 @@ export default function App() {
     }
   };
 
-  // 一键恢复为系统默认 NS (删除所有第三方 custom NS 记录)
+  // 一键恢复为系统默认 NS / 清理残留 NS 记录（两者都是删除区域内的 NS 解析记录）
   const handleResetToDefaultNs = async () => {
     if (!nsModalDomain) return;
-    if (!confirm(`确定要将域名 [${nsModalDomain.full_domain}] 恢复为系统默认 NS 吗？这会清除当前配置的第三方 NS 记录。`)) return;
+    const isDefaultNs = checkHasDns(nsModalDomain);
+    const confirmMsg = isDefaultNs
+      ? `域名 [${nsModalDomain.full_domain}] 已委派回系统默认 NS，确定清理区域内残留的 ${nsRecords.length} 条 NS 解析记录吗？`
+      : `确定要将域名 [${nsModalDomain.full_domain}] 恢复为系统默认 NS 吗？这会清除当前配置的第三方 NS 记录。`;
+    if (!confirm(confirmMsg)) return;
 
     setActionLoading("reset-ns");
     try {
+      // 逐条删除并检查每条的业务结果 —— apiFetch 只在网络层失败时抛异常，
+      // 后端返回 {success:false} 时不会抛，若不检查就会误报"恢复成功"而记录仍在。
+      const failed: Array<{ ns: string; msg: string }> = [];
+      let nsDisabled = false;
+
       for (const rec of nsRecords) {
-        await apiFetch(`/api/domains/${nsModalDomain.id}/dns/${rec.id ?? rec.record_id}`, {
-          method: "DELETE"
-        });
+        const label = rec.content || rec.name || String(rec.id ?? rec.record_id);
+        try {
+          const res = await apiFetch(`/api/domains/${nsModalDomain.id}/dns/${rec.id ?? rec.record_id}`, {
+            method: "DELETE"
+          });
+          const data = await res.json().catch(() => ({ success: res.ok }));
+          if (!data.success) {
+            if (data.error_code === "ns_management_disabled") nsDisabled = true;
+            failed.push({ ns: label, msg: data.message || `HTTP ${res.status}` });
+          }
+        } catch (err) {
+          failed.push({ ns: label, msg: err instanceof Error ? err.message : "请求异常" });
+        }
       }
-      showToast("success", `域名 [${nsModalDomain.full_domain}] 已成功恢复为系统默认 NS！`);
-      setNsModalOpen(false);
+
+      if (failed.length === 0) {
+        showToast(
+          "success",
+          isDefaultNs
+            ? `已清理 ${nsRecords.length} 条残留 NS 记录`
+            : `域名 [${nsModalDomain.full_domain}] 已成功恢复为系统默认 NS！`
+        );
+        setNsModalOpen(false);
+      } else {
+        showToast(
+          "error",
+          nsDisabled
+            ? "DNSHE 上游平台已禁用 NS 管理，无法通过 API 删除 NS 记录。请前往 DNSHE 官网后台手动设置。"
+            : `${failed.length} 条 NS 记录删除失败：${failed.map(f => `${f.ns}(${f.msg})`).join("；")}`
+        );
+        // 失败时保持弹窗打开并刷新列表，让实际剩余记录可见
+        handleOpenNsModal(nsModalDomain);
+      }
       handleSyncDomains();
     } catch (e) {
       showToast("error", "恢复系统默认 NS 发生异常");
@@ -1587,10 +1649,28 @@ export default function App() {
     }
   };
 
-  // 添加自定义 NS 记录 (支持自动清理与 NS 冲突的同名记录)
+  // 把 NS 输入框内容解析为去重后的地址列表（换行/逗号/空格分隔，去掉末尾的根点）
+  const parseNsInput = (text: string): string[] =>
+    Array.from(
+      new Set(
+        text
+          .split(/[,，;；\s\n]+/)
+          .map(s => s.trim().replace(/\.$/, "").toLowerCase())
+          .filter(Boolean)
+      )
+    );
+
+  // 输入框实时解析结果，供表单显示「已识别 N 条」
+  const parsedNsList = useMemo(() => parseNsInput(newCustomNsContent), [newCustomNsContent]);
+
+  // 添加自定义 NS 记录 (支持一次填多个，逐条提交；并可自动清理与 NS 冲突的同名记录)
   const handleAddCustomNs = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!nsModalDomain || !newCustomNsContent.trim()) return;
+    if (!nsModalDomain) return;
+
+    // NS 委派通常要求至少主备两条，这里逐条提交
+    const nsList = parseNsInput(newCustomNsContent);
+    if (nsList.length === 0) return;
 
     setActionLoading("add-ns");
     try {
@@ -1601,37 +1681,67 @@ export default function App() {
         if (data.success && Array.isArray(data.records)) {
           // 2. 筛选出非 NS 类型的冲突记录 (如 A, CNAME, TXT, MX 等)
           const conflicts = data.records.filter((r: DnsRecord) => r.type !== "NS");
+          const undeleted: string[] = [];
           for (const conf of conflicts) {
-            await apiFetch(`/api/domains/${nsModalDomain.id}/dns/${conf.id ?? conf.record_id}`, {
-              method: "DELETE"
-            });
+            try {
+              const delRes = await apiFetch(
+                `/api/domains/${nsModalDomain.id}/dns/${conf.id ?? conf.record_id}`,
+                { method: "DELETE" }
+              );
+              const delData = await delRes.json().catch(() => ({ success: delRes.ok }));
+              if (!delData.success) undeleted.push(`${conf.type} ${conf.name}`);
+            } catch {
+              undeleted.push(`${conf.type} ${conf.name}`);
+            }
+          }
+          // 删不掉要说出来：否则后面 NS 添加失败时，用户会以为是别的原因
+          if (undeleted.length > 0) {
+            showToast("warning", `${undeleted.length} 条冲突记录未能删除：${undeleted.join("、")}`);
           }
         }
       }
 
-      // 3. 创建新的第三方 NS 记录
-      const res = await apiFetch(`/api/domains/${nsModalDomain.id}/dns`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "NS",
-          name: "@",
-          content: newCustomNsContent.trim(),
-          ttl: 86400
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast("success", `NS 记录 [${newCustomNsContent}] 添加成功！`);
+      // 3. 逐条创建 NS 记录。上游接口一次只收一条，且有限频，因此串行提交。
+      //    单条失败不中断其余条目，最后统一汇报，避免"加了一半却什么都没说"。
+      const succeeded: string[] = [];
+      const failed: Array<{ ns: string; msg: string }> = [];
+      let nsDisabled = false;
+
+      for (const ns of nsList) {
+        try {
+          const res = await apiFetch(`/api/domains/${nsModalDomain.id}/dns`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ type: "NS", name: "@", content: ns, ttl: 86400 })
+          });
+          const data = await res.json();
+          if (data.success) {
+            succeeded.push(ns);
+          } else {
+            if (data.error_code === "ns_management_disabled") nsDisabled = true;
+            failed.push({ ns, msg: data.message || "添加失败" });
+          }
+        } catch (err) {
+          failed.push({ ns, msg: err instanceof Error ? err.message : "请求异常" });
+        }
+      }
+
+      if (succeeded.length > 0) {
+        showToast("success", `成功添加 ${succeeded.length} 条 NS 记录：${succeeded.join("、")}`);
         setNewCustomNsContent("");
         handleOpenNsModal(nsModalDomain);
         handleSyncDomains();
-      } else {
-        // NOTE: 区分 NS 管理被上游禁用 vs 其他错误
-        const isNsDisabled = data.error_code === "ns_management_disabled";
-        showToast("error", isNsDisabled
-          ? "DNSHE 上游平台已禁用 NS 管理，无法通过 API 修改 NS 记录。请前往 DNSHE 官网后台手动设置。"
-          : (data.message || "添加 NS 记录失败，请勾选【强制替换冲突记录】"));
+      }
+
+      if (failed.length > 0) {
+        showToast(
+          "error",
+          nsDisabled
+            ? "DNSHE 上游平台已禁用 NS 管理，无法通过 API 修改 NS 记录。请前往 DNSHE 官网后台手动设置。"
+            : `${failed.length} 条添加失败：${failed.map(f => `${f.ns}(${f.msg})`).join("；")}${
+                succeeded.length === 0 ? "。可尝试勾选【强制替换冲突记录】" : ""
+              }`
+        );
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "添加 NS 记录发生异常";
@@ -1867,117 +1977,50 @@ export default function App() {
     showToast("info", `已移除根域名 [.${rootToRemove}]`);
   };
 
-  // 批量词库与自定义前缀生成器
-  const generatePrefixesFromRule = (rule: string, len: number, exclude: string): string[] => {
-    const consonants = "bcdfghjklmnpqrstvwxyz"; // 声母 (21 个辅音字母)
-    const vowels = "aeiou";                     // 韵母 (5 个元音字母)
-    const digits = "0123456789";
-    const digitsNo04 = "12356789";
-    const letters = "abcdefghijklmnopqrstuvwxyz";
+  // 批量规则生成：解析与组合逻辑见 rulegen.ts（花括号槽位模型）
+  //
+  // 生成上限对齐 west.cn 在线版的 30 万条。注意这只是「生成」上限，
+  // 实际扫描速度受单账号 1.2s 限频约束（见 handleStartBatchScan 的 RATE_LIMIT_MS）。
+  const MAX_PREFIXES = 300000;
 
-    // 组合爆炸保护上限：字母×字母=676、CVCV=2205 均在范围内，超大规则会被安全截断
-    const MAX_PREFIXES = 20000;
+  // 让用户自建词库也能作为 {词库名} 标签参与组合 —— 比 west.cn 固定的「我的字典1-6」更灵活
+  const resolveBank = useMemo(
+    () => (name: string): string[] | null => {
+      const bank = wordBanks.find(b => b.name === name);
+      return bank ? bank.words : null;
+    },
+    [wordBanks]
+  );
 
-    // 排除字符集合（大小写不敏感）与过滤器
-    const exSet = new Set((exclude || "").toLowerCase().split("").filter(Boolean));
-    const filterEx = (arr: string[]) => arr.filter(s => !s.split("").some(c => exSet.has(c)));
-
-    // 简单字符类 token -> 该「位置」的候选字符集合
-    const classMap: Record<string, string[]> = {
-      "字母": letters.split(""),
-      "数字无04": digitsNo04.split(""),
-      "数字": digits.split(""),
-      "声母": consonants.split(""),
-      "韵母": vowels.split(""),
+  // 规则实时解析：组合数预估 + 耗时估算
+  const rulePreview = useMemo(() => {
+    const parsed = parseRule(batchRules, excludeChars, batchLength, resolveBank);
+    const total = countCombos(parsed);
+    const rootCount = Math.max(selectedRoots.length, 1);
+    const workerCount = Math.max(accounts.length, 1);
+    // 每个候选前缀要对每个根域名各查一次，单账号 1.2s 限频，N 个账号 N 条流水线
+    const scanned = Math.min(total, MAX_PREFIXES) * rootCount;
+    // 规则本身有效但被排除字符清空 —— 与「还没输入规则」是两回事，提示语要能区分
+    const emptiedByExclude =
+      total === 0 &&
+      parsed.unknownTokens.length === 0 &&
+      (parsed.slots.length > 0 || parsed.literalList !== null) &&
+      excludeChars.trim().length > 0;
+    return {
+      parsed,
+      total,
+      emptiedByExclude,
+      isBraceSyntax: batchRules.includes("{"),
+      estSeconds: (scanned * 1.2) / workerCount
     };
+  }, [batchRules, excludeChars, batchLength, resolveBank, selectedRoots.length, accounts.length]);
 
-    // 2 位拼音 / 双拼：声母 + 韵母 组成的可发音音节 (21×5 = 105)
-    const cvSyllables: string[] = [];
-    for (const c of consonants.split("")) {
-      for (const v of vowels.split("")) cvSyllables.push(c + v);
-    }
-
-    // 豹子 (AA / AAA)：字母与数字的等字符重复串
-    const repeatPattern = (n: number) =>
-      [...letters.split(""), ...digits.split("")].map(ch => ch.repeat(n));
-
-    // CVCV：辅音-元音-辅音-元音 四字组合 (21×5×21×5 = 11025，过滤后取上限)
-    const cvcvPattern: string[] = [];
-    for (const c1 of consonants.split("")) {
-      for (const v1 of vowels.split("")) {
-        for (const c2 of consonants.split("")) {
-          for (const v2 of vowels.split("")) cvcvPattern.push(`${c1}${v1}${c2}${v2}`);
-        }
-      }
-    }
-
-    const shortcutTags = ["字母", "数字", "数字无04", "声母", "韵母", "2位拼音", "双拼", "2位豹子", "3位豹子", "CVCV"];
-    const hasShortcutTag = shortcutTags.some(tag => rule.includes(tag));
-
-    // ── 自定义前缀模式：无任何快捷标签时，按分隔符拆分为具体前缀词 ──
-    if (!hasShortcutTag) {
-      if (!rule.trim()) return [];
-      const customs = rule.trim().toLowerCase()
-        .split(/[+,;\s\n]+/)
-        .map(s => s.trim())
-        .filter(Boolean);
-      return Array.from(new Set(filterEx(customs)));
-    }
-
-    // ── 整体型 token：直接产出完整前缀，不参与逐位笛卡尔组合 ──
-    if (rule.includes("CVCV"))
-      return Array.from(new Set(filterEx(cvcvPattern))).slice(0, MAX_PREFIXES);
-    if (rule.includes("3位豹子"))
-      return Array.from(new Set(filterEx(repeatPattern(3)))).slice(0, MAX_PREFIXES);
-    if (rule.includes("2位豹子"))
-      return Array.from(new Set(filterEx(repeatPattern(2)))).slice(0, MAX_PREFIXES);
-    if (rule.includes("2位拼音") || rule.includes("双拼"))
-      return Array.from(new Set(filterEx(cvSyllables))).slice(0, MAX_PREFIXES);
-
-    // ── 逐位组合型：按 "+" 拆分为有序段，每段对应「一个位置」的候选字符集 ──
-    const segments = rule.split("+").map(s => s.trim()).filter(Boolean);
-
-    let pools: string[][] = [];
-    for (const seg of segments) {
-      if (classMap[seg]) {
-        pools.push(classMap[seg]);
-        continue;
-      }
-      // 兼容未用 "+" 分隔的连写（如 "字母数字"），按优先级探测子串（数字无04 优先于 数字）
-      let matched: string[] | null = null;
-      if (seg.includes("数字无04")) matched = classMap["数字无04"];
-      else if (seg.includes("数字")) matched = classMap["数字"];
-      else if (seg.includes("字母")) matched = classMap["字母"];
-      else if (seg.includes("声母")) matched = classMap["声母"];
-      else if (seg.includes("韵母")) matched = classMap["韵母"];
-      if (matched) pools.push(matched);
-    }
-
-    // 仅识别到单个位置时，用下拉框长度把该位置重复 len 次（如 "字母" + 3 位 → aaa..zzz）
-    if (pools.length === 1 && len > 1) {
-      pools = Array(len).fill(pools[0]);
-    }
-
-    // 对每个位置应用排除字符；任一位置被排空则无法生成
-    pools = pools.map(p => filterEx(p));
-    if (pools.length === 0 || pools.some(p => p.length === 0)) return [];
-
-    // 逐位笛卡尔积：用下标映射保证每条结果都是完整长度，并在 MAX_PREFIXES 处干净截断
-    const total = pools.reduce((acc, p) => acc * p.length, 1);
-    const limit = Math.min(total, MAX_PREFIXES);
-    const results: string[] = [];
-    for (let i = 0; i < limit; i++) {
-      let idx = i;
-      let s = "";
-      for (let p = pools.length - 1; p >= 0; p--) {
-        const pool = pools[p];
-        s = pool[idx % pool.length] + s;
-        idx = Math.floor(idx / pool.length);
-      }
-      results.push(s);
-    }
-
-    return Array.from(new Set(results));
+  // 把秒数格式化为「3.2 小时 / 12 分钟 / 45 秒」
+  const formatDuration = (sec: number): string => {
+    if (sec < 60) return `${Math.ceil(sec)} 秒`;
+    if (sec < 3600) return `${(sec / 60).toFixed(1)} 分钟`;
+    if (sec < 86400) return `${(sec / 3600).toFixed(1)} 小时`;
+    return `${(sec / 86400).toFixed(1)} 天`;
   };
 
   // ===== 顺序检测：进位递增生成器 =====
@@ -2122,6 +2165,16 @@ export default function App() {
       showToast("error", "请填写词库名称！");
       return;
     }
+    // 词库名会作为 {名称} 标签写进规则，含花括号或逗号会破坏规则解析
+    if (/[{},]/.test(name)) {
+      showToast("error", "词库名称不能包含 { } 或逗号，否则无法作为规则标签使用！");
+      return;
+    }
+    // 与内置标签重名会被内置定义遮蔽，导致点击词库标签却取到内置候选集
+    if ((BUILTIN_TOKENS as readonly string[]).includes(name)) {
+      showToast("error", `[${name}] 与内置标签同名，请换一个词库名称！`);
+      return;
+    }
     const words = parseWords(bankFormWords);
     if (words.length === 0) {
       showToast("error", "请至少填写一个词条！");
@@ -2166,16 +2219,12 @@ export default function App() {
     showToast("success", `已恢复内置默认词库（${defaults.length} 个分组）`);
   };
 
-  // 把一整类词库追加进批量规则框（去重后以逗号拼接，走自定义前缀模式）
+  // 把词库作为 {词库名} 标签插入规则框。
+  // 早先是把整类词逗号展开进输入框，几百个词会把框挤满、完全看不清规则结构；
+  // 改插占位符后词库还能与其它标签组合（如 {地名城市}{数字}）。
   const appendWordbank = (words: string[], label: string) => {
-    setBatchRules(prev => {
-      const existing = prev.trim()
-        ? prev.trim().split(/[+,;\s\n]+/).map(s => s.trim()).filter(Boolean)
-        : [];
-      const merged = Array.from(new Set([...existing, ...words]));
-      return merged.join(", ");
-    });
-    showToast("success", `已追加「${label}」词库（${words.length} 个词）到规则框`);
+    setBatchRules(prev => `${prev}{${label}}`);
+    showToast("success", `已插入「${label}」词库标签（${words.length} 个词）`);
   };
 
   // 执行批量扫域名引擎（resumeFrom 非空时表示从断点续查）
@@ -2205,13 +2254,22 @@ export default function App() {
         `🔢 顺序模式：从 [${prefixes[0]}] 开始，本轮生成 ${prefixes.length} 个候选前缀`
       );
     } else {
-      prefixes = generatePrefixesFromRule(batchRules, batchLength, excludeChars);
+      const parsed = parseRule(batchRules, excludeChars, batchLength, resolveBank);
+      if (parsed.unknownTokens.length > 0) {
+        showToast("error", `规则中存在无法识别的标签：${parsed.unknownTokens.join("、")}`);
+        return;
+      }
+      prefixes = generateCombos(parsed, MAX_PREFIXES);
       if (prefixes.length === 0) {
         showToast("error", "根据当前规则未能生成有效的前缀词库，请修改规则！");
         return;
       }
-      if (prefixes.length >= 20000) {
-        showToast("warning", "⚠️ 规则组合量过大，已按安全上限截断为 20000 个前缀，建议缩小字符集或使用排除字符。");
+      const totalCombos = countCombos(parsed);
+      if (totalCombos > MAX_PREFIXES) {
+        showToast(
+          "warning",
+          `⚠️ 该规则共 ${totalCombos.toLocaleString()} 条组合，已截断为前 ${MAX_PREFIXES.toLocaleString()} 条。超大规则建议改用顺序模式配合断点续查。`
+        );
       }
     }
 
@@ -3103,16 +3161,44 @@ export default function App() {
                   {/* 1. 生成规则输入框 */}
                   <div className="space-y-2">
                     <div className="flex items-center justify-between gap-2">
-                      <label className="block text-sm font-semibold text-content-secondary">
-                        生成规则:
-                      </label>
+                      <div className="flex items-baseline flex-wrap gap-x-2 gap-y-1 min-w-0">
+                        <label className="block text-sm font-semibold text-content-secondary shrink-0">
+                          生成规则:
+                        </label>
+                        {/* 组合数预估：由各槽位大小相乘得出，不实际生成。
+                            放在标题行而非输入框下方 —— 标题行本就有横向留白，不额外占高度。 */}
+                        {rulePreview.parsed.unknownTokens.length > 0 ? (
+                          <span className="text-xs text-red-400 flex items-center gap-1.5 min-w-0">
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                            <span className="truncate">
+                              无法识别的标签：{rulePreview.parsed.unknownTokens.join("、")}
+                            </span>
+                          </span>
+                        ) : rulePreview.emptiedByExclude ? (
+                          <span className="text-xs text-amber-400 flex items-center gap-1.5 min-w-0">
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                            <span className="truncate">
+                              排除字符「{excludeChars.trim()}」把某一位的候选全滤掉了，组合数为 0
+                            </span>
+                          </span>
+                        ) : rulePreview.total > 0 ? (
+                          <span className="text-xs text-content-muted flex items-center gap-1.5">
+                            <Info className="w-3.5 h-3.5 shrink-0 text-indigo-400" />
+                            当前规则穷举将会产生
+                            <span className="text-red-400 font-bold">
+                              {rulePreview.total.toLocaleString()}
+                            </span>
+                            条域名组合
+                          </span>
+                        ) : null}
+                      </div>
                       <button
                         onClick={() => {
                           setBatchRules("");
                           showToast("info", "已清空生成规则");
                         }}
                         disabled={!batchRules}
-                        className="text-xs font-semibold text-content-muted hover:text-red-400 border border-border-base hover:border-red-500/40 bg-elevated hover:bg-red-950/30 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="shrink-0 text-xs font-semibold text-content-muted hover:text-red-400 border border-border-base hover:border-red-500/40 bg-elevated hover:bg-red-950/30 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                         一键清空
@@ -3123,17 +3209,43 @@ export default function App() {
                         type="text"
                         value={batchRules}
                         onChange={(e) => setBatchRules(e.target.value)}
-                        placeholder="例如: myapp, test123 或点击下方快捷标签（如 声母+韵母）"
+                        placeholder="例如: {字母}{字母}{字母} 或 my{字母}{数字}，也可直接填 myapp, test123"
                         className="w-full bg-transparent py-3 text-content-primary text-sm focus:outline-none"
                       />
-                      <span className="text-xs text-indigo-400 font-bold whitespace-nowrap px-2">ⓘ 规则就绪</span>
+                      <span className="text-xs text-indigo-400 font-bold whitespace-nowrap px-2">
+                        {rulePreview.parsed.unknownTokens.length > 0
+                          ? "⚠ 标签无法识别"
+                          : rulePreview.emptiedByExclude
+                            ? "⚠ 已被排除字符清空"
+                            : rulePreview.total > 0
+                              ? "ⓘ 规则就绪"
+                              : "ⓘ 待输入规则"}
+                      </span>
                     </div>
+
+                    {/* 超限与耗时警告：偶发且文字较长，留在输入框下方，不挤占标题行 */}
+                    {rulePreview.total > 0 &&
+                      (rulePreview.total > MAX_PREFIXES ||
+                        (selectedRoots.length > 0 && rulePreview.total > 5000)) && (
+                        <p className="text-xs text-amber-400 flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          {rulePreview.total > MAX_PREFIXES && (
+                            <span>超出上限，仅处理前 {MAX_PREFIXES.toLocaleString()} 条。</span>
+                          )}
+                          {selectedRoots.length > 0 && rulePreview.total > 5000 && (
+                            <span>
+                              按当前 {accounts.length || 1} 个账号 × {selectedRoots.length} 个后缀估算，
+                              约需 {formatDuration(rulePreview.estSeconds)}，建议改用顺序模式配合断点续查
+                            </span>
+                          )}
+                        </p>
+                      )}
                   </div>
 
                   {/* 2. 排除字符与长度 */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div className="md:col-span-2 space-y-2">
-                      <label className="block text-xs font-semibold text-content-muted">
+                  <div className="flex flex-col md:flex-row md:items-start gap-4">
+                    <div className="flex-1 min-w-0 space-y-2">
+                      <label className="block text-xs font-semibold text-content-muted h-4 leading-4">
                         排除字符 (可选，若域名中出现定义的字符，则忽略):
                       </label>
                       <input
@@ -3144,14 +3256,28 @@ export default function App() {
                         className="w-full bg-elevated border border-border-base rounded-xl px-4 py-2.5 text-content-primary text-xs focus:border-indigo-500 focus:outline-none"
                       />
                     </div>
-                    <div className="space-y-2">
-                      <label className="block text-xs font-semibold text-content-muted">
-                        生成组合长度:
-                      </label>
+                    <div className="w-full md:w-[19rem] shrink-0 space-y-2">
+                      {/* 提示放在标题行：与左列标题同高，不撑高行、不影响两列输入框对齐 */}
+                      <div className="flex items-baseline gap-2 h-4 leading-4">
+                        <label className="block text-xs font-semibold text-content-muted shrink-0">
+                          生成组合长度:
+                        </label>
+                        {rulePreview.isBraceSyntax && (
+                          <span className="text-[11px] text-content-muted/70 truncate">
+                            花括号规则由标签数量决定长度，此项不生效
+                          </span>
+                        )}
+                      </div>
                       <select
                         value={batchLength}
                         onChange={(e) => setBatchLength(Number(e.target.value))}
-                        className="w-full bg-elevated border border-border-base rounded-xl px-4 py-2.5 text-content-primary text-xs focus:border-indigo-500 focus:outline-none"
+                        disabled={rulePreview.isBraceSyntax}
+                        className="w-full bg-elevated border border-border-base rounded-xl px-4 py-2.5 text-content-primary text-xs focus:border-indigo-500 focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed"
+                        title={
+                          rulePreview.isBraceSyntax
+                            ? "花括号规则由标签数量决定长度，此项不生效"
+                            : undefined
+                        }
                       >
                         <option value={2}>2位长度 (如 aa / ba / 88)</option>
                         <option value={3}>3位长度 (如 aaa / 123 / abc)</option>
@@ -3160,18 +3286,17 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 3. 快捷标签按钮组 */}
+                  {/* 3. 快捷标签按钮组 —— 点击插入 {标签} 占位符，可与字面量混排 */}
                   <div className="space-y-2">
                     <label className="block text-xs font-semibold text-content-muted">
-                      支持快捷标签 (点击追加到规则框):
+                      支持标签 (点击追加到规则框，可任意组合，也可与固定字符混排如 my
+                      <span className="text-indigo-400">{"{字母}"}</span>):
                     </label>
                     <div className="flex flex-wrap gap-2">
-                      {[
-                        "字母", "数字", "数字无04", "声母", "韵母", "2位拼音", "双拼", "2位豹子", "3位豹子", "CVCV"
-                      ].map((tag) => (
+                      {BUILTIN_TOKENS.map((tag) => (
                         <button
                           key={tag}
-                          onClick={() => setBatchRules(prev => prev ? `${prev}+${tag}` : tag)}
+                          onClick={() => setBatchRules(prev => `${prev}{${tag}}`)}
                           className="bg-elevated hover:bg-indigo-950/60 text-content-secondary hover:text-indigo-300 border border-border-base hover:border-indigo-500/40 text-xs px-3 py-1.5 rounded-lg transition-all"
                         >
                           {tag}
@@ -3184,7 +3309,7 @@ export default function App() {
                   <div className="space-y-3 border-t border-border-base pt-5">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                       <label className="block text-xs font-semibold text-content-muted">
-                        词库 (点击标签追加整类词到规则框，中文将自动转 Punycode 提交):
+                        词库 (点击插入 <span className="text-indigo-400">{"{词库名}"}</span> 标签，可与其它标签组合；中文将自动转 Punycode 提交):
                       </label>
                       <div className="flex items-center gap-2 shrink-0">
                         <button
@@ -3767,7 +3892,7 @@ export default function App() {
               </div>
             ) : (
               <div className="space-y-6">
-                {groupedDomains.map((group, index) => {
+                {groupedDomains.map((group) => {
                   const defaultDomains = group.domains.filter(checkHasDns);
                   const externalDomains = group.domains.filter((d) => !checkHasDns(d));
 
@@ -3796,8 +3921,12 @@ export default function App() {
                             <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
                           )}
                           <Key className="w-4 h-4 text-indigo-400 shrink-0" />
-                          <span className="text-emerald-400">账号 {index + 1}</span>
-                          <span className="text-content-muted">·</span>
+                          {group.seq > 0 && (
+                            <>
+                              <span className="text-emerald-400">账号 {group.seq}</span>
+                              <span className="text-content-muted">·</span>
+                            </>
+                          )}
                           <span className="text-indigo-300">{group.alias}</span>
                           <span className="text-xs bg-indigo-950/80 text-indigo-300 border border-indigo-900/60 px-2.5 py-0.5 rounded-full font-normal">
                             共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
@@ -5131,26 +5260,42 @@ export default function App() {
             {/* 模态框内容 */}
             <div className="p-6 overflow-y-auto space-y-6">
               
-              {/* 当前 NS 状态指示 */}
-              <div className="p-4 rounded-xl border border-border-base bg-hovered flex items-center justify-between">
-                <div>
-                  <span className="text-xs text-content-muted block font-medium">当前 NS 运行状态</span>
-                  <span className="text-sm font-bold text-content-primary mt-1 block">
-                    {nsRecords.length === 0 ? "系统默认 (ns1.dnshe.com / ns2.dnshe.com)" : "外部 DNS 委派托管中"}
-                  </span>
-                </div>
-                <div>
-                  {nsRecords.length === 0 ? (
-                    <span className="bg-emerald-950/80 text-emerald-400 border border-emerald-900/60 text-xs px-3 py-1 rounded-full font-semibold">
-                      系统默认
-                    </span>
-                  ) : (
-                    <span className="bg-sky-950/80 text-sky-300 border border-sky-800/60 text-xs px-3 py-1 rounded-full font-semibold">
-                      外部 DNS
-                    </span>
-                  )}
-                </div>
-              </div>
+              {/* 当前 NS 状态指示
+                  以域名自身的委派状态（checkHasDns，来自同步的 ns1/ns2 字段）为准，
+                  而不是区域内 NS 解析记录的条数 —— 两者是两回事：
+                  官网把 NS 改回 ns1/ns2.dnshe.com 后，区域里遗留的 NS 记录不会自动消失。 */}
+              {(() => {
+                const isDefaultNs = checkHasDns(nsModalDomain);
+                const hasLeftoverNs = nsRecords.length > 0;
+                return (
+                  <div className="p-4 rounded-xl border border-border-base bg-hovered flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <span className="text-xs text-content-muted block font-medium">当前 NS 运行状态</span>
+                      <span className="text-sm font-bold text-content-primary mt-1 block">
+                        {isDefaultNs
+                          ? "系统默认 (ns1.dnshe.com / ns2.dnshe.com)"
+                          : "外部 DNS 委派托管中"}
+                      </span>
+                      {isDefaultNs && hasLeftoverNs && (
+                        <span className="text-[11px] text-amber-400 mt-1 block">
+                          域名已委派回系统默认，但区域内仍残留 {nsRecords.length} 条 NS 解析记录，建议清理
+                        </span>
+                      )}
+                    </div>
+                    <div className="shrink-0">
+                      {isDefaultNs ? (
+                        <span className="bg-emerald-950/80 text-emerald-400 border border-emerald-900/60 text-xs px-3 py-1 rounded-full font-semibold">
+                          系统默认
+                        </span>
+                      ) : (
+                        <span className="bg-sky-950/80 text-sky-300 border border-sky-800/60 text-xs px-3 py-1 rounded-full font-semibold">
+                          外部 DNS
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* 已设置的 NS 记录列表 */}
               {loadingNsModal ? (
@@ -5159,7 +5304,11 @@ export default function App() {
                 </div>
               ) : nsRecords.length > 0 ? (
                 <div className="space-y-3">
-                  <h4 className="text-xs font-bold text-content-secondary uppercase tracking-wider">当前委派的第三方 NS 服务器列表</h4>
+                  <h4 className="text-xs font-bold text-content-secondary uppercase tracking-wider">
+                    {checkHasDns(nsModalDomain)
+                      ? "区域内残留的 NS 解析记录"
+                      : "当前委派的第三方 NS 服务器列表"}
+                  </h4>
                   <div className="bg-hovered border border-border-base rounded-xl overflow-hidden divide-y divide-border-soft">
                     {nsRecords.map((rec) => (
                       <div key={rec.id} className="p-3.5 flex justify-between items-center text-xs font-mono">
@@ -5186,7 +5335,9 @@ export default function App() {
                     className="w-full bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-900/60 py-2.5 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all shadow-inner mt-2"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${actionLoading === "reset-ns" ? "animate-spin" : ""}`} />
-                    一键恢复为系统默认 NS (ns1.dnshe.com / ns2.dnshe.com)
+                    {checkHasDns(nsModalDomain)
+                      ? `清理这 ${nsRecords.length} 条残留 NS 记录`
+                      : "一键恢复为系统默认 NS (ns1.dnshe.com / ns2.dnshe.com)"}
                   </button>
                 </div>
               ) : (
@@ -5199,15 +5350,27 @@ export default function App() {
               <form onSubmit={handleAddCustomNs} className="p-4 border border-border-base rounded-xl bg-hovered space-y-3">
                 <h4 className="text-xs font-bold text-content-secondary">添加 / 变更自定义 NS 服务器</h4>
                 <div>
-                  <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">第三方 NS 服务器地址</label>
-                  <input
-                    type="text"
+                  <div className="flex items-baseline justify-between gap-2 mb-1">
+                    <label className="block text-[10px] text-content-muted font-bold uppercase">
+                      第三方 NS 服务器地址
+                    </label>
+                    {parsedNsList.length > 0 && (
+                      <span className="text-[10px] text-indigo-400 font-semibold">
+                        已识别 {parsedNsList.length} 条
+                      </span>
+                    )}
+                  </div>
+                  <textarea
                     required
-                    placeholder="例如 dara.ns.cloudflare.com"
+                    rows={3}
+                    placeholder={"每行一个，或用逗号/空格分隔，例如：\ndara.ns.cloudflare.com\nrick.ns.cloudflare.com"}
                     value={newCustomNsContent}
                     onChange={(e) => setNewCustomNsContent(e.target.value)}
-                    className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
+                    className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary font-mono resize-y"
                   />
+                  <p className="text-[10px] text-content-muted mt-1">
+                    可一次填多个（NS 委派通常需要主备至少两条），将逐条提交
+                  </p>
                 </div>
                 <div className="flex items-center gap-2 py-1">
                   <input
@@ -5224,11 +5387,13 @@ export default function App() {
                 </div>
                 <button
                   type="submit"
-                  disabled={actionLoading === "add-ns"}
-                  className="w-full btn-primary py-2.5 rounded-lg font-semibold text-xs text-white flex items-center justify-center gap-2"
+                  disabled={actionLoading === "add-ns" || parsedNsList.length === 0}
+                  className="w-full btn-primary py-2.5 rounded-lg font-semibold text-xs text-white flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   {actionLoading === "add-ns" && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-                  添加 NS 委派记录
+                  {parsedNsList.length > 1
+                    ? `添加 ${parsedNsList.length} 条 NS 委派记录`
+                    : "添加 NS 委派记录"}
                 </button>
               </form>
 

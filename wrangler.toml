@@ -27,7 +27,10 @@ crons = ["0 2 * * *"]
 #                 直接登录/访问 API 作为兜底找回手段；不配置则完全禁用该通道，仅认用户名密码 + 2FA。
 #
 # 以下为可选配置项：
-# ALLOWED_ORIGIN = "https://your-pages-domain.pages.dev"  # 限制 CORS 允许的前端域名
+# ALLOWED_ORIGIN = "https://your-pages-domain.pages.dev"  # 限制 CORS 允许的前端域名；
+#                                                         # 支持逗号分隔多个来源，前端若同时挂 pages.dev
+#                                                         # 与自定义域名，两个都要写，例如：
+#                                                         # "https://xxx.pages.dev,https://dnshe.example.com"
 # WEBHOOK_URL    = "https://your-webhook-notification-url" # Webhook 推送地址
 # WEBHOOK_TYPE   = "dingtalk"                              # Webhook 类型: dingtalk / feishu / wecom / custom
 #

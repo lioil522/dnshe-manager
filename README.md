@@ -224,7 +224,7 @@
 | 配置项名 | 是否必要 | 默认值 | 作用与说明 |
 | :--- | :---: | :---: | :--- |
 | **`DB`** | **必要 🔴** | `dnshe-manager-db` | D1 数据库绑定句柄（`[[d1_databases]]` 节点）。 |
-| **`ALLOWED_ORIGIN`** | **非必要 🟢** | `*` (自适应) | 允许的跨域前端 Origin 来源（例如 `https://your-app.pages.dev`）。生产环境建议配置以防接口跨域盗用。 |
+| **`ALLOWED_ORIGIN`** | **非必要 🟢** | `*` (自适应) | 允许的跨域前端 Origin 来源。支持逗号分隔多个，例如 `https://your-app.pages.dev,https://dnshe.example.com`。**前端同时挂在 `pages.dev` 与自定义域名上时，两个都要写进来**，否则未列出的那个域名会在登录时报 `Failed to fetch`。留空则不限制来源。 |
 | **`WEBHOOK_TYPE`** | **非必要 🟢** | `custom` | Webhook 消息格式类型。可选：`dingtalk` (钉钉)、`feishu` (飞书)、`wecom` (企业微信)、`custom` (通用格式)。 |
 | **`DEFAULT_API_KEY`** | **非必要 🟢** | 无 | 部署完成后首次启动时，若存在此配置，系统将自动绑定该 API Key 账号，无需在 UI 手动录入。 |
 | **`DEFAULT_API_SECRET`**| **非必要 🟢** | 无 | 搭配 `DEFAULT_API_KEY` 使用的 API Secret。 |

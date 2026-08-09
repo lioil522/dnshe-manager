@@ -431,26 +431,6 @@ export default function App() {
   const [bankFormKind, setBankFormKind] = useState<BankKind>("cn");
   const [bankFormWords, setBankFormWords] = useState("");
 
-  /**
-   * 动态智能推演当前环境对应的后端 Worker API 地址 (适应任意新域名)
-   */
-  const getAutoBackendUrl = (): string => {
-    const host = window.location.hostname;
-    if (!host || host === "localhost" || host === "127.0.0.1") {
-      return "";
-    }
-
-    const parts = host.split(".");
-    if (parts.length >= 2) {
-      const mainDomain = parts.slice(-2).join(".");
-      if (parts[0].startsWith("api")) {
-        return `https://${host}`;
-      }
-      return `https://api-dnshe.${mainDomain}`;
-    }
-    return `https://api-${host}`;
-  };
-
   // 后端 Worker 地址
   const backendUrl = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
 
@@ -503,13 +483,24 @@ export default function App() {
     const storedBackend = backendUrl || localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL;
 
     // 如果传入相对路径以 /api 开头，智能补全后端基准域名
+    //
+    // NOTE: 此处不再按当前域名猜测后端地址（原先会拼出 https://api-dnshe.<主域名>）。
+    //       那个约定并不成立：Worker 未绑同名自定义域名时该主机根本不解析，
+    //       请求只会以一句 Failed to fetch 结束，反而掩盖了「后端地址未配置」这个真实原因。
+    //       地址来源现在只有两个：用户在设置页保存的覆盖值，以及构建期烘焙的 VITE_API_BASE_URL。
     let finalUrl = url;
     if (url.startsWith("/api")) {
-      const activeBackend = storedBackend || getAutoBackendUrl();
-      if (activeBackend) {
-        finalUrl = `${activeBackend.replace(/\/$/, "")}${url}`;
+      if (storedBackend) {
+        finalUrl = `${storedBackend.replace(/\/$/, "")}${url}`;
       } else {
-        // 本地开发环境直接走相对路径代理
+        const host = window.location.hostname;
+        const isLocalDev = host === "localhost" || host === "127.0.0.1";
+        if (!isLocalDev) {
+          // 线上两者皆空：走相对路径只会打到 Pages 自身、被 SPA 兜底返回 HTML，
+          // 报错会变成 JSON 解析失败。这里直接给出真实原因。
+          throw new Error("未配置后端地址（部署时未能推导出 Worker 地址），请在设置页手动填写后端 Worker 地址");
+        }
+        // 本地开发走 Vite 代理的相对路径
         finalUrl = url;
       }
     }
@@ -562,12 +553,16 @@ export default function App() {
   }, []);
 
   // 保存会话 Token 并进入系统
+  //
+  // NOTE: 这里刻意不再把 backendUrl 写回 localStorage。backendUrl 在用户没有手动配置时
+  //       等于构建期烘焙的 VITE_API_BASE_URL，一旦登录成功就被冻结进 localStorage，
+  //       而 localStorage 的优先级又高于烘焙值 —— 之后 CI 重新检测出的新后端地址会被
+  //       这个旧值永久遮蔽（部署流水线每次都会重新推导该地址：自定义域名 → workers.dev
+  //       子域 → 空），表现为换域名/换后端后登录一直 Failed to fetch，且只能靠清站点数据恢复。
+  //       localStorage 只应保存用户在设置页显式填写的覆盖值。
   const persistSession = (token: string) => {
     sessionStorage.setItem("DNSHE_SESSION", token);
     setSessionToken(token);
-    if (backendUrl.trim()) {
-      localStorage.setItem("DNSHE_BACKEND_URL", backendUrl.trim().replace(/\/$/, ""));
-    }
   };
 
   // 提交登录（用户名 + 密码，若后端要求则附带 2FA 动态码）
@@ -615,7 +610,14 @@ export default function App() {
       }
     } catch (err: any) {
       console.error("Login error:", err);
-      setLoginError(`登录请求失败：${err?.message || "网络异常，请检查后端地址与 DNS 解析"}`);
+      // 网络类失败最常见的成因是后端地址不对，且本地覆盖值优先级高于构建期烘焙值，
+      // 故直接把当前实际使用的地址与来源写进提示，避免只看到一句 Failed to fetch。
+      const override = localStorage.getItem("DNSHE_BACKEND_URL");
+      const target = override || backendUrl;
+      const hint = target
+        ? `当前请求地址：${target}${override ? "（来自本机保存的覆盖值，优先级高于部署时写入的默认地址；如该地址已失效，清除本站点数据即可恢复默认）" : "（来自部署时写入的默认地址）"}`
+        : "尚未配置后端地址";
+      setLoginError(`登录请求失败：${err?.message || "网络异常"}。${hint}`);
     } finally {
       setLoginLoading(false);
     }
@@ -4624,7 +4626,7 @@ export default function App() {
                         <input
                           value={backendUrlInput}
                           onChange={(e) => setBackendUrlInput(e.target.value)}
-                          placeholder="https://api-dnshe.example.com"
+                          placeholder="https://dnshe-manager-backend.<子域>.workers.dev"
                           className="form-input flex-1 px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                         />
                         <button onClick={handleSaveBackendUrl} className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5">

@@ -137,29 +137,47 @@ const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 /**
  * CORS 中间件 — 默认仅允许同源访问，生产环境通过 ALLOWED_ORIGIN 环境变量配置
- * 
- * NOTE: 不再使用 origin: "*"，避免任意域名跨域调用管理 API
+ *
+ * ALLOWED_ORIGIN 支持逗号分隔的多个来源，便于前端同时挂在
+ * xxx.pages.dev 与自定义域名上（例："https://a.pages.dev,https://dnshe.example.com"）。
+ *
+ * NOTE: 预检与真实响应必须使用同一套判定逻辑，否则会出现「预检通过、真实请求被浏览器拦掉」
+ *       的 Failed to fetch 假故障。
  */
 app.use(
   "/api/*",
   async (c, next) => {
-    const origin = c.req.header("Origin") || "*";
-    
+    const requestOrigin = c.req.header("Origin") || "";
+
+    // 白名单为空 => 不限制来源（回显请求方 Origin）；非空 => 仅放行命中白名单的来源
+    const allowList = (c.env.ALLOWED_ORIGIN || "")
+      .split(",")
+      .map((o) => o.trim().replace(/\/$/, ""))
+      .filter(Boolean);
+    const allowOrigin =
+      allowList.length === 0
+        ? requestOrigin || "*"
+        : allowList.includes(requestOrigin)
+        ? requestOrigin
+        : "";
+
     // 强制直接响应 CORS OPTIONS 预检请求，避免跨域报错
     if (c.req.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": origin,
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-          "Access-Control-Max-Age": "86400",
-        },
-      });
+      const headers: Record<string, string> = {
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Max-Age": "86400",
+        Vary: "Origin",
+      };
+      // 来源不在白名单时不下发 Allow-Origin，让浏览器按跨域拦截处理
+      if (allowOrigin) {
+        headers["Access-Control-Allow-Origin"] = allowOrigin;
+      }
+      return new Response(null, { status: 204, headers });
     }
 
     const corsMiddleware = cors({
-      origin: c.env.ALLOWED_ORIGIN || origin,
+      origin: allowList.length > 0 ? allowList : requestOrigin || "*",
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
       allowHeaders: ["Content-Type", "Authorization"],
       maxAge: 86400,

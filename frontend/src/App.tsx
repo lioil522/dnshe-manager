@@ -76,6 +76,7 @@ interface Domain {
   has_dns?: number | boolean;
   ns1?: string;
   ns2?: string;
+  dns_provider?: string | null;
   disable_ns_management?: boolean;
 }
 
@@ -856,6 +857,37 @@ export default function App() {
     return true;
   };
 
+  const detectDnsProvider = (nameservers: string[]): string => {
+    const hosts = nameservers
+      .map((value) => value.trim().toLowerCase().replace(/\.$/, ""))
+      .filter(Boolean);
+    const matchesDomain = (host: string, domain: string) =>
+      host === domain || host.endsWith(`.${domain}`);
+
+    if (hosts.some((host) => matchesDomain(host, "vps8.zz.cd"))) return "vps8";
+    if (hosts.some((host) => matchesDomain(host, "ns.cloudflare.com"))) return "Cloudflare";
+    if (hosts.some((host) =>
+      matchesDomain(host, "dnspod.net") ||
+      matchesDomain(host, "dnspod.com") ||
+      matchesDomain(host, "dnsv.com") ||
+      /(^|\.)dnsv[1-5]\.com$/.test(host)
+    )) return "DNSPod";
+    if (hosts.some((host) => matchesDomain(host, "vercel-dns.com"))) return "Vercel";
+    return "外部 DNS";
+  };
+
+  const getDnsProviderLabel = (dom: Domain, records?: DnsRecord[]): string => {
+    if (checkHasDns(dom)) return "系统默认";
+    if (records) {
+      return detectDnsProvider(
+        records.filter((record) => record.type === "NS").map((record) => String(record.content || ""))
+      );
+    }
+    return dom.dns_provider && dom.dns_provider !== "external"
+      ? dom.dns_provider
+      : "外部 DNS";
+  };
+
   // 渲染域名三态徽章：未解析 / 已解析 / 已委派
   const renderStatusBadge = (dom: Domain) => {
     let statusText = dom.status;
@@ -943,7 +975,7 @@ export default function App() {
           </span>
         ) : (
           <span className="bg-sky-950/80 text-sky-300 border border-sky-800/60 text-xs font-medium px-2.5 py-0.5 rounded-md">
-            外部 DNS
+            {getDnsProviderLabel(dom)}
           </span>
         )}
       </div>
@@ -5269,6 +5301,7 @@ export default function App() {
               {(() => {
                 const isDefaultNs = checkHasDns(nsModalDomain);
                 const hasLeftoverNs = nsRecords.length > 0;
+                const providerLabel = getDnsProviderLabel(nsModalDomain, nsRecords);
                 return (
                   <div className="p-4 rounded-xl border border-border-base bg-hovered flex items-center justify-between gap-3">
                     <div className="min-w-0">
@@ -5276,7 +5309,7 @@ export default function App() {
                       <span className="text-sm font-bold text-content-primary mt-1 block">
                         {isDefaultNs
                           ? "系统默认 (ns1.dnshe.com / ns2.dnshe.com)"
-                          : "外部 DNS 委派托管中"}
+                          : `${providerLabel} 委派托管中`}
                       </span>
                       {isDefaultNs && hasLeftoverNs && (
                         <span className="text-[11px] text-amber-400 mt-1 block">
@@ -5291,7 +5324,7 @@ export default function App() {
                         </span>
                       ) : (
                         <span className="bg-sky-950/80 text-sky-300 border border-sky-800/60 text-xs px-3 py-1 rounded-full font-semibold">
-                          外部 DNS
+                          {providerLabel}
                         </span>
                       )}
                     </div>

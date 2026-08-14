@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS domains_cache (
     expires_at TEXT NOT NULL,             -- 到期时间 (YYYY-MM-DD HH:MM:SS)
     last_renewed_at TEXT,                 -- 上次自动续期时间
     has_dns INTEGER DEFAULT 1,            -- 是否使用默认 NS 并启用 DNS 管理 (1=是, 0=否)
+    dns_provider TEXT,                    -- DNS 托管商 (system/Cloudflare/DNSPod/Vercel/vps8/external)
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );

@@ -57,10 +57,10 @@ const YUNMU = [
 ];
 
 /**
- * {2-6位豹子}：44 条。整体排除数字 4（无 44/444/…），且 6 位缺 000000。
+ * {2-6位数字豹子}：44 条。整体排除数字 4（无 44/444/…），且 6 位缺 000000。
  * 这是原表的既有取舍，不是遗漏 —— 4 在域名场景被视为不吉利。
  */
-const BAOZI = [
+const DIGIT_BAOZI = [
   "00", "11", "22", "33", "55", "66", "77", "88", "99",
   "000", "111", "222", "333", "555", "666", "777", "888", "999",
   "0000", "1111", "2222", "3333", "5555", "6666", "7777", "8888", "9999",
@@ -69,15 +69,32 @@ const BAOZI = [
 ];
 
 /**
- * {3-6位顺子}：18 条。仅数字、仅升序，且跳过所有跨越 4 的段
+ * {2-6位字母豹子}：同一个英文字母重复 2 至 6 次，例如 aa / zzzzzz。
+ */
+const LETTER_BAOZI = LETTERS.flatMap((letter) =>
+  Array.from({ length: 5 }, (_, index) => letter.repeat(index + 2))
+);
+
+/**
+ * {3-6位数字顺子}：18 条。仅数字、仅升序，且跳过所有跨越 4 的段
  * （3 位有 123/234/345/567/678/789，没有 456）。
  */
-const SHUNZI = [
+const DIGIT_SHUNZI = [
   "123", "234", "345", "567", "678", "789",
   "1234", "2345", "3456", "5678", "6789",
   "12345", "23456", "34567", "56789",
   "123456", "234567", "345678",
 ];
+
+/**
+ * {3-6位字母顺子}：连续升序英文字母，例如 abc / bcde / uvwxyz。
+ */
+const LETTER_SHUNZI = Array.from({ length: 4 }, (_, lengthIndex) => lengthIndex + 3)
+  .flatMap((length) =>
+    Array.from({ length: LETTERS.length - length + 1 }, (_, start) =>
+      LETTERS.slice(start, start + length).join("")
+    )
+  );
 
 /**
  * CVCV：辅音字母-元音字母 交替的四字组合，21×5×21×5 = 11025。
@@ -142,8 +159,10 @@ const TOKEN_BUILDERS: Record<string, () => string[]> = {
   动词: () => VERBS,
   形容词: () => ADJECTIVES,
 
-  "2-6位豹子": () => BAOZI,
-  "3-6位顺子": () => SHUNZI,
+  "2-6位数字豹子": () => DIGIT_BAOZI,
+  "2-6位字母豹子": () => LETTER_BAOZI,
+  "3-6位数字顺子": () => DIGIT_SHUNZI,
+  "3-6位字母顺子": () => LETTER_SHUNZI,
 
   城市: () => CITY_PINYIN,
   城市简写: () => CITY_ABBR,
@@ -167,6 +186,9 @@ const TOKEN_ALIASES: Record<string, string> = {
   "3-4位拼": "3-4位拼音",
   "5-6位拼": "5-6位拼音",
   汉字拼音: "拼音",
+  // 兼容旧版已保存的规则；旧标签原本就是纯数字集合。
+  "2-6位豹子": "2-6位数字豹子",
+  "3-6位顺子": "3-6位数字顺子",
 };
 
 /** 全部内置标签名（供 UI 渲染快捷标签按钮，顺序即展示顺序） */
@@ -303,15 +325,15 @@ function parseLegacy(
   // 整体型标签：旧实现下它们直接返回全部候选，等价于单槽位且不受长度下拉框影响
   const whole: Record<string, string> = {
     CVCV: "CVCV",
-    "3位豹子": "2-6位豹子",
-    "2位豹子": "2-6位豹子",
+    "3位豹子": "2-6位数字豹子",
+    "2位豹子": "2-6位数字豹子",
     双拼: "2位拼音",     // 旧语义下 双拼 == 2位拼音（声母+韵母），保持兼容
     "2位拼音": "2位拼音",
   };
   for (const [oldName, newName] of Object.entries(whole)) {
     if (!rule.includes(oldName)) continue;
     if (oldName === "2位豹子" || oldName === "3位豹子") {
-      // 旧语义：字母与数字的等长重复串，含 44/aa，与新 {2-6位豹子} 的纯数字口径不同
+      // 旧语义：字母与数字的等长重复串，含 44/aa；继续冻结旧规则的既有产出。
       const n = oldName === "2位豹子" ? 2 : 3;
       const rep = [...LETTERS, ...DIGITS].map((ch) => ch.repeat(n));
       return [{ token: oldName, candidates: keep(rep) }];

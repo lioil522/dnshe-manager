@@ -5,6 +5,7 @@ import { DatabaseManager, timingSafeEqual } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams } from "./dnshe";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
+import { detectDnsProvider } from "./dns-provider";
 import { toASCII } from "./punycode";
 
 /**
@@ -49,13 +50,13 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
       try {
         const recordsRes = await client.listDnsRecords(sub.id);
         const records = recordsRes.records || [];
-        const customNsRecord = records.find(
-          (r) => r.type === "NS" && !String(r.content || "").toLowerCase().includes("dnshe.com")
+        const dnsProvider = detectDnsProvider(
+          records.filter((r) => r.type === "NS").map((r) => String(r.content || ""))
         );
 
         let computedStatus = sub.status;
         let hasDnsVal = 1;
-        if (customNsRecord) {
+        if (dnsProvider !== "system") {
           computedStatus = "已委派";
           hasDnsVal = 0;
         } else if (records.length > 0) {
@@ -69,10 +70,11 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
         // 深度同步拿到的真实解析记录一并回填缓存，后续打开 DNS 面板直接命中、零上游调用
         await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
 
-        return { ...sub, status: computedStatus, has_dns: hasDnsVal };
+        return { ...sub, status: computedStatus, has_dns: hasDnsVal, dns_provider: dnsProvider };
       } catch (e: unknown) {
         console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
-        return { ...sub, has_dns: 1 };
+        // 上游临时失败时不覆盖缓存中已经识别出的托管商。
+        return { ...sub };
       }
     })
   );
@@ -1033,7 +1035,8 @@ async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client
     
     // 是否使用自定义/第三方 NS
     const nsRecords = records.filter(r => r.type === "NS");
-    const hasCustomNs = nsRecords.length > 0;
+    const dnsProvider = detectDnsProvider(nsRecords.map((r) => String(r.content || "")));
+    const hasCustomNs = dnsProvider !== "system";
     
     let computedStatus = "未解析";
     let hasDns = 1;
@@ -1049,7 +1052,7 @@ async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client
       hasDns = 1;
     }
 
-    await dbManager.updateDomainStatusAndDns(domainId, computedStatus, hasDns);
+    await dbManager.updateDomainStatusAndDns(domainId, computedStatus, hasDns, dnsProvider);
   } catch (e) {
     console.error(`域名状态实时更新异常 [subdomain_id: ${domainId}]:`, e);
   }

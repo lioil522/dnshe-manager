@@ -1,5 +1,6 @@
 import { DatabaseManager } from "./db";
 import type { SubdomainInfo } from "./dnshe";
+import { detectDnsProvider } from "./dns-provider";
 
 /**
  * Webhook 通知类型定义
@@ -188,14 +189,14 @@ export async function runDailySyncAndRenewal(
           try {
             const recordsRes = await client.listDnsRecords(sub.id);
             const records = recordsRes.records || [];
-            const customNsRecord = records.find(
-              (r) => r.type === "NS" && !r.content.toLowerCase().includes("dnshe.com")
+            const dnsProvider = detectDnsProvider(
+              records.filter((r) => r.type === "NS").map((r) => String(r.content || ""))
             );
             
             let computedStatus = sub.status;
             let hasDnsVal = 1;
 
-            if (customNsRecord) {
+            if (dnsProvider !== "system") {
               computedStatus = "已委派";
               hasDnsVal = 0;
             } else if (records.length > 0) {
@@ -209,10 +210,12 @@ export async function runDailySyncAndRenewal(
             return {
               ...sub,
               status: computedStatus,
-              has_dns: hasDnsVal
+              has_dns: hasDnsVal,
+              dns_provider: dnsProvider
             };
           } catch (e) {
-            return { ...sub, has_dns: 1 };
+            // 上游临时失败时不覆盖缓存中已经识别出的托管商。
+            return { ...sub };
           }
         })
       );

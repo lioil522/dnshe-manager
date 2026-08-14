@@ -150,6 +150,7 @@ export interface DBDomain {
   expires_at: string;
   last_renewed_at: string | null;
   has_dns?: number;
+  dns_provider?: string | null;
   updated_at: string;
 }
 
@@ -203,6 +204,7 @@ export class DatabaseManager {
             expires_at TEXT NOT NULL,
             last_renewed_at TEXT,
             has_dns INTEGER DEFAULT 1,
+            dns_provider TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
           );
@@ -232,6 +234,12 @@ export class DatabaseManager {
           );
         `)
       ]);
+
+      // 兼容已部署的旧数据库：仅在缺少字段时执行一次轻量迁移。
+      const domainColumns = await this.db.prepare("PRAGMA table_info(domains_cache)").all<{ name: string }>();
+      if (!(domainColumns.results || []).some((column) => column.name === "dns_provider")) {
+        await this.db.prepare("ALTER TABLE domains_cache ADD COLUMN dns_provider TEXT").run();
+      }
     } catch (e) {
       console.error("Auto ensureTables error:", e);
     }
@@ -556,12 +564,12 @@ export class DatabaseManager {
   /**
    * 实时更新域名的解析状态与 NS 标记 (用于 DNS 增删改后精准即时刷新状态)
    */
-  async updateDomainStatusAndDns(domainId: number, status: string, hasDns: number) {
+  async updateDomainStatusAndDns(domainId: number, status: string, hasDns: number, dnsProvider?: string) {
     try {
       const beijingNow = this.getBeijingNow();
       await this.db.prepare(
-        "UPDATE domains_cache SET status = ?, has_dns = ?, updated_at = ? WHERE id = ?"
-      ).bind(status, hasDns, beijingNow, domainId).run();
+        "UPDATE domains_cache SET status = ?, has_dns = ?, dns_provider = ?, updated_at = ? WHERE id = ?"
+      ).bind(status, hasDns, dnsProvider || (hasDns ? "system" : "external"), beijingNow, domainId).run();
     } catch (e) {
       console.error("Failed to update domain status and dns:", e);
     }
@@ -823,6 +831,7 @@ export class DatabaseManager {
     has_dns?: boolean | number;
     ns1?: string;
     ns2?: string;
+    dns_provider?: string;
   }>) {
     const statements: D1PreparedStatement[] = [];
     
@@ -847,16 +856,18 @@ export class DatabaseManager {
       } else if (sub.has_dns !== undefined) {
         hasDnsVal = sub.has_dns ? 1 : 0;
       }
+      const dnsProvider = sub.dns_provider ?? null;
 
       statements.push(
         this.db.prepare(`
-          INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             status = excluded.status,
             created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
             expires_at = excluded.expires_at,
             has_dns = excluded.has_dns,
+            dns_provider = COALESCE(excluded.dns_provider, domains_cache.dns_provider),
             updated_at = excluded.updated_at
         `).bind(
           sub.id,
@@ -868,6 +879,7 @@ export class DatabaseManager {
           sub.created_at || "",
           sub.expires_at || "",
           hasDnsVal,
+          dnsProvider,
           this.getBeijingNow()
         )
       );

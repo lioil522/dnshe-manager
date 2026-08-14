@@ -40,6 +40,10 @@ export interface SubdomainInfo {
   status: string;
   expires_at?: string;
   created_at?: string;
+  disable_ns_management?: boolean | number;
+  has_dns?: boolean | number;
+  ns1?: string;
+  ns2?: string;
 }
 
 /** 子域名详情响应 */

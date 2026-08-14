@@ -4,6 +4,7 @@
   "description": "DNSHE Multi-Account Domain Manager Cloudflare Worker",
   "main": "src/index.ts",
   "scripts": {
+    "clean:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/clean-local.ps1 -Force",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },

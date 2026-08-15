@@ -1672,7 +1672,9 @@ export default function App() {
           fetchQuotas();
         }
       } else {
-        showToast("error", data.message || "更新账号失败");
+        // 密钥框非空却失败，多半是被密码管理器预填的登录凭据当成了新密钥送去校验
+        const hint = keyChanged ? "（若 API Key/Secret 是浏览器自动填充的，请清空这两个框后重试）" : "";
+        showToast("error", `${data.message || "更新账号失败"}${hint}`);
       }
     } catch (e) {
       showToast("error", "更新账号请求失败");
@@ -4270,10 +4272,24 @@ export default function App() {
               </div>
 
               <div className="p-6 space-y-4">
+                {/*
+                  NOTE: 这三个输入框必须显式标注 autoComplete 与不像凭据的 name。
+                  缺了这些提示，Chrome 密码管理器会把「API Secret」当成登录密码框，
+                  再顺手把它上方最近的文本框（API Key）当成用户名一起填上——于是
+                  只想改个别名时，两个密钥框会被静默填成登录用户名与登录密码。
+                  这不只是要手动清空的麻烦：handleUpdateAccount 见到两个框都非空
+                  就认定「要换密钥」，把填进去的登录凭据当新密钥送去校验，结果是
+                  改别名直接失败在「无法验证新 API 密钥有效性」上。
+
+                  和设置页的密码表单同一套解法：把密码框标成 new-password，表单内
+                  就不存在可填充的凭据目标，Chrome 不会发起这次成对填充。
+                */}
                 <div>
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名</label>
                   <input
                     type="text"
+                    name="dnshe-account-alias"
+                    autoComplete="off"
                     value={editAlias}
                     onChange={(e) => setEditAlias(e.target.value)}
                     placeholder="账户别名"
@@ -4284,6 +4300,8 @@ export default function App() {
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key（留空保持不变）</label>
                   <input
                     type="text"
+                    name="dnshe-edit-api-key"
+                    autoComplete="off"
                     value={editApiKey}
                     onChange={(e) => setEditApiKey(e.target.value)}
                     placeholder={`当前: ${editingAccount.api_key.substring(0, 8)}***${editingAccount.api_key.substring(editingAccount.api_key.length - 4)}`}
@@ -4294,6 +4312,8 @@ export default function App() {
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret（留空保持不变）</label>
                   <input
                     type="password"
+                    name="dnshe-edit-api-secret"
+                    autoComplete="new-password"
                     value={editApiSecret}
                     onChange={(e) => setEditApiSecret(e.target.value)}
                     placeholder="如需更换密钥则填写新的 API Secret"
@@ -4441,10 +4461,13 @@ export default function App() {
               </div>
 
               <form onSubmit={handleAddAccount} className="p-6 space-y-4">
+                {/* NOTE: 与「修改账号」弹窗同理，避免 Chrome 把 API Key/Secret 当成登录凭据对填充 */}
                 <div>
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (可选，留空自动解析)</label>
                   <input
                     type="text"
+                    name="dnshe-bind-alias"
+                    autoComplete="off"
                     placeholder="如：主账号、测试组"
                     value={newAlias}
                     onChange={(e) => setNewAlias(e.target.value)}
@@ -4456,6 +4479,8 @@ export default function App() {
                   <input
                     type="text"
                     required
+                    name="dnshe-bind-api-key"
+                    autoComplete="off"
                     placeholder="cfsd_xxxxxxxxxx"
                     value={newApiKey}
                     onChange={(e) => setNewApiKey(e.target.value)}
@@ -4467,6 +4492,8 @@ export default function App() {
                   <input
                     type="password"
                     required
+                    name="dnshe-bind-api-secret"
+                    autoComplete="new-password"
                     placeholder="请输入 API Secret"
                     value={newApiSecret}
                     onChange={(e) => setNewApiSecret(e.target.value)}

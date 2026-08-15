@@ -1246,23 +1246,43 @@ export default function App() {
   //       它们是侧栏徽标与各页共用的全局数据，跟当前在哪个标签页无关，所以只挂 sessionToken。
   //       增删改、续期、同步等操作后，各自的处理函数里已经显式调用了
   //       fetchAccounts() / fetchDomains() 刷新，不依赖切页来触发。
+  // 标签页专属数据的「上次拉取时刻」，用于避免每次点击标签页都重新请求一遍
+  const tabDataFetchedAtRef = useRef<Record<string, number>>({});
+
   useEffect(() => {
     if (!sessionToken) return;
+    // 换会话（登录 / 重新登录）时清空时效记录，让下面的按需拉取重新跑一轮
+    tabDataFetchedAtRef.current = {};
     fetchAccounts();
     fetchDomains();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionToken]);
 
   // 按当前 ActiveTab 拉取该页专属数据（仅在已登录时触发）
+  //
+  // NOTE: 这里原先每次切到对应标签页都会无条件重新请求一遍，来回点几下
+  //       「设置 / 运行日志 / 账户配额」就是好几轮 D1 往返的白等。改为带时效判断：
+  //       日志与配额 60 秒内不重复拉；设置与账户信息只在本次会话首次进入时拉一次
+  //       —— 它们只会通过本界面修改，而保存设置、改密码、开关 2FA 等处理函数
+  //       已经各自显式调用了对应的 fetch 刷新，不依赖切页触发。
+  //       时间戳在发起请求前就写入，这样快速连点同一个标签页也不会打出重复请求。
   useEffect(() => {
     if (!sessionToken) return;
+    const now = Date.now();
+    const fetchIfStale = (key: string, ttlMs: number, run: () => void) => {
+      const last = tabDataFetchedAtRef.current[key];
+      if (last !== undefined && now - last < ttlMs) return;
+      tabDataFetchedAtRef.current[key] = now;
+      run();
+    };
+
     if (activeTab === "dashboard" || activeTab === "logs") {
-      fetchLogs();
+      fetchIfStale("logs", 60_000, fetchLogs);
     } else if (activeTab === "quota") {
-      fetchQuotas();
+      fetchIfStale("quota", 60_000, fetchQuotas);
     } else if (activeTab === "settings") {
-      fetchSettings();
-      fetchAccountInfo();
+      fetchIfStale("settings", Infinity, fetchSettings);
+      fetchIfStale("account", Infinity, fetchAccountInfo);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, sessionToken]);
@@ -1325,6 +1345,16 @@ export default function App() {
       return a.seq - b.seq;
     });
   }, [domains, globalSearch, domainSearchIndex, accountSeqMap]);
+
+  // 当前搜索命中的域名总数 —— 供筛选栏提示使用。
+  //
+  // NOTE: 表头的「托管域名: N 个」读的是 domains.length（总数），搜索过滤发生在渲染层，
+  //       两个数字不一致时很容易被误读成「账号和域名凭空少了一大半」。
+  //       把命中数显式摆出来，让过滤状态不再是隐形的。
+  const searchHitCount = useMemo(
+    () => groupedDomains.reduce((n, g) => n + g.domains.length, 0),
+    [groupedDomains]
+  );
 
   // 立即发起域名同步
   const handleSyncDomains = async () => {
@@ -2846,7 +2876,18 @@ export default function App() {
           {/* 全局搜索框 */}
           <div className="flex-1 max-w-md relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-content-muted pointer-events-none" />
+            {/*
+              NOTE: type="search" + autoComplete="off" 是为了挡住 Chrome 密码管理器。
+              设置页的「修改登录密码」表单一旦被自动填充，Chrome 会去猜用户名字段，
+              往前找到的第一个纯文本输入框就是这里，于是把用户名塞进搜索框、
+              静默过滤掉域名列表（看起来像账号和域名凭空少了一大半）。
+              Chrome 不会把 type="search" 的输入框当作用户名字段。
+              原生清除按钮在 index.css 里隐藏，外观与改造前一致。
+            */}
             <input
+              type="search"
+              name="domain-search"
+              autoComplete="off"
               value={globalSearch}
               onChange={(e) => setGlobalSearch(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") handleGlobalSearchSubmit(); }}
@@ -3877,6 +3918,20 @@ export default function App() {
               </div>
 
               <div className="flex items-center gap-4">
+                {globalSearch.trim() && (
+                  <div className="flex items-center gap-1.5 text-xs bg-amber-950/40 text-amber-300 border border-amber-900/60 px-2.5 py-1 rounded-full whitespace-nowrap">
+                    <Search className="w-3 h-3 shrink-0" />
+                    <span className="font-mono">
+                      搜索「{globalSearch.trim()}」· 命中 {searchHitCount} 个
+                    </span>
+                    <button
+                      onClick={() => setGlobalSearch("")}
+                      className="ml-0.5 font-semibold underline decoration-dotted hover:text-amber-100 transition-colors"
+                    >
+                      清除
+                    </button>
+                  </div>
+                )}
                 <div className="text-xs text-content-muted font-mono">
                   已绑定账户: <span className="text-indigo-400 font-bold">{accounts.length}</span> |
                   托管域名: <span className="text-emerald-400 font-bold">{domains.length}</span> 个
@@ -4709,8 +4764,14 @@ export default function App() {
                     <div className="text-sm font-semibold text-content-primary flex items-center gap-1.5">
                       <Key className="w-4 h-4 text-amber-400" /> 修改登录密码
                     </div>
+                    {/*
+                      NOTE: 这三个密码框与下面的用户名框必须显式标注 autoComplete。
+                      缺了这些提示，Chrome 密码管理器会自行猜测用户名字段，
+                      结果把页头的全局搜索框当成用户名填进去，静默过滤掉域名列表。
+                    */}
                     <input
                       type="password"
+                      autoComplete="current-password"
                       value={pwOld}
                       onChange={(e) => setPwOld(e.target.value)}
                       placeholder="原密码"
@@ -4719,6 +4780,7 @@ export default function App() {
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <input
                         type="password"
+                        autoComplete="new-password"
                         value={pwNew}
                         onChange={(e) => setPwNew(e.target.value)}
                         placeholder="新密码（至少 8 位）"
@@ -4726,6 +4788,7 @@ export default function App() {
                       />
                       <input
                         type="password"
+                        autoComplete="new-password"
                         value={pwNew2}
                         onChange={(e) => setPwNew2(e.target.value)}
                         placeholder="确认新密码"
@@ -4734,6 +4797,7 @@ export default function App() {
                     </div>
                     <input
                       type="text"
+                      autoComplete="username"
                       value={pwNewUsername}
                       onChange={(e) => setPwNewUsername(e.target.value)}
                       placeholder={`同时修改用户名（可选，当前：${accountInfo.username || "admin"}）`}

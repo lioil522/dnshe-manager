@@ -94,6 +94,16 @@
   outline: none;
 }
 
+/*
+ * 全局搜索框用的是 type="search"（为了不被 Chrome 密码管理器当成用户名字段
+ * 自动填充），这里隐藏 WebKit 的原生清除按钮，让外观与普通文本框保持一致。
+ */
+.form-input[type="search"]::-webkit-search-cancel-button,
+.form-input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
 /* 闪烁圆点（表示同步中/状态好） */
 .pulse-green {
   animation: pulse-green-anim 2s infinite;

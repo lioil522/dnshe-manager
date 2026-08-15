@@ -693,7 +693,12 @@ export default function App() {
     setActionLoading("change-pw");
     try {
       const payload: Record<string, string> = { old_password: pwOld, new_password: pwNew };
-      if (pwNewUsername.trim()) payload.username = pwNewUsername.trim();
+      // 与当前用户名相同时不下发 username：避免浏览器把当前用户名预填进「同时修改用户名」
+      // 之后，提交时产生一次毫无意义的改名写入与日志。
+      const wantUsername = pwNewUsername.trim();
+      if (wantUsername && wantUsername !== (accountInfo.username || "")) {
+        payload.username = wantUsername;
+      }
       const res = await apiFetch("/api/auth/change-password", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4765,13 +4770,19 @@ export default function App() {
                       <Key className="w-4 h-4 text-amber-400" /> 修改登录密码
                     </div>
                     {/*
-                      NOTE: 这三个密码框与下面的用户名框必须显式标注 autoComplete。
-                      缺了这些提示，Chrome 密码管理器会自行猜测用户名字段，
-                      结果把页头的全局搜索框当成用户名填进去，静默过滤掉域名列表。
+                      NOTE: 这里刻意不用 autoComplete="current-password" / "username"。
+                      Chrome 是「成对」填充凭据的：只要表单里存在一个 current-password
+                      目标，它就会连带去找用户名字段填上。上一版把这两个语义标注补齐后，
+                      填充确实不再跑到页头搜索框，但改成精准落进「原密码 + 同时修改用户名」，
+                      等于换了个地方犯同样的毛病——修改密码表单被预填本来就不是我们想要的。
+                      把三个密码框统一标成 new-password（表单内不存在可填充的凭据目标），
+                      Chrome 就不会发起这次凭据填充，也就不会再去找用户名字段。
+                      name 也故意取成不像 username 的值，避免命中它的启发式。
                     */}
                     <input
                       type="password"
-                      autoComplete="current-password"
+                      name="dnshe-old-password"
+                      autoComplete="new-password"
                       value={pwOld}
                       onChange={(e) => setPwOld(e.target.value)}
                       placeholder="原密码"
@@ -4780,6 +4791,7 @@ export default function App() {
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <input
                         type="password"
+                        name="dnshe-new-password"
                         autoComplete="new-password"
                         value={pwNew}
                         onChange={(e) => setPwNew(e.target.value)}
@@ -4788,6 +4800,7 @@ export default function App() {
                       />
                       <input
                         type="password"
+                        name="dnshe-new-password-confirm"
                         autoComplete="new-password"
                         value={pwNew2}
                         onChange={(e) => setPwNew2(e.target.value)}
@@ -4797,7 +4810,8 @@ export default function App() {
                     </div>
                     <input
                       type="text"
-                      autoComplete="username"
+                      name="dnshe-rename"
+                      autoComplete="off"
                       value={pwNewUsername}
                       onChange={(e) => setPwNewUsername(e.target.value)}
                       placeholder={`同时修改用户名（可选，当前：${accountInfo.username || "admin"}）`}

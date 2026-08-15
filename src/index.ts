@@ -1,11 +1,12 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
-import { DatabaseManager, timingSafeEqual } from "./db";
+import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams } from "./dnshe";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
-import { detectDnsProvider } from "./dns-provider";
+import { computeDnsState } from "./dns-provider";
+import type { DnsState } from "./dns-provider";
 import { toASCII } from "./punycode";
 
 /**
@@ -50,30 +51,14 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
       try {
         const recordsRes = await client.listDnsRecords(sub.id);
         const records = recordsRes.records || [];
-        const dnsProvider = detectDnsProvider(
-          records.filter((r) => r.type === "NS").map((r) => String(r.content || ""))
-        );
-
-        let computedStatus = sub.status;
-        let hasDnsVal = 1;
-        if (dnsProvider !== "system") {
-          computedStatus = "已委派";
-          hasDnsVal = 0;
-        } else if (records.length > 0) {
-          computedStatus = "已解析";
-          hasDnsVal = 1;
-        } else {
-          computedStatus = "未解析";
-          hasDnsVal = 1;
-        }
 
         // 深度同步拿到的真实解析记录一并回填缓存，后续打开 DNS 面板直接命中、零上游调用
         await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
 
-        return { ...sub, status: computedStatus, has_dns: hasDnsVal, dns_provider: dnsProvider };
+        return { ...sub, ...computeDnsState(records) };
       } catch (e: unknown) {
         console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
-        // 上游临时失败时不覆盖缓存中已经识别出的托管商。
+        // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
         return { ...sub };
       }
     })
@@ -85,15 +70,19 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
   return subdomains.length;
 }
 
-// NOTE: 批量绑定后逐个账号深度同步域名（间隔 1.2s 规避 DNSHE 速率限制）
-async function syncDomainsForAccounts(dbManager: DatabaseManager, accountIds: number[]) {
+// NOTE: 账号绑定/换 Key 后逐个账号深度同步域名，并刷新该账号的配额缓存
+//       （间隔 1.2s 规避 DNSHE 速率限制）
+async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds: number[]) {
   for (const id of accountIds) {
     try {
-      const { client } = await dbManager.getClientForAccount(id);
+      const { client, alias } = await dbManager.getClientForAccount(id);
+      // 先刷配额缓存再同步域名：前端是以「该账号的域名已落库」作为后台任务完成的信号，
+      // 放在后面做会让配额缓存慢于这个信号，用户切到配额页仍是旧数据
+      await dbManager.refreshAccountQuotaCache(id, alias);
       const synced = await deepSyncAccountDomains(dbManager, id, client);
       console.log(`Deep sync finished for account ${id}: ${synced} domains`);
     } catch (e: unknown) {
-      console.error(`Background domain deep sync failed for account ${id}:`, e);
+      console.error(`Background account resync failed for account ${id}:`, e);
     }
     await sleep(1200);
   }
@@ -102,6 +91,49 @@ async function syncDomainsForAccounts(dbManager: DatabaseManager, accountIds: nu
 // NOTE: 简易异步等待工具
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 注册成功后，只把新增的这一个域名写入 domains_cache。
+ *
+ * NOTE: 这里刻意不走 syncAccountDomains —— 它会按账号全量覆盖，而 subdomains/list
+ * 不返回解析记录，结果是同账号下所有「已委派」域名被刷成「已解析 + 系统默认」。
+ * 单条 upsert 既不碰其他行，也不需要为整个账号重新拉一遍 DNS 记录。
+ */
+async function cacheNewlyRegisteredDomain(
+  dbManager: DatabaseManager,
+  client: DNSHEClient,
+  accountId: number,
+  subdomainId: number | undefined,
+  fullDomain: string
+): Promise<void> {
+  // 上游只回传 subdomain_id / full_domain，注册时间与到期时间仍需从列表接口取
+  const subdomains = await fetchAllSubdomainsFromClient(client);
+  const created = subdomains.find(
+    (sub) => (subdomainId !== undefined && sub.id === subdomainId) || sub.full_domain === fullDomain
+  );
+  if (!created) {
+    console.error(`注册后未在上游列表中找到新域名: ${fullDomain}`);
+    return;
+  }
+
+  // 新域名理论上是「未解析」，但上游可能自动创建默认记录，仍以真实记录为准
+  let dnsState: Partial<DnsState> = {
+    status: "未解析",
+    has_dns: 1,
+    dns_provider: "system"
+  };
+  try {
+    const recordsRes = await client.listDnsRecords(created.id);
+    const records = recordsRes.records || [];
+    await dbManager.setCache(`api_cache:dns:${created.id}`, JSON.stringify(records));
+    dnsState = computeDnsState(records);
+  } catch (e) {
+    // 拉取失败时按新域名的默认三态入库；不带 dns_state_known，避免覆盖历史行的已有状态
+    console.error(`注册后拉取新域名解析记录失败 [${created.id}]:`, e);
+  }
+
+  await dbManager.upsertDomain(accountId, { ...created, ...dnsState });
 }
 
 // NOTE: 辅助函数 - 如果在环境变量中配置了 DEFAULT_API_KEY 和 DEFAULT_API_SECRET，自动进行初始化绑定
@@ -688,7 +720,7 @@ app.post("/api/accounts", async (c) => {
     
     // 绑定成功后，后台深度同步该账号域名（逐个拉取 DNS 记录自动分类），不阻塞响应
     if (newAccount && newAccount.id) {
-      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, [newAccount.id]));
+      c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [newAccount.id]));
     }
 
     return c.json(successRes({ account: newAccount }));
@@ -744,13 +776,15 @@ app.post("/api/accounts/batch", async (c) => {
 
     // 绑定完成后在后台逐个同步域名（间隔 1.2s 限频），不阻塞 HTTP 响应
     if (newAccountIds.length > 0) {
-      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, newAccountIds));
+      c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, newAccountIds));
     }
 
     return c.json(successRes({
       success_count: successCount,
       fail_count: failCount,
       results,
+      // 前端据此轮询等待后台域名同步落库，绑定完不必手动刷新页面
+      account_ids: newAccountIds,
       message: `批量绑定完成：成功 ${successCount} 个，失败 ${failCount} 个，域名同步已在后台进行中`,
     }));
   } catch (e: unknown) {
@@ -772,8 +806,11 @@ app.put("/api/accounts/:id", async (c) => {
     const updatedAccount = await dbManager.updateAccount(id, alias, apiKey, apiSecret);
 
     // 若更换了 API Key，则后台深度重新同步该账号的域名缓存（拉取 DNS 记录自动分类）
+    // 并刷新其配额缓存；仅改别名时配额数字不变，只需就地改掉缓存里的别名
     if (apiKey && apiSecret) {
-      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, [updatedAccount.id]));
+      c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [updatedAccount.id]));
+    } else {
+      await dbManager.renameAccountInQuotaCache(updatedAccount.id, updatedAccount.alias);
     }
 
     return c.json(successRes({ account: updatedAccount, message: "账号信息已更新" }));
@@ -788,6 +825,9 @@ app.delete("/api/accounts/:id", async (c) => {
   const dbManager = c.get("db");
   const id = parseInt(c.req.param("id"), 10);
   try {
+    // 先摘掉配额缓存里的条目，否则「账户配额」页会一直列着已解绑的账号，
+    // 直到用户手动点「刷新」强制回源为止
+    await dbManager.removeAccountFromQuotaCache(id);
     await dbManager.deleteAccount(id);
     return c.json(successRes({ message: "账户解绑成功" }));
   } catch (e: unknown) {
@@ -856,7 +896,7 @@ app.post("/api/domains/:id/renew", async (c) => {
       try {
         const { accounts, quotas } = await fetchAllQuotas(dbManager);
         if (accounts.length > 0) {
-          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+          await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
         }
       } catch (e) {
         console.error("续期后刷新配额缓存失败:", e);
@@ -987,7 +1027,7 @@ app.post("/api/domains/:id/delete", async (c) => {
       try {
         const { accounts, quotas } = await fetchAllQuotas(dbManager);
         if (accounts.length > 0) {
-          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+          await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
         }
       } catch (e) {
         console.error("删除后刷新配额缓存失败:", e);
@@ -1057,27 +1097,9 @@ async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client
     
     // 写操作回源后，将最新记录回填到缓存，后续读操作直接命中
     await dbManager.setCache(`api_cache:dns:${domainId}`, JSON.stringify(records));
-    
-    // 是否使用自定义/第三方 NS
-    const nsRecords = records.filter(r => r.type === "NS");
-    const dnsProvider = detectDnsProvider(nsRecords.map((r) => String(r.content || "")));
-    const hasCustomNs = dnsProvider !== "system";
-    
-    let computedStatus = "未解析";
-    let hasDns = 1;
-    
-    if (hasCustomNs) {
-      computedStatus = "已委派";
-      hasDns = 0;
-    } else if (records.length > 0) {
-      computedStatus = "已解析";
-      hasDns = 1;
-    } else {
-      computedStatus = "未解析";
-      hasDns = 1;
-    }
 
-    await dbManager.updateDomainStatusAndDns(domainId, computedStatus, hasDns, dnsProvider);
+    const { status, has_dns, dns_provider } = computeDnsState(records);
+    await dbManager.updateDomainStatusAndDns(domainId, status, has_dns, dns_provider);
   } catch (e) {
     console.error(`域名状态实时更新异常 [subdomain_id: ${domainId}]:`, e);
   }
@@ -1231,7 +1253,7 @@ async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: A
 
 app.get("/api/quota", async (c) => {
   const dbManager = c.get("db");
-  const cacheKey = "api_cache:quota";
+  const cacheKey = QUOTA_CACHE_KEY;
   const forceRefresh = c.req.query("refresh") === "1";
 
   try {
@@ -1498,16 +1520,17 @@ app.post("/api/domains/register", async (c) => {
       try {
         const { accounts, quotas } = await fetchAllQuotas(dbManager);
         if (accounts.length > 0) {
-          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+          await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
         }
       } catch (e) {
         console.error("注册后刷新配额缓存失败:", e);
       }
       
-      // 触发一次账号全量同步，把新注册域名自动拉入 domains_cache 数据库
+      // 只把新注册的这一个域名拉入 domains_cache
+      // NOTE: 不能在这里做账号级别的全量同步 —— subdomains/list 不返回解析记录，
+      // 会把该账号下所有域名的三态刷成「已解析 + 系统默认」，必须重新「同步所有账号」才能恢复。
       try {
-        const subdomains = await fetchAllSubdomainsFromClient(client);
-        await dbManager.syncAccountDomains(account_id, subdomains);
+        await cacheNewlyRegisteredDomain(dbManager, client, account_id, res.subdomain_id, fullDomain);
       } catch (e) {
         console.error("注册后同步错误:", e);
       }

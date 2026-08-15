@@ -164,8 +164,40 @@ export interface DBLog {
 }
 
 /**
+ * 写入 domains_cache 的上游域名数据
+ *
+ * NOTE: dns_state_known 表示本次调用已经拉取过该域名的真实解析记录，
+ * 因此 status / has_dns / dns_provider 可信、允许覆盖数据库中的旧值。
+ * 由 dns-provider.ts 的 computeDnsState() 统一产出，不要手工拼装。
+ */
+export interface UpstreamSubdomain {
+  id: number;
+  subdomain: string;
+  rootdomain: string;
+  full_domain: string;
+  status: string;
+  created_at?: string;
+  expires_at?: string;
+  disable_ns_management?: boolean | number;
+  has_dns?: boolean | number;
+  ns1?: string;
+  ns2?: string;
+  dns_provider?: string;
+  dns_state_known?: boolean;
+}
+
+/** domains_cache.status 允许的三态取值（由 computeDnsState 产出） */
+const THREE_STATE_STATUSES = new Set(["已委派", "已解析", "未解析"]);
+
+/** 全部账号配额的缓存键（内容为按 account_id 升序排列的数组） */
+export const QUOTA_CACHE_KEY = "api_cache:quota";
+
+/** 配额缓存中的单个账号条目：成功时展开 quota 字段，失败时带 error */
+export type QuotaEntry = { account_id: number; alias: string; [key: string]: unknown };
+
+/**
  * 数据库封装操作
- * 
+ *
  * NOTE: 使用 D1Database 类型替代 any，获得完整的编译期类型检查
  */
 export class DatabaseManager {
@@ -437,6 +469,68 @@ export class DatabaseManager {
     } catch (e) {
       console.error("deleteCache error:", e);
     }
+  }
+
+  // ===== 配额缓存的按账号维护 =====
+  //
+  // NOTE: 配额缓存走的是「写操作回源回填、读操作只命中缓存」模型，TTL 长达 366 天。
+  // 但账号的增删改会改变账号集合，这份缓存却一直没跟着变，于是「账户配额」页
+  // 依然列着已解绑的账号、也看不到新绑定的账号，只能点「刷新」强制回源才对得上。
+  // 下面三个方法按账号粒度打补丁：解绑与改名零上游调用，只有新绑定/换 Key 才拉一次配额。
+  // 缓存本就不存在时一律直接跳过 —— 下一次读取会整体回源重建。
+
+  /** 读取配额缓存数组；缓存不存在或内容损坏时返回 null */
+  private async readQuotaCache(): Promise<QuotaEntry[] | null> {
+    const cached = await this.getCache(QUOTA_CACHE_KEY);
+    if (!cached) return null;
+    try {
+      const parsed = JSON.parse(cached);
+      return Array.isArray(parsed) ? (parsed as QuotaEntry[]) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 写回配额缓存，并保持与 getAccounts() 相同的 id ASC 顺序（配额页按数组顺序渲染） */
+  private async writeQuotaCache(entries: QuotaEntry[]): Promise<void> {
+    const sorted = [...entries].sort((a, b) => Number(a.account_id) - Number(b.account_id));
+    await this.setCache(QUOTA_CACHE_KEY, JSON.stringify(sorted));
+  }
+
+  /** 解绑账号：摘掉对应条目 */
+  async removeAccountFromQuotaCache(accountId: number): Promise<void> {
+    const cached = await this.readQuotaCache();
+    if (cached === null) return;
+    await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
+  }
+
+  /** 仅改别名：就地改写缓存里的别名 */
+  async renameAccountInQuotaCache(accountId: number, alias: string): Promise<void> {
+    const cached = await this.readQuotaCache();
+    if (cached === null) return;
+    if (!cached.some((q) => Number(q.account_id) === accountId)) return;
+    await this.writeQuotaCache(
+      cached.map((q) => (Number(q.account_id) === accountId ? { ...q, alias } : q))
+    );
+  }
+
+  /** 新绑定 / 换 Key：拉一次该账号的配额写回缓存，只影响这一个账号 */
+  async refreshAccountQuotaCache(accountId: number, alias: string): Promise<void> {
+    const cached = await this.readQuotaCache();
+    if (cached === null) return;
+
+    let entry: QuotaEntry;
+    try {
+      const { client } = await this.getClientForAccount(accountId);
+      const qRes = await client.getQuota();
+      entry = qRes && qRes.success
+        ? { account_id: accountId, alias, ...qRes.quota }
+        : { account_id: accountId, alias, error: qRes?.message || "获取额度失败" };
+    } catch (e: unknown) {
+      entry = { account_id: accountId, alias, error: e instanceof Error ? e.message : "获取额度失败" };
+    }
+
+    await this.writeQuotaCache([...cached.filter((q) => Number(q.account_id) !== accountId), entry]);
   }
 
   // ===== 会话 (Session) 管理 =====
@@ -842,7 +936,18 @@ export class DatabaseManager {
   async deleteAccount(id: number) {
     const account = await this.db.prepare("SELECT alias FROM accounts WHERE id = ?").bind(id).first();
     const alias = account ? (account as { alias: string }).alias : `ID ${id}`;
-    
+
+    // NOTE: domains_cache 会随账号级联删除，但这些域名的 DNS 记录缓存不会——
+    // cache 表里会留下一批永远不会再被读取的孤儿行，直到 366 天兜底 TTL 到期。
+    // 必须在删账号之前清，否则级联删完就查不到这些域名的 id 了。
+    try {
+      await this.db.prepare(
+        "DELETE FROM cache WHERE key IN (SELECT 'api_cache:dns:' || id FROM domains_cache WHERE account_id = ?)"
+      ).bind(id).run();
+    } catch (e) {
+      console.error("Failed to purge dns cache for account:", e);
+    }
+
     await this.db.prepare("DELETE FROM accounts WHERE id = ?").bind(id).run();
     await this.writeLog("info", "operation", `解绑了账户 [${alias}]，其名下的域名缓存已被自动级联清理`);
   }
@@ -919,24 +1024,87 @@ export class DatabaseManager {
   }
 
   /**
+   * 构造单条域名的 UPSERT 语句
+   *
+   * NOTE: 只有当调用方带上 dns_state_known（即本次确实拉取到了该域名的解析记录）时，
+   * 才允许覆盖已有行的 status / has_dns / dns_provider。否则仅刷新到期时间等注册信息，
+   * 保留数据库中已识别出的三态 —— 否则上游 subdomains/list 返回的 active 状态
+   * 会把整个账号下的「已委派」域名刷成「已解析 + 系统默认」。
+   */
+  private buildDomainUpsert(accountId: number, sub: UpstreamSubdomain): D1PreparedStatement {
+    let hasDnsVal = 1;
+    if (sub.dns_state_known) {
+      // 调用方已经读过该域名的真实解析记录，直接采信，不再从注册商层面的 ns1/ns2 反推
+      hasDnsVal = sub.has_dns ? 1 : 0;
+    } else if (sub.disable_ns_management) {
+      hasDnsVal = 0;
+    } else if (sub.ns1 || sub.ns2) {
+      // 判断 NS 是否为默认 ns1.dnshe.com / ns2.dnshe.com
+      const ns1 = (sub.ns1 || "").toLowerCase();
+      const ns2 = (sub.ns2 || "").toLowerCase();
+      const isDefault = ns1.includes("dnshe.com") || ns2.includes("dnshe.com");
+      hasDnsVal = isDefault ? 1 : 0;
+    } else if (sub.has_dns !== undefined) {
+      hasDnsVal = sub.has_dns ? 1 : 0;
+    }
+    const dnsProvider = sub.dns_provider ?? null;
+
+    // 解析状态未知时，冲突分支保持数据库中的原值不动
+    const dnsStateAssignments = sub.dns_state_known
+      ? `status = excluded.status,
+            has_dns = excluded.has_dns,
+            dns_provider = COALESCE(excluded.dns_provider, domains_cache.dns_provider),`
+      : "";
+
+    // 绑定的 status 在「解析状态未知」时只对 INSERT 生效（新行没有旧值可保留）。
+    //
+    // NOTE: 此时上游给的是注册态（active / Registered），前端会把它显示成「已解析」——
+    // 新绑定账号里恰好被限流、没拉到解析记录的域名就会挂上一个假的「已解析 + 系统默认」。
+    // 落成中性的「未解析」宁可少报也不误报，下一次同步会纠正过来。
+    const statusVal = sub.dns_state_known || THREE_STATE_STATUSES.has(sub.status)
+      ? sub.status
+      : "未解析";
+
+    return this.db.prepare(`
+      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        account_id = excluded.account_id,
+        ${dnsStateAssignments}
+        created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
+        expires_at = excluded.expires_at,
+        updated_at = excluded.updated_at
+    `).bind(
+      sub.id,
+      accountId,
+      sub.subdomain,
+      sub.rootdomain,
+      sub.full_domain,
+      statusVal,
+      sub.created_at || "",
+      sub.expires_at || "",
+      hasDnsVal,
+      dnsProvider,
+      this.getBeijingNow()
+    );
+  }
+
+  /**
+   * 写入/更新单条域名缓存（不做账号级别的清理扫描）
+   *
+   * NOTE: 供在线注册等「只新增一个域名」的场景使用。不能改用 syncAccountDomains，
+   * 因为后者会把没出现在入参列表里的域名当作上游已删除而清除。
+   */
+  async upsertDomain(accountId: number, sub: UpstreamSubdomain): Promise<void> {
+    await this.buildDomainUpsert(accountId, sub).run();
+  }
+
+  /**
    * 同步单个账号名下的域名到缓存表
    */
-  async syncAccountDomains(accountId: number, subdomains: Array<{
-    id: number;
-    subdomain: string;
-    rootdomain: string;
-    full_domain: string;
-    status: string;
-    created_at?: string;
-    expires_at?: string;
-    disable_ns_management?: boolean | number;
-    has_dns?: boolean | number;
-    ns1?: string;
-    ns2?: string;
-    dns_provider?: string;
-  }>) {
+  async syncAccountDomains(accountId: number, subdomains: UpstreamSubdomain[]) {
     const statements: D1PreparedStatement[] = [];
-    
+
     // 1. 获取当前缓存中该账号所有的域名 ID 集合，以便删除在 DNSHE 后台已经被删掉的域名
     const cachedDomains = await this.db.prepare(
       "SELECT id FROM domains_cache WHERE account_id = ?"
@@ -946,45 +1114,7 @@ export class DatabaseManager {
 
     // 2. 准备插入/更新操作
     for (const sub of subdomains) {
-      // 判断 NS 是否为默认 ns1.dnshe.com / ns2.dnshe.com，或 disable_ns_management 状态
-      let hasDnsVal = 1;
-      if (sub.disable_ns_management) {
-        hasDnsVal = 0;
-      } else if (sub.ns1 || sub.ns2) {
-        const ns1 = (sub.ns1 || "").toLowerCase();
-        const ns2 = (sub.ns2 || "").toLowerCase();
-        const isDefault = ns1.includes("dnshe.com") || ns2.includes("dnshe.com");
-        hasDnsVal = isDefault ? 1 : 0;
-      } else if (sub.has_dns !== undefined) {
-        hasDnsVal = sub.has_dns ? 1 : 0;
-      }
-      const dnsProvider = sub.dns_provider ?? null;
-
-      statements.push(
-        this.db.prepare(`
-          INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            status = excluded.status,
-            created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
-            expires_at = excluded.expires_at,
-            has_dns = excluded.has_dns,
-            dns_provider = COALESCE(excluded.dns_provider, domains_cache.dns_provider),
-            updated_at = excluded.updated_at
-        `).bind(
-          sub.id,
-          accountId,
-          sub.subdomain,
-          sub.rootdomain,
-          sub.full_domain,
-          sub.status,
-          sub.created_at || "",
-          sub.expires_at || "",
-          hasDnsVal,
-          dnsProvider,
-          this.getBeijingNow()
-        )
-      );
+      statements.push(this.buildDomainUpsert(accountId, sub));
     }
 
     // 3. 准备删除操作（清理已经被删除的域名）

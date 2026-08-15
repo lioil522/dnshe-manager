@@ -123,6 +123,9 @@ interface AppLog {
   created_at: string;
 }
 
+/** 简易异步等待工具（用于轮询后台同步进度） */
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * 主应用组件 - 提供 DNSHE 域名管理控制面板
  */
@@ -1077,6 +1080,80 @@ export default function App() {
     }
   };
 
+  // 2.5 读取某账号域名缓存的「指纹」：域名条数 + 最新的 updated_at
+  //
+  // NOTE: 后端每个账号的域名是在一次 db.batch 里整批写入的，所以指纹一变
+  //       就说明该账号这一轮后台同步已经落库。新绑定账号从「0 条」变为有域名，
+  //       换 Key 重新同步则是 updated_at 被刷新，两种场景都能用同一个信号判断。
+  const readAccountDomainFingerprint = async (accountId: number): Promise<string | null> => {
+    try {
+      const res = await apiFetch(`/api/domains?account_id=${accountId}`);
+      const data = await res.json();
+      if (!data.success) return null;
+      const list: Array<Record<string, unknown>> = data.domains || [];
+      const newest = list.reduce((max, d) => {
+        const v = String(d.updated_at || "");
+        return v > max ? v : max;
+      }, "");
+      return `${list.length}:${newest}`;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  // 2.6 等待账号的域名在后端落库后再刷新列表
+  //
+  // NOTE: 绑定 / 换 Key 接口里的域名同步是 waitUntil 后台任务（逐个域名拉解析记录
+  //       判定三态），接口返回「成功」时库里通常还没写完。原先紧接着调 fetchDomains()
+  //       只会拿到空列表或旧数据，看起来像「账号绑上了却没有域名」，只能手动刷新页面。
+  const waitForAccountDomainSync = async (
+    accountIds: number[],
+    label: string,
+    baseline?: Map<number, string>
+  ) => {
+    const pending = new Set(accountIds.filter((id) => Number.isFinite(id) && id > 0));
+    if (pending.size === 0) {
+      fetchDomains();
+      return;
+    }
+
+    showToast("info", `${label}，正在后台同步域名，完成后自动刷新…`);
+
+    // 后端逐个账号同步，账号之间还有 1.2s 间隔，等待预算随账号数增长
+    const deadline = Date.now() + 15_000 + pending.size * 8_000;
+
+    while (pending.size > 0 && Date.now() < deadline) {
+      await sleep(1500);
+
+      // 轮询期间会话失效（登出 / 过期）就不再空转
+      if (!sessionStorage.getItem("DNSHE_SESSION") && !localStorage.getItem("DNSHE_SESSION")) return;
+
+      // 逐个账号单独查询，不受域名页当前账号筛选影响
+      for (const id of [...pending]) {
+        const fingerprint = await readAccountDomainFingerprint(id);
+        // 查询失败（null）不终止等待，下一轮继续
+        if (fingerprint !== null && fingerprint !== (baseline?.get(id) ?? "0:")) {
+          pending.delete(id);
+        }
+      }
+    }
+
+    // 无论是否等齐都刷新一次列表，让已完成的账号立即可见
+    fetchDomains();
+    // 后端在同步域名之前已经刷过这些账号的配额缓存，这里顺带把配额也拉新
+    invalidateQuotaTabCache();
+    fetchQuotas();
+
+    if (pending.size === 0) {
+      showToast("success", "域名同步完成，列表已刷新");
+    } else {
+      showToast(
+        "warning",
+        `${pending.size} 个账号暂未同步到域名（可能仍在后台进行，也可能该账号名下确实没有域名），可稍后点击「同步所有账号」`
+      );
+    }
+  };
+
   // 3. 获取配额列表（默认命中缓存，forceRefresh 时强制回源刷新）
   const fetchQuotas = async (forceRefresh = false) => {
     setLoadingQuotas(true);
@@ -1254,6 +1331,15 @@ export default function App() {
   // 标签页专属数据的「上次拉取时刻」，用于避免每次点击标签页都重新请求一遍
   const tabDataFetchedAtRef = useRef<Record<string, number>>({});
 
+  // 账号增删改后让「账户配额」页的时效缓存失效
+  //
+  // NOTE: 配额是按账号聚合的，账号集合一变它就过时了。后端已按账号粒度维护配额缓存，
+  //       但前端这层还有 60 秒时效判断——不主动失效的话，解绑账号后立刻切到配额页
+  //       仍会显示刚删掉的账号，只能等 60 秒或点「刷新」。
+  const invalidateQuotaTabCache = () => {
+    delete tabDataFetchedAtRef.current.quota;
+  };
+
   useEffect(() => {
     if (!sessionToken) return;
     // 换会话（登录 / 重新登录）时清空时效记录，让下面的按需拉取重新跑一轮
@@ -1406,7 +1492,11 @@ export default function App() {
         setNewApiSecret("");
         setBindModal(null);
         fetchAccounts();
-        fetchDomains();
+        // 域名由后端 waitUntil 后台深度同步，轮询等它落库后再刷新列表
+        waitForAccountDomainSync(
+          [Number(data.account?.id)],
+          `账号 [${data.account?.alias || newApiKey}] 绑定成功`
+        );
       } else {
         showToast("error", data.message || "账号绑定失败，请检查密钥是否正确");
       }
@@ -1487,7 +1577,11 @@ export default function App() {
         showToast("success", data.message || "批量绑定完成");
         setBatchInput("");
         fetchAccounts();
-        fetchDomains();
+        // 后端按账号串行同步（每个间隔 1.2s），轮询等这批账号的域名全部落库
+        waitForAccountDomainSync(
+          (data.account_ids || []).map(Number),
+          `${(data.account_ids || []).length} 个账号绑定成功`
+        );
       } else {
         showToast("error", data.message || "批量绑定失败");
       }
@@ -1509,6 +1603,9 @@ export default function App() {
         showToast("success", "账户解绑成功");
         fetchAccounts();
         fetchDomains();
+        // 后端已从配额缓存中摘掉该账号，同步刷新配额列表，避免配额页还列着它
+        invalidateQuotaTabCache();
+        fetchQuotas();
       } else {
         showToast("error", data.message || "账户解绑失败");
       }
@@ -1539,13 +1636,23 @@ export default function App() {
       return;
     }
     setActionLoading(`update-account-${editingAccount.id}`);
+    const accountId = editingAccount.id;
     try {
       const body: Record<string, string> = { alias: editAlias.trim() };
-      if (editApiKey.trim() && editApiSecret.trim()) {
+      const keyChanged = Boolean(editApiKey.trim() && editApiSecret.trim());
+      if (keyChanged) {
         body.api_key = editApiKey.trim();
         body.api_secret = editApiSecret.trim();
       }
-      const res = await apiFetch(`/api/accounts/${editingAccount.id}`, {
+
+      // 换 Key 会触发后台重新深度同步，先记下当前指纹作为「同步已生效」的对照基线
+      const baseline = new Map<number, string>();
+      if (keyChanged) {
+        const current = await readAccountDomainFingerprint(accountId);
+        if (current !== null) baseline.set(accountId, current);
+      }
+
+      const res = await apiFetch(`/api/accounts/${accountId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -1555,7 +1662,15 @@ export default function App() {
         showToast("success", data.message || "账号信息已更新");
         setEditingAccount(null);
         fetchAccounts();
-        fetchDomains();
+        if (keyChanged) {
+          // 只改别名时后端不会重新同步域名，没必要轮询
+          waitForAccountDomainSync([accountId], "API 密钥已更换", baseline);
+        } else {
+          fetchDomains();
+          // 后端已就地改掉配额缓存里的别名，刷新一次让配额页的标题跟上
+          invalidateQuotaTabCache();
+          fetchQuotas();
+        }
       } else {
         showToast("error", data.message || "更新账号失败");
       }

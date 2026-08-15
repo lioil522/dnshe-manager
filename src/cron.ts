@@ -1,6 +1,6 @@
 import { DatabaseManager } from "./db";
 import type { SubdomainInfo } from "./dnshe";
-import { detectDnsProvider } from "./dns-provider";
+import { computeDnsState } from "./dns-provider";
 
 /**
  * Webhook 通知类型定义
@@ -189,32 +189,9 @@ export async function runDailySyncAndRenewal(
           try {
             const recordsRes = await client.listDnsRecords(sub.id);
             const records = recordsRes.records || [];
-            const dnsProvider = detectDnsProvider(
-              records.filter((r) => r.type === "NS").map((r) => String(r.content || ""))
-            );
-            
-            let computedStatus = sub.status;
-            let hasDnsVal = 1;
-
-            if (dnsProvider !== "system") {
-              computedStatus = "已委派";
-              hasDnsVal = 0;
-            } else if (records.length > 0) {
-              computedStatus = "已解析";
-              hasDnsVal = 1;
-            } else {
-              computedStatus = "未解析";
-              hasDnsVal = 1;
-            }
-
-            return {
-              ...sub,
-              status: computedStatus,
-              has_dns: hasDnsVal,
-              dns_provider: dnsProvider
-            };
+            return { ...sub, ...computeDnsState(records) };
           } catch (e) {
-            // 上游临时失败时不覆盖缓存中已经识别出的托管商。
+            // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
             return { ...sub };
           }
         })

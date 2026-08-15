@@ -321,11 +321,40 @@ async function verifyTOTP(token?: string, secretStr?: string): Promise<boolean> 
 }
 
 /**
+ * 表结构自举 — 每个 isolate 只执行一次
+ *
+ * NOTE: 这里原先是每个 /api/* 请求都 await dbManager.ensureTables()，
+ *       而 ensureTables 的成本是「5 条 CREATE TABLE 的 batch（写事务）+ 1 条 PRAGMA table_info」，
+ *       两次串行 D1 往返，实测给每个请求固定加上约 0.5s。
+ *       同一个部署内表结构不会变化，因此用模块级 Promise 缓存收敛为每 isolate 一次。
+ *       自举失败时不缓存，留给下一个请求重试，避免把一次偶发失败固化成永久跳过。
+ */
+let schemaReady: Promise<boolean> | null = null;
+
+function ensureSchemaOnce(dbManager: DatabaseManager): Promise<boolean> {
+  if (!schemaReady) {
+    schemaReady = dbManager
+      .ensureTables()
+      .then((ok) => {
+        if (!ok) schemaReady = null;
+        return ok;
+      })
+      .catch((e) => {
+        schemaReady = null;
+        console.error("ensureSchemaOnce failed:", e);
+        return false;
+      });
+  }
+  return schemaReady;
+}
+
+/**
  * DatabaseManager 实例化中间件 — 注入 dbManager 到 context
  */
 app.use("/api/*", async (c, next) => {
   const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
-  await dbManager.ensureTables();
+  // 自举失败不阻塞请求：与改造前行为一致，交由后续真实查询暴露具体错误
+  await ensureSchemaOnce(dbManager);
   c.set("db", dbManager);
   return next();
 });
@@ -372,8 +401,7 @@ app.post("/api/auth/setup", async (c) => {
     await dbManager.writeLog("success", "auth", `系统完成首次初始化，已创建管理员账户 [${username}]`);
 
     // 初始化后直接签发 Session，免去再登录一次
-    const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-    await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+    const sessionToken = await dbManager.createSession();
 
     return c.json(successRes({
       session_token: sessionToken,
@@ -409,8 +437,7 @@ app.post("/api/auth/login", async (c) => {
       const candidate = totpToken || password;
       const emgTotpValid = await verifyTOTP(candidate, emergencyToken);
       if (emgTotpValid || timingSafeEqual(candidate, emergencyToken)) {
-        const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-        await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+        const sessionToken = await dbManager.createSession();
         await dbManager.writeLog("warning", "auth", "管理员通过应急令牌 (ADMIN_TOKEN) 登录");
         return c.json(successRes({
           session_token: sessionToken,
@@ -444,9 +471,8 @@ app.post("/api/auth/login", async (c) => {
       }
     }
 
-    // 3. 全部通过，签发长期 Session Token
-    const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-    await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+    // 3. 全部通过，签发 Session Token（有效期见 DatabaseManager.SESSION_TTL_SECONDS）
+    const sessionToken = await dbManager.createSession();
     await dbManager.writeLog("success", "auth", `管理员 [${username}] 登录成功${cfg.twoFaEnabled ? "（含 2FA 校验）" : ""}`);
 
     return c.json(successRes({
@@ -480,11 +506,10 @@ app.use("/api/*", async (c, next) => {
   const dbManager = c.get("db");
   const emergencyToken = c.env.ADMIN_TOKEN || "";
 
-  // 1. 校验登录成功后签发的 Session Token
+  // 1. 校验登录成功后签发的 Session Token（不存在或已过期均视为失效）
   if (token.startsWith("dnshe_sess_")) {
     try {
-      const storedSess = await dbManager.getSetting(`sess_${token}`);
-      if (storedSess === "valid") {
+      if (await dbManager.validateSession(token)) {
         return next();
       }
     } catch (e) {}

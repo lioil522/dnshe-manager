@@ -179,8 +179,11 @@ export class DatabaseManager {
 
   /**
    * 自动确保所需的 D1 数据库表结构存在
+   *
+   * 返回是否自举成功。调用方（index.ts 的 ensureSchemaOnce）据此决定
+   * 是否缓存结果——失败就不缓存，留给下一次请求重试。
    */
-  async ensureTables() {
+  async ensureTables(): Promise<boolean> {
     try {
       await this.db.batch([
         this.db.prepare(`
@@ -240,8 +243,10 @@ export class DatabaseManager {
       if (!(domainColumns.results || []).some((column) => column.name === "dns_provider")) {
         await this.db.prepare("ALTER TABLE domains_cache ADD COLUMN dns_provider TEXT").run();
       }
+      return true;
     } catch (e) {
       console.error("Auto ensureTables error:", e);
+      return false;
     }
   }
 
@@ -434,6 +439,68 @@ export class DatabaseManager {
     }
   }
 
+  // ===== 会话 (Session) 管理 =====
+  //
+  // 会话以 settings 表中 key = `sess_<token>` 的行表示，value 存放到期时间的
+  // Unix 秒级时间戳（字符串形式）。
+  //
+  // NOTE: 历史版本把 value 固定写成 "valid" 且从不删除，于是这张表随每次登录只进不出，
+  //       而鉴权中间件每个请求都要查它。现在会话带过期时间，并由 purgeExpiredSessions()
+  //       在每日 cron 中回收。为了不让这次升级把所有在线会话立刻踢下线，
+  //       validateSession() 仍然接受历史遗留的 "valid" 值；这些旧行会在
+  //       purgeExpiredSessions() 里按 updated_at 超过 TTL 后一并清掉，自然排空。
+
+  /** 会话有效期：7 天 */
+  static readonly SESSION_TTL_SECONDS = 7 * 24 * 3600;
+
+  /**
+   * 签发一个新会话，返回 Session Token
+   */
+  async createSession(ttlSeconds = DatabaseManager.SESSION_TTL_SECONDS): Promise<string> {
+    const token = `dnshe_sess_${crypto.randomUUID()}`;
+    const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
+    await this.setSetting(`sess_${token}`, String(expiresAt));
+    return token;
+  }
+
+  /**
+   * 校验会话是否有效（存在且未过期）
+   */
+  async validateSession(token: string): Promise<boolean> {
+    const stored = await this.getSetting(`sess_${token}`);
+    if (!stored) return false;
+    // 历史遗留格式：升级前签发的会话没有到期时间，先放行，交给 cron 按 updated_at 回收
+    if (stored === "valid") return true;
+    const expiresAt = Number(stored);
+    return Number.isFinite(expiresAt) && expiresAt > Math.floor(Date.now() / 1000);
+  }
+
+  /**
+   * 清理已过期会话 — 供每日 cron 调用，返回清理条数
+   */
+  async purgeExpiredSessions(ttlSeconds = DatabaseManager.SESSION_TTL_SECONDS): Promise<number> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    try {
+      // 1) 新格式：value 是到期时间戳，直接按数值比较
+      const expired = await this.db.prepare(
+        "DELETE FROM settings WHERE key LIKE 'sess_%' AND value != 'valid' AND CAST(value AS INTEGER) <= ?"
+      ).bind(nowSec).run();
+
+      // 2) 历史遗留格式：value = 'valid' 没有到期时间，退化为按 updated_at 超过 TTL 判定。
+      //    updated_at 由 setSetting 以北京时间写入，所以这里也要用同一套格式生成截止值，
+      //    否则会差 8 小时。格式定宽，字符串比较等价于时间比较。
+      const legacyCutoff = this.toBeijingString(new Date((nowSec - ttlSeconds) * 1000));
+      const legacy = await this.db.prepare(
+        "DELETE FROM settings WHERE key LIKE 'sess_%' AND value = 'valid' AND updated_at <= ?"
+      ).bind(legacyCutoff).run();
+
+      return (expired.meta?.changes || 0) + (legacy.meta?.changes || 0);
+    } catch (e) {
+      console.error("purgeExpiredSessions error:", e);
+      return 0;
+    }
+  }
+
   /**
    * 读取管理员鉴权配置
    *
@@ -441,11 +508,37 @@ export class DatabaseManager {
    * TOTP 密钥使用 AES-GCM 加密，读取时自动解密为原文。
    */
   async getAuthConfig(): Promise<AuthConfig> {
-    const username = (await this.getSetting("auth_username")) || "admin";
-    const passHash = (await this.getSetting("auth_pass_hash")) || "";
-    const passSalt = (await this.getSetting("auth_pass_salt")) || "";
-    const twoFaEnabled = (await this.getSetting("auth_2fa_enabled")) === "1";
-    const encryptedSecret = (await this.getSetting("auth_2fa_secret")) || "";
+    // NOTE: 这里原先是 5 次串行 await getSetting()，也就是 5 条独立 SELECT、5 次 D1 往返。
+    //       D1 主库与执行 Worker 的边缘节点常常不在同一区域，单次往返实测 300-450ms，
+    //       仅这一个函数就能给 /api/auth/status 这类"只读几行配置"的接口压上约 2 秒。
+    //       改为一条 IN 查询后 5 次往返收敛成 1 次。
+    const AUTH_KEYS = [
+      "auth_username",
+      "auth_pass_hash",
+      "auth_pass_salt",
+      "auth_2fa_enabled",
+      "auth_2fa_secret",
+    ];
+
+    const values = new Map<string, string>();
+    try {
+      const { results } = await this.db
+        .prepare(
+          `SELECT key, value FROM settings WHERE key IN (${AUTH_KEYS.map(() => "?").join(", ")})`
+        )
+        .bind(...AUTH_KEYS)
+        .all<{ key: string; value: string }>();
+      for (const row of results || []) {
+        values.set(row.key, String(row.value));
+      }
+    } catch (e) {
+      // 与原 getSetting 的容错行为保持一致：读失败按「尚未配置」处理，
+      // 调用方会落到未初始化分支，而不是抛错把登录页打死。
+      console.error("getAuthConfig read error:", e);
+    }
+
+    const passHash = values.get("auth_pass_hash") || "";
+    const encryptedSecret = values.get("auth_2fa_secret") || "";
 
     let twoFaSecret = "";
     if (encryptedSecret) {
@@ -457,10 +550,10 @@ export class DatabaseManager {
     }
 
     return {
-      username,
+      username: values.get("auth_username") || "admin",
       passHash,
-      passSalt,
-      twoFaEnabled,
+      passSalt: values.get("auth_pass_salt") || "",
+      twoFaEnabled: values.get("auth_2fa_enabled") === "1",
       twoFaSecret,
       initialized: !!passHash,
     };
@@ -508,14 +601,23 @@ export class DatabaseManager {
 
   /**
    * 获取当前北京时间 (UTC+8) 的 ISO 格式字符串
-   * 
+   *
    * NOTE: Cloudflare Workers / D1 的 CURRENT_TIMESTAMP 默认为 UTC，
    * 为了让日志时间与用户所在时区一致，手动构造北京时间。
    */
   private getBeijingNow(): string {
-    const now = new Date();
+    return this.toBeijingString(new Date());
+  }
+
+  /**
+   * 把任意时刻格式化成与 getBeijingNow() 完全一致的北京时间字符串
+   *
+   * NOTE: 供 purgeExpiredSessions() 生成与 updated_at 同格式的比较基准用。
+   * 格式定宽（YYYY-MM-DD HH:mm:ss.sss），因此字符串比较等价于时间先后比较。
+   */
+  private toBeijingString(date: Date): string {
     const beijingOffset = 8 * 60 * 60 * 1000;
-    const beijingTime = new Date(now.getTime() + beijingOffset);
+    const beijingTime = new Date(date.getTime() + beijingOffset);
     return beijingTime.toISOString().replace("T", " ").replace("Z", "");
   }
 

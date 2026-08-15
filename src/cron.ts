@@ -292,6 +292,13 @@ export async function runDailySyncAndRenewal(
     await dbManager.writeLog("info", "system", `已清理 ${purgedCache} 条过期缓存记录（含查重池）`);
   }
 
+  // 自动清理已过期会话，避免 settings 表被 sess_ 行无限撑大
+  // （鉴权中间件每个请求都要查这张表，行数失控会直接拖慢所有接口）
+  const purgedSessions = await dbManager.purgeExpiredSessions();
+  if (purgedSessions > 0) {
+    await dbManager.writeLog("info", "system", `已清理 ${purgedSessions} 条过期登录会话`);
+  }
+
   // 如果有域名触发了续期，则向配置的通知渠道推送消息
   if (renewLogs.length > 0) {
     const notifyBody = `【DNSHE 域名自动续期报告】\n${summaryMsg}\n\n详细明细：\n${renewLogs.join("\n")}`;

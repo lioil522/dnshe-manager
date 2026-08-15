@@ -530,28 +530,11 @@ export default function App() {
     }
   };
 
-  // 查询后端鉴权状态：决定登录页展示"登录"还是"首次设置密码"
-  const checkAuthStatus = async () => {
-    try {
-      const res = await apiFetch("/api/auth/status");
-      const data = await res.json();
-      if (data.success) {
-        setAuthInitialized(!!data.initialized);
-        setAuthTwoFaEnabled(!!data.two_fa_enabled);
-      }
-    } catch (e) {
-      // 后端不可达时默认按已初始化处理，仍展示登录页
-      setAuthInitialized(true);
-    } finally {
-      setAuthStatusLoaded(true);
-    }
-  };
-
-  // 应用启动时查询一次鉴权状态
-  useEffect(() => {
-    checkAuthStatus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // NOTE: 这里原先有一份 checkAuthStatus() + 无依赖 useEffect，会在挂载时无条件
+  //       请求一次 /api/auth/status。它与下面 [sessionToken] 那个 effect 完全重复：
+  //       未登录时冷加载会把这个接口打两遍，已登录时这一次请求的结果又根本用不上
+  //       （authStatusLoaded 只在未登录分支里被读取）。已删除，只保留会在已登录时
+  //       提前 return 的那一个。
 
   // 保存会话 Token 并进入系统
   //
@@ -1255,22 +1238,33 @@ export default function App() {
     }
   }, [activeTab]);
 
-  // 根据当前 ActiveTab 初始化拉取数据（仅在已登录时触发）
+  // 会话建立后拉取一次全局数据（账号列表 + 全量域名列表）
+  //
+  // NOTE: 这两个请求原先和下面的标签页数据挤在同一个 [activeTab, sessionToken] effect 里，
+  //       于是每切一次标签页就要重新拉一遍账号和全量域名——两个请求各自都要付
+  //       「ensureTables + 校验 session + 真实查询」的串行 D1 往返，切页因此固定卡两秒。
+  //       它们是侧栏徽标与各页共用的全局数据，跟当前在哪个标签页无关，所以只挂 sessionToken。
+  //       增删改、续期、同步等操作后，各自的处理函数里已经显式调用了
+  //       fetchAccounts() / fetchDomains() 刷新，不依赖切页来触发。
   useEffect(() => {
     if (!sessionToken) return;
     fetchAccounts();
-    // 域名数量用于全局侧栏徽标，任何页面都需保持有值
     fetchDomains();
-    if (activeTab === "dashboard") {
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionToken]);
+
+  // 按当前 ActiveTab 拉取该页专属数据（仅在已登录时触发）
+  useEffect(() => {
+    if (!sessionToken) return;
+    if (activeTab === "dashboard" || activeTab === "logs") {
       fetchLogs();
     } else if (activeTab === "quota") {
       fetchQuotas();
-    } else if (activeTab === "logs") {
-      fetchLogs();
     } else if (activeTab === "settings") {
       fetchSettings();
       fetchAccountInfo();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, sessionToken]);
 
   // 域名搜索索引：full_domain 在库中一律以 Punycode(xn--) 存储，

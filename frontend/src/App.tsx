@@ -3266,15 +3266,15 @@ export default function App() {
                           </div>
                         </div>
 
-                        <div className="flex flex-col sm:flex-row items-center gap-4 pt-2">
-                          <div className="w-full sm:w-1/2">
-                            <label className="block text-xs font-semibold text-content-secondary mb-1.5">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 items-end">
+                          <div className="space-y-2">
+                            <label className="block text-xs font-semibold text-content-secondary">
                               选择注册的目标账号:
                             </label>
                             <select
                               value={registerAccountId}
                               onChange={(e) => setRegisterAccountId(Number(e.target.value))}
-                              className="w-full bg-elevated border border-border-base focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-content-primary focus:outline-none"
+                              className="w-full bg-elevated border border-border-base focus:border-indigo-500 rounded-xl px-4 py-3 text-sm text-content-primary focus:outline-none"
                             >
                               {accounts.length === 0 ? (
                                 <option value="">暂无可用的绑定账号</option>
@@ -3288,11 +3288,11 @@ export default function App() {
                             </select>
                           </div>
 
-                          <div className="w-full sm:w-1/2 flex items-end">
+                          <div>
                             <button
                               onClick={handleRegisterSubdomain}
                               disabled={actionLoading === "register-subdomain" || accounts.length === 0}
-                              className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                              className="w-full bg-emerald-600 hover:bg-emerald-500 border border-transparent text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                               <Plus className="w-4 h-4" />
                               {actionLoading === "register-subdomain" ? "正在注册中..." : "一键注册该域名"}

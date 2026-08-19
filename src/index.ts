@@ -3,7 +3,7 @@ import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
 import { DNSHEClient } from "./dnshe";
-import type { CreateDnsRecordParams } from "./dnshe";
+import type { CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
 import { computeDnsState } from "./dns-provider";
 import type { DnsState } from "./dns-provider";
@@ -1089,6 +1089,53 @@ app.get("/api/domains/:id/dns", async (c) => {
   }
 });
 
+/**
+ * 把主机记录规范化为上游要求的相对名
+ *
+ * NOTE: dns_records/list 读出来的 name 是**完整域名**（`ipv6.1.cd`），而写接口只接受
+ * `@` 或相对名，原样回填提交会被上游拒绝：
+ *   "record name must be @ or a relative record name; full domain names are not accepted"
+ * 所有写路径（创建 / 修改 / 批量创建）都过这里，前端传完整域名、带尾点、中文都能接住。
+ * 统一转成 ASCII 小写，与「中文域名统一转 xn-- 后送往上游」的既有约定一致。
+ */
+function normalizeDnsRecordName(rawName: string, fullDomain: string): string {
+  const trimmed = String(rawName || "").trim().replace(/\.+$/, "");
+  if (!trimmed || trimmed === "@") {
+    return "@";
+  }
+
+  const name = toASCII(trimmed).toLowerCase();
+  const base = toASCII(String(fullDomain || "").trim()).toLowerCase().replace(/\.+$/, "");
+  if (!base) {
+    return name;
+  }
+  if (name === base) {
+    return "@";
+  }
+  if (name.endsWith(`.${base}`)) {
+    return name.slice(0, -(base.length + 1)) || "@";
+  }
+  return name;
+}
+
+/**
+ * DNS 写操作错误翻译
+ *
+ * NOTE: DNSHE 上游 API 在 disable_ns_management 开关禁用时，会直接拒绝 NS 类型
+ * 记录的写入并返回 403，此处翻译为更友好的中文提示。创建 / 修改 / 批量创建共用。
+ */
+function translateDnsWriteError(raw: string, type?: unknown): { message: string; errorCode: string } {
+  const isNsType = String(type || "").toUpperCase() === "NS";
+  const is403 = raw.includes("403") || raw.includes("Forbidden");
+  if (isNsType && is403) {
+    return {
+      message: "DNSHE 上游平台已禁用 NS 管理功能 (disable_ns_management)，无法通过 API 修改 NS 记录。请前往 DNSHE 官网后台手动设置。",
+      errorCode: "ns_management_disabled",
+    };
+  }
+  return { message: raw, errorCode: "internal_error" };
+}
+
 // 辅助函数：DNS 记录变更后，自动重新计算并同步更新域名的三态 (已委派 / 已解析 / 未解析)
 async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client: DNSHEClient, domainId: number) {
   try {
@@ -1121,13 +1168,17 @@ app.post("/api/domains/:id/dns", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    // NOTE: 保留 ...body 透传（weight / port / target 等上游可选字段），只覆盖需要
+    // 规范化的主机记录；前端把列表里读到的完整域名填回来时也不会被上游拒绝。
+    const recordName = normalizeDnsRecordName(String(body.name ?? ""), domainInfo.full_domain);
     const res = await client.createDnsRecord({
       subdomain_id: domainId,
-      ...body
+      ...body,
+      name: recordName
     } as CreateDnsRecordParams);
 
     if (res && res.success) {
-      await dbManager.writeLog("success", "api", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${body.name || "@"} -> ${body.content}`);
+      await dbManager.writeLog("success", "api", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${recordName} -> ${body.content}`);
       await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "创建DNS记录成功", record: res.record }));
     } else {
@@ -1135,14 +1186,336 @@ app.post("/api/domains/:id/dns", async (c) => {
     }
   } catch (e: unknown) {
     const rawMsg = e instanceof Error ? e.message : "未知错误";
-    // NOTE: DNSHE 上游 API 在 disable_ns_management 开关禁用时，
-    // 会直接拒绝 NS 类型记录的写入并返回 403，此处翻译为更友好的中文提示
-    const isNsType = body.type === "NS";
-    const is403 = rawMsg.includes("403") || rawMsg.includes("Forbidden");
-    const message = (isNsType && is403)
-      ? "DNSHE 上游平台已禁用 NS 管理功能 (disable_ns_management)，无法通过 API 修改 NS 记录。请前往 DNSHE 官网后台手动设置。"
-      : rawMsg;
-    return c.json(errorRes(message, isNsType && is403 ? "ns_management_disabled" : "internal_error"), 400);
+    const { message, errorCode } = translateDnsWriteError(rawMsg, body.type);
+    return c.json(errorRes(message, errorCode), 400);
+  }
+});
+
+/** 批量写入 DNS 记录的单次上限（与上游 30-60 请求/分钟的限频折中） */
+const DNS_BATCH_LIMIT = 50;
+
+/** 批量写操作之间的间隔（毫秒），规避 DNSHE 上游限频 */
+const DNS_BATCH_INTERVAL = 300;
+
+/** 批量操作的单条结果 */
+interface DnsBatchItemResult {
+  label: string;
+  success: boolean;
+  message: string;
+}
+
+/**
+ * 把批量请求里的单条 item 规范化为上游写接口参数
+ *
+ * 类型统一大写、主机记录转相对名、优先级只对 MX / SRV 下发、线路留空则不带上，
+ * 批量创建与批量修改共用一份逻辑。type / content 为空时由调用方拒绝该条。
+ */
+function buildBatchDnsParams(
+  item: Record<string, unknown> | null | undefined,
+  domainId: number,
+  fullDomain: string
+): { type: string; name: string; content: string; params: Record<string, unknown> } {
+  const type = String(item?.type || "").trim().toUpperCase();
+  const name = normalizeDnsRecordName(String(item?.name ?? ""), fullDomain);
+  const content = String(item?.content || "").trim();
+
+  const params: Record<string, unknown> = {
+    subdomain_id: domainId,
+    type,
+    name,
+    content,
+    ttl: Number(item?.ttl) > 0 ? Number(item?.ttl) : 600,
+  };
+  if ((type === "MX" || type === "SRV") && Number.isFinite(Number(item?.priority))) {
+    params.priority = Number(item?.priority);
+  }
+  const line = String(item?.line || "").trim();
+  if (line) {
+    params.line = line;
+  }
+
+  return { type, name, content, params };
+}
+
+// 5.1 批量新建 DNS 解析记录（串行提交，逐条返回结果，最后统一回源同步一次三态）
+app.post("/api/domains/:id/dns/batch", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const items = Array.isArray(body.records) ? body.records : [];
+    if (items.length === 0) {
+      return c.json(errorRes("请至少提供一条解析记录", "bad_request"), 400);
+    }
+    if (items.length > DNS_BATCH_LIMIT) {
+      return c.json(errorRes(`单次最多批量添加 ${DNS_BATCH_LIMIT} 条解析记录`, "bad_request"), 400);
+    }
+
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+
+    const results: DnsBatchItemResult[] = [];
+    let successCount = 0;
+    let failCount = 0;
+    let nsDisabled = false;
+    let changed = false;
+
+    for (const item of items) {
+      const { type, name, content, params } = buildBatchDnsParams(item, domainId, domainInfo.full_domain);
+      const label = `${type || "?"} ${name} → ${content || "(空)"}`;
+
+      if (!type || !content) {
+        failCount++;
+        results.push({ label, success: false, message: "记录类型与记录值均不能为空" });
+        continue;
+      }
+
+      try {
+        const res = await client.createDnsRecord(params as unknown as CreateDnsRecordParams);
+        if (res && res.success) {
+          successCount++;
+          changed = true;
+          results.push({ label, success: true, message: "创建成功" });
+        } else {
+          throw new Error(res?.message || "创建DNS记录失败");
+        }
+      } catch (e: unknown) {
+        failCount++;
+        const rawMsg = e instanceof Error ? e.message : "未知错误";
+        const { message, errorCode } = translateDnsWriteError(rawMsg, type);
+        if (errorCode === "ns_management_disabled") {
+          nsDisabled = true;
+        }
+        results.push({ label, success: false, message });
+      }
+
+      await sleep(DNS_BATCH_INTERVAL);
+    }
+
+    // 只要有记录真的写进去了，就回源刷新缓存与三态（整批失败时不必多跑一次上游）
+    if (changed) {
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+    }
+
+    await dbManager.writeLog(
+      failCount === 0 ? "success" : "warning",
+      "api",
+      `批量添加域名 [${domainInfo.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+      results
+    );
+
+    return c.json(successRes({
+      success_count: successCount,
+      fail_count: failCount,
+      results,
+      error_code: nsDisabled ? "ns_management_disabled" : undefined,
+      message: `批量添加完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(`批量添加解析记录失败: ${message}`), 400);
+  }
+});
+
+// 5.2 批量修改 DNS 解析记录（串行提交，逐条返回结果，最后统一回源同步一次三态）
+//
+// NOTE: 每条记录的字段由前端合并后整条送来（要改的字段用新值，不改的字段沿用原值），
+// 上游 update 接口本身也是整条覆盖语义，这里不做「部分字段」的猜测。
+app.post("/api/domains/:id/dns/batch-update", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const items = Array.isArray(body.records) ? body.records : [];
+    if (items.length === 0) {
+      return c.json(errorRes("请至少选择一条要修改的解析记录", "bad_request"), 400);
+    }
+    if (items.length > DNS_BATCH_LIMIT) {
+      return c.json(errorRes(`单次最多批量修改 ${DNS_BATCH_LIMIT} 条解析记录`, "bad_request"), 400);
+    }
+
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+
+    const results: DnsBatchItemResult[] = [];
+    let successCount = 0;
+    let failCount = 0;
+    let nsDisabled = false;
+    let changed = false;
+
+    for (const item of items) {
+      const { type, name, content, params } = buildBatchDnsParams(item, domainId, domainInfo.full_domain);
+      const recordId = String(item?.record_id ?? item?.id ?? "").trim();
+      const label = String(item?.label || "").trim() || `${type || "?"} ${name} → ${content || "(空)"}`;
+
+      if (!recordId) {
+        failCount++;
+        results.push({ label, success: false, message: "缺少记录 ID，无法定位要修改的记录" });
+        continue;
+      }
+      if (!type || !content) {
+        failCount++;
+        results.push({ label, success: false, message: "记录类型与记录值均不能为空" });
+        continue;
+      }
+
+      try {
+        const res = await client.updateDnsRecord({
+          ...params,
+          record_id: recordId,
+        } as unknown as UpdateDnsRecordParams);
+        if (res && res.success) {
+          successCount++;
+          changed = true;
+          results.push({ label, success: true, message: "修改成功" });
+        } else {
+          throw new Error(res?.message || "更新DNS记录失败");
+        }
+      } catch (e: unknown) {
+        failCount++;
+        const rawMsg = e instanceof Error ? e.message : "未知错误";
+        const { message, errorCode } = translateDnsWriteError(rawMsg, type);
+        if (errorCode === "ns_management_disabled") {
+          nsDisabled = true;
+        }
+        results.push({ label, success: false, message });
+      }
+
+      await sleep(DNS_BATCH_INTERVAL);
+    }
+
+    if (changed) {
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+    }
+
+    await dbManager.writeLog(
+      failCount === 0 ? "success" : "warning",
+      "api",
+      `批量修改域名 [${domainInfo.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+      results
+    );
+
+    return c.json(successRes({
+      success_count: successCount,
+      fail_count: failCount,
+      results,
+      error_code: nsDisabled ? "ns_management_disabled" : undefined,
+      message: `批量修改完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(`批量修改解析记录失败: ${message}`), 400);
+  }
+});
+
+// 5.3 批量删除 DNS 解析记录（串行提交，逐条返回结果，最后统一回源同步一次三态）
+app.post("/api/domains/:id/dns/batch-delete", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const rawItems = Array.isArray(body.records) ? body.records : [];
+    // 兼容只传 ID 数组的调用：records 支持 [{record_id, label}] 或 ["123", 456]
+    const items = rawItems.map((it: unknown) => {
+      if (it !== null && typeof it === "object") {
+        const obj = it as Record<string, unknown>;
+        return {
+          recordId: String(obj.record_id ?? obj.id ?? "").trim(),
+          label: String(obj.label ?? obj.record_id ?? obj.id ?? "").trim(),
+        };
+      }
+      return { recordId: String(it ?? "").trim(), label: String(it ?? "").trim() };
+    }).filter((it: { recordId: string }) => it.recordId);
+
+    if (items.length === 0) {
+      return c.json(errorRes("请至少选择一条要删除的解析记录", "bad_request"), 400);
+    }
+    if (items.length > DNS_BATCH_LIMIT) {
+      return c.json(errorRes(`单次最多批量删除 ${DNS_BATCH_LIMIT} 条解析记录`, "bad_request"), 400);
+    }
+
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+
+    const results: DnsBatchItemResult[] = [];
+    let successCount = 0;
+    let failCount = 0;
+    let nsDisabled = false;
+    let changed = false;
+
+    for (const item of items) {
+      const label = item.label || item.recordId;
+      try {
+        const res = await client.deleteDnsRecord(domainId, item.recordId);
+        if (res && res.success) {
+          successCount++;
+          changed = true;
+          results.push({ label, success: true, message: "删除成功" });
+        } else {
+          throw new Error(res?.message || "删除DNS记录失败");
+        }
+      } catch (e: unknown) {
+        failCount++;
+        const rawMsg = e instanceof Error ? e.message : "未知错误";
+        // 批量删除时无从得知记录类型，统一按 NS 判定 403（NS 被禁用是唯一会 403 的场景）
+        const { message, errorCode } = translateDnsWriteError(rawMsg, "NS");
+        if (errorCode === "ns_management_disabled") {
+          nsDisabled = true;
+        }
+        results.push({ label, success: false, message });
+      }
+
+      await sleep(DNS_BATCH_INTERVAL);
+    }
+
+    if (changed) {
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+    }
+
+    await dbManager.writeLog(
+      failCount === 0 ? "success" : "warning",
+      "api",
+      `批量删除域名 [${domainInfo.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+      results
+    );
+
+    return c.json(successRes({
+      success_count: successCount,
+      fail_count: failCount,
+      results,
+      error_code: nsDisabled ? "ns_management_disabled" : undefined,
+      message: `批量删除完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(`批量删除解析记录失败: ${message}`), 400);
   }
 });
 
@@ -1151,32 +1524,61 @@ app.put("/api/domains/:id/dns/:record_id", async (c) => {
   const dbManager = c.get("db");
   const domainId = parseInt(c.req.param("id"), 10);
   const recordId = c.req.param("record_id");
+  // NOTE: body 声明在 try 外层，以便 catch 块能访问已解析的请求体
+  let body: Record<string, unknown> = {};
 
   try {
-    const body = await c.req.json();
+    body = await c.req.json();
     // NOTE: 使用主键查询替代全表扫描
     const domainInfo = await dbManager.getDomainById(domainId);
     if (!domainInfo) {
       return c.json(errorRes("未找到域名记录", "not_found"), 404);
     }
 
-    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.updateDnsRecord({
+    // 规范化提交字段：类型统一大写、主机记录转相对名、优先级只对 MX / SRV 下发
+    const type = String(body.type || "").trim().toUpperCase();
+    const content = String(body.content ?? "").trim();
+    if (!type || !content) {
+      return c.json(errorRes("记录类型与记录值均不能为空", "bad_request"), 400);
+    }
+
+    // NOTE: 先摊平 body 以透传 weight / port / target 等上游可选字段，再覆盖需要
+    // 规范化的字段；优先级与线路在不适用时显式删掉，避免把 A 记录的 priority 传上去。
+    const params: Record<string, unknown> = {
+      ...body,
       record_id: recordId,
       subdomain_id: domainId,
-      ...body
-    });
+      type,
+      name: normalizeDnsRecordName(String(body.name ?? ""), domainInfo.full_domain),
+      content,
+      ttl: Number(body.ttl) > 0 ? Number(body.ttl) : 600,
+    };
+    if ((type === "MX" || type === "SRV") && Number.isFinite(Number(body.priority))) {
+      params.priority = Number(body.priority);
+    } else {
+      delete params.priority;
+    }
+    const line = String(body.line || "").trim();
+    if (line) {
+      params.line = line;
+    } else {
+      delete params.line;
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const res = await client.updateDnsRecord(params as unknown as UpdateDnsRecordParams);
 
     if (res && res.success) {
-      await dbManager.writeLog("success", "api", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${body.type} -> ${body.content}`);
+      await dbManager.writeLog("success", "api", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${params.type} ${params.name} -> ${params.content}`);
       await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
       return c.json(successRes({ message: "更新DNS记录成功" }));
     } else {
       throw new Error(res.message || "更新DNS记录失败");
     }
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    return c.json(errorRes(message), 400);
+    const rawMsg = e instanceof Error ? e.message : "未知错误";
+    const { message, errorCode } = translateDnsWriteError(rawMsg, body.type);
+    return c.json(errorRes(message, errorCode), 400);
   }
 });
 

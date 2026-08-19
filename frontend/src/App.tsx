@@ -53,6 +53,15 @@ import {
   generateCombos,
   BUILTIN_TOKENS
 } from "./rulegen";
+import {
+  DNS_TYPE_OPTIONS,
+  needsDnsPriority,
+  dnsRecordKey,
+  toRelativeRecordName,
+  parseDnsBatchInput,
+  buildDnsEditTargets,
+  type ParsedDnsLine
+} from "./dnsrecords";
 
 // API 响应基本接口
 export interface ApiResponse {
@@ -308,6 +317,51 @@ export default function App() {
   const [newDnsPriority, setNewDnsPriority] = useState<number>(10);
   const [newDnsLine, setNewDnsLine] = useState("");
   const [dnsFormOpen, setDnsFormOpen] = useState(false);
+
+  // 行内修改解析记录状态（editingDnsKey 为 dnsRecordKey(rec)，null 表示当前没有在编辑）
+  const [editingDnsKey, setEditingDnsKey] = useState<string | null>(null);
+  const [editDnsType, setEditDnsType] = useState("A");
+  const [editDnsName, setEditDnsName] = useState("");
+  const [editDnsContent, setEditDnsContent] = useState("");
+  const [editDnsTtl, setEditDnsTtl] = useState(600);
+  const [editDnsPriority, setEditDnsPriority] = useState<number>(10);
+  const [editDnsLine, setEditDnsLine] = useState("");
+
+  // 批量添加解析记录面板状态（面板上的类型/主机记录/TTL 等作为每行缺省字段的默认值）
+  const [dnsBatchOpen, setDnsBatchOpen] = useState(false);
+  const [dnsBatchInput, setDnsBatchInput] = useState("");
+  const [dnsBatchType, setDnsBatchType] = useState("A");
+  const [dnsBatchName, setDnsBatchName] = useState("@");
+  const [dnsBatchTtl, setDnsBatchTtl] = useState(600);
+  const [dnsBatchPriority, setDnsBatchPriority] = useState<number>(10);
+  const [dnsBatchLine, setDnsBatchLine] = useState("");
+  const [dnsBatchResults, setDnsBatchResults] = useState<Array<{ label: string; success: boolean; message: string }> | null>(null);
+
+  // 批量删除：已勾选的解析记录键集合
+  const [selectedDnsKeys, setSelectedDnsKeys] = useState<Set<string>>(new Set());
+
+  // 批量修改面板状态
+  //
+  // NOTE: 勾选哪个字段就只覆盖那个字段，其余字段沿用每条记录的原值 —— 批量选中的
+  // 记录往往只有 TTL / 线路 需要统一，记录值各不相同（如 6 条不同 IP 的 AAAA），
+  // 整表覆盖会把它们改成一模一样。
+  const [dnsEditPanelOpen, setDnsEditPanelOpen] = useState(false);
+  const [dnsEditFields, setDnsEditFields] = useState({
+    type: false,
+    name: false,
+    content: false,
+    ttl: true,
+    line: false,
+    priority: false
+  });
+  const [batchEditType, setBatchEditType] = useState("A");
+  const [batchEditName, setBatchEditName] = useState("@");
+  const [batchEditTtl, setBatchEditTtl] = useState(600);
+  const [batchEditLine, setBatchEditLine] = useState("");
+  const [batchEditPriority, setBatchEditPriority] = useState<number>(10);
+  // 记录值逐条给值（键为 record_id）：勾选「记录值」后每行都能单独改，留空即保持原值
+  const [batchEditContents, setBatchEditContents] = useState<Record<string, string>>({});
+  const [dnsEditResults, setDnsEditResults] = useState<Array<{ label: string; success: boolean; message: string }> | null>(null);
 
   // DNSHE 系统根域名 (支持动态添加)
   const DEFAULT_ROOT_DOMAINS = [
@@ -1931,21 +1985,14 @@ export default function App() {
     }
   };
 
-  // 打开 DNS 管理面板
-  const handleOpenDnsModal = async (domain: Domain, forceRefresh = false) => {
-    setSelectedDomain(domain);
-    setDnsModalOpen(true);
+  // 拉取解析记录列表（只刷新列表，不重置弹窗内已展开的表单与批量结果）
+  const reloadDnsRecords = async (domain: Domain, forceRefresh = false) => {
     setLoadingDns(true);
-    setDnsRecords([]);
-    setDnsFormOpen(false);
-    
-    // 初始化表单字段
-    setNewDnsName("");
-    setNewDnsContent("");
-    setNewDnsType("A");
-    setNewDnsTtl(600);
-    setNewDnsPriority(10);
-    setNewDnsLine("");
+    // 记录集合变了，之前的勾选与行内编辑都可能指向已不存在的行，一并作废
+    setSelectedDnsKeys(new Set());
+    setEditingDnsKey(null);
+    // 批量修改面板依赖勾选，勾选清空后面板也没有意义（结果回执保留给用户看）
+    setDnsEditPanelOpen(false);
 
     try {
       const res = await apiFetch(`/api/domains/${domain.id}/dns${forceRefresh ? "?refresh=1" : ""}`);
@@ -1960,6 +2007,39 @@ export default function App() {
     } finally {
       setLoadingDns(false);
     }
+  };
+
+  // 打开 DNS 管理面板
+  const handleOpenDnsModal = async (domain: Domain, forceRefresh = false) => {
+    setSelectedDomain(domain);
+    setDnsModalOpen(true);
+    setDnsRecords([]);
+    setDnsFormOpen(false);
+
+    // 初始化表单字段
+    setNewDnsName("");
+    setNewDnsContent("");
+    setNewDnsType("A");
+    setNewDnsTtl(600);
+    setNewDnsPriority(10);
+    setNewDnsLine("");
+
+    // 初始化批量添加面板
+    setDnsBatchOpen(false);
+    setDnsBatchInput("");
+    setDnsBatchType("A");
+    setDnsBatchName("@");
+    setDnsBatchTtl(600);
+    setDnsBatchPriority(10);
+    setDnsBatchLine("");
+    setDnsBatchResults(null);
+
+    // 初始化批量修改面板
+    setDnsEditPanelOpen(false);
+    setDnsEditFields({ type: false, name: false, content: false, ttl: true, line: false, priority: false });
+    setDnsEditResults(null);
+
+    await reloadDnsRecords(domain, forceRefresh);
   };
 
   // 创建新 DNS 记录
@@ -1981,7 +2061,7 @@ export default function App() {
           name: newDnsName || "@",
           content: newDnsContent,
           ttl: newDnsTtl,
-          priority: newDnsType === "MX" || newDnsType === "SRV" ? newDnsPriority : undefined,
+          priority: needsDnsPriority(newDnsType) ? newDnsPriority : undefined,
           line: newDnsLine || undefined
         })
       });
@@ -1991,7 +2071,7 @@ export default function App() {
         setNewDnsName("");
         setNewDnsContent("");
         setDnsFormOpen(false);
-        handleOpenDnsModal(selectedDomain);
+        reloadDnsRecords(selectedDomain);
         fetchDomains();
       } else {
         showToast("error", data.message || "创建解析记录失败");
@@ -2003,26 +2083,352 @@ export default function App() {
     }
   };
 
-  // 删除 DNS 记录
-  const handleDeleteDnsRecord = async (recordId: string | number) => {
+  // 进入某条记录的行内编辑态：把当前值灌进编辑表单
+  const handleStartEditDnsRecord = (rec: DnsRecord) => {
+    setEditingDnsKey(dnsRecordKey(rec));
+    setEditDnsType(rec.type || "A");
+    // 上游读到的是完整域名，编辑框里要显示相对名（@ / jp），否则改完提交会被上游拒绝
+    setEditDnsName(toRelativeRecordName(rec.name, selectedDomain?.full_domain || ""));
+    setEditDnsContent(rec.content || "");
+    setEditDnsTtl(rec.ttl > 0 ? rec.ttl : 600);
+    setEditDnsPriority(rec.priority !== null && rec.priority !== undefined ? rec.priority : 10);
+    setEditDnsLine(rec.line || "");
+  };
+
+  // 提交行内修改
+  const handleUpdateDnsRecord = async (recordId: string | number) => {
     if (!selectedDomain) return;
-    if (!confirm("确定要删除这条 DNS 解析记录吗？这会立即影响该域名的解析！")) return;
-    
-    setActionLoading(`delete-dns-${recordId}`);
+    if (!editDnsContent.trim()) {
+      showToast("error", "解析记录值不能为空！");
+      return;
+    }
+
+    setActionLoading(`update-dns-${recordId}`);
     try {
       const res = await apiFetch(`/api/domains/${selectedDomain.id}/dns/${recordId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: editDnsType,
+          name: editDnsName.trim() || "@",
+          content: editDnsContent.trim(),
+          ttl: editDnsTtl,
+          priority: needsDnsPriority(editDnsType) ? editDnsPriority : undefined,
+          line: editDnsLine.trim() || undefined
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", "DNS 解析记录修改成功！");
+        setEditingDnsKey(null);
+        reloadDnsRecords(selectedDomain);
+        fetchDomains();
+      } else {
+        showToast("error", data.message || "修改解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "修改解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 行内编辑的键盘操作：回车保存、Esc 取消（表格行里放不了 <form>，只能手工绑定）
+  const handleEditDnsKeyDown = (e: React.KeyboardEvent, recordId: string) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleUpdateDnsRecord(recordId);
+    } else if (e.key === "Escape") {
+      setEditingDnsKey(null);
+    }
+  };
+
+  // 删除 DNS 记录
+  // NOTE: domain 显式传入 —— NS 弹窗里删除 NS 记录时打开的是 nsModalDomain，
+  // 与 DNS 弹窗的 selectedDomain 不一定是同一个域名（甚至可能为 null）。
+  const handleDeleteDnsRecord = async (recordId: string | number, domain: Domain | null = selectedDomain) => {
+    if (!domain) return;
+    if (!confirm("确定要删除这条 DNS 解析记录吗？这会立即影响该域名的解析！")) return;
+
+    setActionLoading(`delete-dns-${recordId}`);
+    try {
+      const res = await apiFetch(`/api/domains/${domain.id}/dns/${recordId}`, {
         method: "DELETE"
       });
       const data = await res.json();
       if (data.success) {
         showToast("success", "DNS 解析记录删除成功！");
-        handleOpenDnsModal(selectedDomain);
+        if (dnsModalOpen && selectedDomain?.id === domain.id) {
+          reloadDnsRecords(domain);
+        }
         fetchDomains();
       } else {
         showToast("error", data.message || "删除解析记录失败");
       }
     } catch (e) {
       showToast("error", "删除解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 勾选 / 取消勾选单条记录（用于批量删除）
+  const toggleDnsSelection = (key: string) => {
+    const next = new Set(selectedDnsKeys);
+    if (next.has(key)) {
+      next.delete(key);
+    } else {
+      next.add(key);
+    }
+    setSelectedDnsKeys(next);
+  };
+
+  // 全选 / 取消全选当前列表
+  const toggleAllDnsSelection = () => {
+    if (selectedDnsKeys.size === dnsRecords.length) {
+      setSelectedDnsKeys(new Set());
+    } else {
+      setSelectedDnsKeys(new Set(dnsRecords.map(dnsRecordKey)));
+    }
+  };
+
+  // 当前勾选的记录（批量修改 / 批量删除共用）
+  const selectedDnsRecords = useMemo(
+    () => dnsRecords.filter((rec) => selectedDnsKeys.has(dnsRecordKey(rec))),
+    [dnsRecords, selectedDnsKeys]
+  );
+
+  // 批量修改的目标记录：勾选的字段用新值，其余字段沿用每条记录的原值
+  const batchEditTargets = useMemo(
+    () =>
+      buildDnsEditTargets(
+        selectedDnsRecords,
+        dnsEditFields,
+        {
+          type: batchEditType,
+          name: batchEditName,
+          content: "",
+          ttl: batchEditTtl,
+          line: batchEditLine,
+          priority: batchEditPriority
+        },
+        selectedDomain?.full_domain || "",
+        batchEditContents
+      ),
+    [
+      selectedDnsRecords,
+      selectedDomain,
+      dnsEditFields,
+      batchEditType,
+      batchEditName,
+      batchEditContents,
+      batchEditTtl,
+      batchEditLine,
+      batchEditPriority
+    ]
+  );
+
+  // 真正需要提交的记录：合并后与原记录完全一致的跳过，不为没变化的记录白跑一次上游
+  const batchEditChanged = useMemo(
+    () => batchEditTargets.filter((t) => !t.unchanged),
+    [batchEditTargets]
+  );
+
+  // 面板里是否需要露出优先级：改成 MX / SRV，或选中的记录里本来就有 MX / SRV
+  const batchEditNeedsPriority = dnsEditFields.type
+    ? needsDnsPriority(batchEditType)
+    : selectedDnsRecords.some((rec) => needsDnsPriority(rec.type));
+
+  // 打开批量修改面板：默认值取第一条选中记录，避免面板一开就是空的
+  const handleOpenDnsEditPanel = () => {
+    const first = selectedDnsRecords[0];
+    if (first) {
+      setBatchEditType(first.type || "A");
+      setBatchEditName(toRelativeRecordName(first.name, selectedDomain?.full_domain || ""));
+      setBatchEditTtl(first.ttl > 0 ? first.ttl : 600);
+      setBatchEditLine(first.line || "");
+      setBatchEditPriority(first.priority !== null && first.priority !== undefined ? first.priority : 10);
+    }
+    // 逐条记录值预填各自原值，用户只改需要改的那几行
+    setBatchEditContents(
+      Object.fromEntries(selectedDnsRecords.map((rec) => [dnsRecordKey(rec), rec.content || ""]))
+    );
+    setDnsEditResults(null);
+    setDnsEditPanelOpen(true);
+  };
+
+  // 批量修改已勾选的解析记录（后端串行提交并逐条回执）
+  const handleBatchUpdateDnsRecords = async () => {
+    if (!selectedDomain || batchEditTargets.length === 0) return;
+
+    const enabled = Object.entries(dnsEditFields).filter(([, on]) => on).map(([k]) => k);
+    if (enabled.length === 0) {
+      showToast("error", "请至少勾选一个要修改的字段");
+      return;
+    }
+    if (batchEditChanged.length === 0) {
+      showToast("info", "选中的记录与当前值一致，没有需要提交的修改");
+      return;
+    }
+    if (batchEditChanged.length > 50) {
+      showToast("error", "单次最多批量修改 50 条解析记录");
+      return;
+    }
+
+    setActionLoading("batch-update-dns");
+    setDnsEditResults(null);
+    try {
+      const res = await apiFetch(`/api/domains/${selectedDomain.id}/dns/batch-update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ records: batchEditChanged })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setDnsEditResults(data.results || []);
+        if (data.fail_count === 0) {
+          showToast("success", `已修改 ${data.success_count} 条解析记录`);
+          setDnsEditPanelOpen(false);
+        } else {
+          showToast(
+            "warning",
+            data.error_code === "ns_management_disabled"
+              ? "DNSHE 上游平台已禁用 NS 管理，NS 记录无法通过 API 修改。请前往 DNSHE 官网后台手动设置。"
+              : `批量修改完成：成功 ${data.success_count} 条，失败 ${data.fail_count} 条（详见下方明细）`
+          );
+        }
+        reloadDnsRecords(selectedDomain);
+        fetchDomains();
+      } else {
+        showToast("error", data.message || "批量修改解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "批量修改解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 批量删除已勾选的解析记录（后端串行删除并逐条回执）
+  const handleBatchDeleteDnsRecords = async () => {
+    if (!selectedDomain || selectedDnsKeys.size === 0) return;
+
+    const targets = selectedDnsRecords.map((rec) => ({
+      record_id: dnsRecordKey(rec),
+      label: `${rec.type} ${rec.name} → ${rec.content}`
+    }));
+
+    if (
+      !confirm(
+        `确定要删除选中的 ${targets.length} 条 DNS 解析记录吗？这会立即影响该域名的解析！\n\n${targets
+          .map((t) => t.label)
+          .join("\n")}`
+      )
+    ) {
+      return;
+    }
+
+    setActionLoading("batch-delete-dns");
+    try {
+      const res = await apiFetch(`/api/domains/${selectedDomain.id}/dns/batch-delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ records: targets })
+      });
+      const data = await res.json();
+      if (data.success) {
+        const failed = (data.results || []).filter((r: { success: boolean }) => !r.success);
+        if (failed.length === 0) {
+          showToast("success", `已删除 ${data.success_count} 条解析记录`);
+        } else {
+          showToast(
+            "error",
+            data.error_code === "ns_management_disabled"
+              ? "DNSHE 上游平台已禁用 NS 管理，NS 记录无法通过 API 删除。请前往 DNSHE 官网后台手动设置。"
+              : `${failed.length} 条删除失败：${failed
+                  .map((f: { label: string; message: string }) => `${f.label}(${f.message})`)
+                  .join("；")}`
+          );
+        }
+        reloadDnsRecords(selectedDomain);
+        fetchDomains();
+      } else {
+        showToast("error", data.message || "批量删除解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "批量删除解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 批量添加输入框的实时解析结果，供按钮显示「已识别 N 条」并复用于提交
+  // NOTE: 主机记录在这里就转成相对名，让预览显示的与真正写进去的完全一致
+  const parsedDnsBatchLines = useMemo(
+    () =>
+      parseDnsBatchInput(dnsBatchInput, {
+        type: dnsBatchType,
+        name: dnsBatchName,
+        ttl: dnsBatchTtl,
+        priority: dnsBatchPriority
+      }).map((r) =>
+        r ? { ...r, name: toRelativeRecordName(r.name, selectedDomain?.full_domain || "") } : null
+      ),
+    [dnsBatchInput, dnsBatchType, dnsBatchName, dnsBatchTtl, dnsBatchPriority, selectedDomain]
+  );
+
+  const validDnsBatchLines = useMemo(
+    () => parsedDnsBatchLines.filter((r): r is ParsedDnsLine => r !== null),
+    [parsedDnsBatchLines]
+  );
+
+  // 批量添加解析记录
+  const handleBatchCreateDnsRecords = async () => {
+    if (!selectedDomain) return;
+
+    if (validDnsBatchLines.length === 0) {
+      showToast("error", "未能解析出任何有效的解析记录，请检查输入格式");
+      return;
+    }
+    if (validDnsBatchLines.length > 50) {
+      showToast("error", "单次最多批量添加 50 条解析记录");
+      return;
+    }
+
+    const records = validDnsBatchLines.map((r) => ({
+      ...r,
+      line: dnsBatchLine.trim() || undefined
+    }));
+
+    setActionLoading("batch-create-dns");
+    setDnsBatchResults(null);
+    try {
+      const res = await apiFetch(`/api/domains/${selectedDomain.id}/dns/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ records })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setDnsBatchResults(data.results || []);
+        if (data.fail_count === 0) {
+          showToast("success", `已添加 ${data.success_count} 条解析记录`);
+          setDnsBatchInput("");
+        } else {
+          showToast(
+            "warning",
+            data.error_code === "ns_management_disabled"
+              ? "DNSHE 上游平台已禁用 NS 管理，NS 记录无法通过 API 添加。请前往 DNSHE 官网后台手动设置。"
+              : `批量添加完成：成功 ${data.success_count} 条，失败 ${data.fail_count} 条（详见下方明细）`
+          );
+        }
+        reloadDnsRecords(selectedDomain);
+        fetchDomains();
+      } else {
+        showToast("error", data.message || "批量添加解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "批量添加解析记录请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -5185,8 +5591,8 @@ export default function App() {
                 </p>
               </div>
               <div className="flex items-center gap-1">
-                <button 
-                  onClick={() => handleOpenDnsModal(selectedDomain, true)}
+                <button
+                  onClick={() => reloadDnsRecords(selectedDomain, true)}
                   disabled={loadingDns}
                   className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded disabled:opacity-50"
                   title="强制刷新（重新从 DNSHE 拉取）"
@@ -5223,14 +5629,9 @@ export default function App() {
                         onChange={(e) => setNewDnsType(e.target.value)}
                         className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
                       >
-                        <option value="A">A (IPv4地址)</option>
-                        <option value="AAAA">AAAA (IPv6地址)</option>
-                        <option value="CNAME">CNAME (别名指向)</option>
-                        <option value="TXT">TXT (文本记录)</option>
-                        <option value="MX">MX (邮件服务器)</option>
-                        <option value="NS">NS (域名服务器)</option>
-                        <option value="CAA">CAA (证书签发限制)</option>
-                        <option value="SRV">SRV (服务定位)</option>
+                        {DNS_TYPE_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
                       </select>
                     </div>
 
@@ -5238,6 +5639,8 @@ export default function App() {
                       <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">主机记录</label>
                       <input
                         type="text"
+                        name="dns-new-name"
+                        autoComplete="off"
                         placeholder="例如 @ 或 www"
                         value={newDnsName}
                         onChange={(e) => setNewDnsName(e.target.value)}
@@ -5249,6 +5652,8 @@ export default function App() {
                       <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">记录值 (Content)</label>
                       <input
                         type="text"
+                        name="dns-new-content"
+                        autoComplete="off"
                         required
                         placeholder="例如 192.168.1.1"
                         value={newDnsContent}
@@ -5261,6 +5666,8 @@ export default function App() {
                       <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">TTL (秒)</label>
                       <input
                         type="number"
+                        name="dns-new-ttl"
+                        autoComplete="off"
                         min={120}
                         max={86400}
                         value={newDnsTtl}
@@ -5269,11 +5676,13 @@ export default function App() {
                       />
                     </div>
 
-                    {(newDnsType === "MX" || newDnsType === "SRV") && (
+                    {needsDnsPriority(newDnsType) && (
                       <div>
                         <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">优先级</label>
                         <input
                           type="number"
+                          name="dns-new-priority"
+                          autoComplete="off"
                           min={0}
                           max={65535}
                           value={newDnsPriority}
@@ -5287,6 +5696,8 @@ export default function App() {
                       <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
                       <input
                         type="text"
+                        name="dns-new-line"
+                        autoComplete="off"
                         placeholder="如 us.ci / cn.mt"
                         value={newDnsLine}
                         onChange={(e) => setNewDnsLine(e.target.value)}
@@ -5308,9 +5719,471 @@ export default function App() {
                 )}
               </div>
 
+              {/* 批量添加解析记录折叠面板 */}
+              <div className="border border-border-base rounded-lg overflow-hidden bg-hovered">
+                <button
+                  onClick={() => setDnsBatchOpen(!dnsBatchOpen)}
+                  className="w-full px-4 py-3 bg-elevated hover:bg-hovered flex justify-between items-center text-sm font-semibold text-content-secondary transition-colors"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4 text-emerald-400" />
+                    {dnsBatchOpen ? "隐藏批量添加面板" : "批量添加解析记录"}
+                  </span>
+                  {!dnsBatchOpen && (
+                    <span className="text-[10px] text-content-muted font-normal">一行一条，缺省字段取下方默认值</span>
+                  )}
+                </button>
+
+                {dnsBatchOpen && (
+                  <div className="p-4 space-y-4 border-t border-border-base">
+                    <p className="text-xs text-content-muted leading-relaxed">
+                      每行一条记录，支持 <span className="font-mono text-indigo-400">记录值</span> /
+                      <span className="font-mono text-indigo-400"> 主机记录 记录值</span> /
+                      <span className="font-mono text-indigo-400"> 类型 主机记录 记录值 [TTL] [优先级]</span>；
+                      字段分隔符优先级为 <span className="font-mono">竖线 &gt; 逗号 &gt; 空格</span>
+                      （TXT 记录值本身含空格时请改用竖线或逗号分隔），<span className="font-mono">#</span> 开头的行会被忽略。
+                      未写明的字段取下方默认值，单次最多 50 条。
+                      主机记录只能是相对名 —— <span className="font-mono text-indigo-400">@</span> 代表
+                      <span className="font-mono"> {selectedDomain.full_domain}</span>，
+                      填完整域名会自动剥成相对名。
+                    </p>
+
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      <div>
+                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认类型</label>
+                        <select
+                          value={dnsBatchType}
+                          onChange={(e) => setDnsBatchType(e.target.value)}
+                          className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
+                        >
+                          {DNS_TYPE_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认主机记录</label>
+                        <input
+                          type="text"
+                          name="dns-batch-name"
+                          autoComplete="off"
+                          placeholder="@ 或 www"
+                          value={dnsBatchName}
+                          onChange={(e) => setDnsBatchName(e.target.value)}
+                          className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认 TTL (秒)</label>
+                        <input
+                          type="number"
+                          name="dns-batch-ttl"
+                          autoComplete="off"
+                          min={120}
+                          max={86400}
+                          value={dnsBatchTtl}
+                          onChange={(e) => setDnsBatchTtl(parseInt(e.target.value, 10) || 600)}
+                          className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
+                        />
+                      </div>
+
+                      {needsDnsPriority(dnsBatchType) && (
+                        <div>
+                          <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认优先级</label>
+                          <input
+                            type="number"
+                            name="dns-batch-priority"
+                            autoComplete="off"
+                            min={0}
+                            max={65535}
+                            value={dnsBatchPriority}
+                            onChange={(e) => setDnsBatchPriority(parseInt(e.target.value, 10) || 0)}
+                            className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
+                          />
+                        </div>
+                      )}
+
+                      <div>
+                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
+                        <input
+                          type="text"
+                          name="dns-batch-line"
+                          autoComplete="off"
+                          placeholder="如 us.ci / cn.mt"
+                          value={dnsBatchLine}
+                          onChange={(e) => setDnsBatchLine(e.target.value)}
+                          className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
+                        />
+                      </div>
+                    </div>
+
+                    <textarea
+                      value={dnsBatchInput}
+                      onChange={(e) => setDnsBatchInput(e.target.value)}
+                      rows={6}
+                      name="dns-batch-input"
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder={"2606:4700:52::5010:e191\n2606:4700:57::527:8a4e\nAAAA ipv6 2606:4700:5a::e095:d9aa\nA www 1.2.3.4 600\nMX @ mail.example.com 600 10"}
+                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-y"
+                    />
+
+                    <button
+                      onClick={handleBatchCreateDnsRecords}
+                      disabled={actionLoading === "batch-create-dns" || validDnsBatchLines.length === 0}
+                      className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                      {actionLoading === "batch-create-dns" ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" /> 正在逐条提交…
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-4 h-4" /> 开始批量添加 (已识别 {validDnsBatchLines.length} 条)
+                        </>
+                      )}
+                    </button>
+
+                    {/* 无法解析的行（缺少记录值）会被跳过，这里明确告知条数，避免静默丢弃 */}
+                    {parsedDnsBatchLines.length > validDnsBatchLines.length && (
+                      <p className="text-xs text-amber-400 flex items-center gap-1.5">
+                        <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                        有 {parsedDnsBatchLines.length - validDnsBatchLines.length} 行无法解析（缺少记录值），提交时会自动跳过
+                      </p>
+                    )}
+
+                    {/* 解析预览：提交前先让用户核对每行被解析成了什么 */}
+                    {validDnsBatchLines.length > 0 && (
+                      <div className="max-h-40 overflow-y-auto pr-1 space-y-1">
+                        {validDnsBatchLines.map((r, idx) => (
+                          <div key={idx} className="text-[11px] font-mono text-content-muted flex items-center gap-2">
+                            <span className="text-indigo-400 font-bold w-12 shrink-0">{r.type}</span>
+                            <span className="w-24 shrink-0 truncate" title={r.name}>{r.name}</span>
+                            <span className="flex-1 truncate text-content-secondary" title={r.content}>{r.content}</span>
+                            <span className="shrink-0">TTL {r.ttl}</span>
+                            {r.priority !== undefined && <span className="shrink-0">优先级 {r.priority}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* 逐条提交结果回执 */}
+                    {dnsBatchResults && dnsBatchResults.length > 0 && (
+                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                        {dnsBatchResults.map((r, idx) => (
+                          <div
+                            key={idx}
+                            className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
+                              r.success
+                                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                                : "bg-red-500/10 border-red-500/30 text-red-300"
+                            }`}
+                          >
+                            <div className="font-mono min-w-0 truncate" title={r.label}>{r.label}</div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                              <span>{r.success ? "成功" : r.message}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
               {/* DNS 记录列表展现 */}
               <div>
-                <h4 className="text-sm font-bold text-content-primary mb-3">当前解析记录列表</h4>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                  <h4 className="text-sm font-bold text-content-primary">
+                    当前解析记录列表
+                    {dnsRecords.length > 0 && (
+                      <span className="ml-2 text-xs text-content-muted font-normal">共 {dnsRecords.length} 条</span>
+                    )}
+                  </h4>
+
+                  {selectedDnsKeys.size > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-content-muted">已选 {selectedDnsKeys.size} 条</span>
+                      <button
+                        onClick={() => setSelectedDnsKeys(new Set())}
+                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-2.5 py-1.5 rounded-lg text-xs font-semibold"
+                      >
+                        取消选择
+                      </button>
+                      <button
+                        onClick={() => (dnsEditPanelOpen ? setDnsEditPanelOpen(false) : handleOpenDnsEditPanel())}
+                        className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
+                          dnsEditPanelOpen
+                            ? "bg-indigo-500/20 border-indigo-500/50 text-indigo-200"
+                            : "bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-300 border-indigo-900/60"
+                        }`}
+                        title="批量修改已勾选记录的指定字段"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                        批量修改 ({selectedDnsKeys.size})
+                      </button>
+                      <button
+                        onClick={handleBatchDeleteDnsRecords}
+                        disabled={actionLoading === "batch-delete-dns"}
+                        className="bg-red-950/60 hover:bg-red-900/60 text-red-300 border border-red-900/60 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                        title="批量删除已勾选的解析记录"
+                      >
+                        {actionLoading === "batch-delete-dns" ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="w-3.5 h-3.5" />
+                        )}
+                        批量删除 ({selectedDnsKeys.size})
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* 批量修改面板：勾选哪个字段就只覆盖那个字段 */}
+                {dnsEditPanelOpen && selectedDnsKeys.size > 0 && (
+                  <div className="mb-3 border border-indigo-900/60 bg-indigo-950/20 rounded-lg p-4 space-y-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <h5 className="text-xs font-bold text-indigo-200 flex items-center gap-1.5">
+                        <Pencil className="w-3.5 h-3.5" />
+                        批量修改 {selectedDnsKeys.size} 条记录
+                      </h5>
+                      <span className="text-[10px] text-content-muted">只有勾选的字段会被覆盖，其余字段保留各自原值</span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {/* 记录类型 */}
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={dnsEditFields.type}
+                          onChange={(e) => setDnsEditFields({ ...dnsEditFields, type: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0"
+                        />
+                        <span className="text-xs text-content-secondary w-20 shrink-0">记录类型</span>
+                        <select
+                          value={batchEditType}
+                          onChange={(e) => setBatchEditType(e.target.value)}
+                          disabled={!dnsEditFields.type}
+                          className="flex-1 form-input px-2 py-1.5 rounded text-xs text-content-secondary disabled:opacity-40"
+                        >
+                          {DNS_TYPE_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                      </label>
+
+                      {/* TTL */}
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={dnsEditFields.ttl}
+                          onChange={(e) => setDnsEditFields({ ...dnsEditFields, ttl: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0"
+                        />
+                        <span className="text-xs text-content-secondary w-20 shrink-0">TTL (秒)</span>
+                        <input
+                          type="number"
+                          name="dns-bulk-ttl"
+                          autoComplete="off"
+                          min={120}
+                          max={86400}
+                          value={batchEditTtl}
+                          onChange={(e) => setBatchEditTtl(parseInt(e.target.value, 10) || 600)}
+                          disabled={!dnsEditFields.ttl}
+                          className="flex-1 form-input px-2 py-1.5 rounded text-xs text-content-secondary disabled:opacity-40"
+                        />
+                      </label>
+
+                      {/* 主机记录 */}
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={dnsEditFields.name}
+                          onChange={(e) => setDnsEditFields({ ...dnsEditFields, name: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0"
+                        />
+                        <span className="text-xs text-content-secondary w-20 shrink-0">主机记录</span>
+                        <input
+                          type="text"
+                          name="dns-bulk-name"
+                          autoComplete="off"
+                          placeholder="@ 或 jp"
+                          title={`只能填相对名：@ 代表 ${selectedDomain.full_domain}`}
+                          value={batchEditName}
+                          onChange={(e) => setBatchEditName(e.target.value)}
+                          disabled={!dnsEditFields.name}
+                          className="flex-1 form-input px-2 py-1.5 rounded text-xs font-mono text-content-secondary disabled:opacity-40"
+                        />
+                      </label>
+
+                      {/* 解析线路 */}
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={dnsEditFields.line}
+                          onChange={(e) => setDnsEditFields({ ...dnsEditFields, line: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0"
+                        />
+                        <span className="text-xs text-content-secondary w-20 shrink-0">解析线路</span>
+                        <input
+                          type="text"
+                          name="dns-bulk-line"
+                          autoComplete="off"
+                          placeholder="留空为默认线路"
+                          value={batchEditLine}
+                          onChange={(e) => setBatchEditLine(e.target.value)}
+                          disabled={!dnsEditFields.line}
+                          className="flex-1 form-input px-2 py-1.5 rounded text-xs text-content-secondary disabled:opacity-40"
+                        />
+                      </label>
+
+                      {/* 记录值：只在这里开关，具体新值在下方逐条编辑 */}
+                      <label className="flex items-center gap-2 md:col-span-2">
+                        <input
+                          type="checkbox"
+                          checked={dnsEditFields.content}
+                          onChange={(e) => setDnsEditFields({ ...dnsEditFields, content: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0"
+                        />
+                        <span className="text-xs text-content-secondary w-20 shrink-0">记录值</span>
+                        <span className="text-[11px] text-content-muted">
+                          {dnsEditFields.content
+                            ? "在下方逐条编辑各自的新记录值，不改的行保持原值"
+                            : "勾选后可在下方逐条编辑记录值"}
+                        </span>
+                      </label>
+
+                      {/* 优先级：仅在改成 MX / SRV 或选中记录含 MX / SRV 时出现 */}
+                      {batchEditNeedsPriority && (
+                        <label className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={dnsEditFields.priority}
+                            onChange={(e) => setDnsEditFields({ ...dnsEditFields, priority: e.target.checked })}
+                            className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0"
+                          />
+                          <span className="text-xs text-content-secondary w-20 shrink-0">优先级</span>
+                          <input
+                            type="number"
+                            name="dns-bulk-priority"
+                            autoComplete="off"
+                            min={0}
+                            max={65535}
+                            value={batchEditPriority}
+                            onChange={(e) => setBatchEditPriority(parseInt(e.target.value, 10) || 0)}
+                            disabled={!dnsEditFields.priority}
+                            className="flex-1 form-input px-2 py-1.5 rounded text-xs text-content-secondary disabled:opacity-40"
+                          />
+                        </label>
+                      )}
+                    </div>
+
+                    {/* 记录值逐条编辑时，提示重复值会造成重复记录（上游通常直接拒绝） */}
+                    {dnsEditFields.content && (() => {
+                      const values = batchEditTargets.map((t) => `${t.type}|${t.name}|${t.content}`);
+                      const dupCount = values.length - new Set(values).size;
+                      return dupCount > 0 ? (
+                        <p className="text-xs text-amber-400 flex items-center gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          有 {dupCount} 条记录的「类型 + 主机记录 + 记录值」与其它行重复，上游可能拒绝写入
+                        </p>
+                      ) : null;
+                    })()}
+
+                    {/* 变更预览：逐条显示「原记录 → 改后」；勾了记录值时该列可就地编辑 */}
+                    <div className="max-h-56 overflow-y-auto pr-1 space-y-1">
+                      {batchEditTargets.map((t) => (
+                        <div
+                          key={t.record_id}
+                          className={`text-[11px] font-mono flex items-center gap-2 rounded px-1 py-0.5 ${
+                            t.unchanged ? "opacity-45" : ""
+                          }`}
+                          title={t.unchanged ? "与原记录一致，提交时会跳过" : undefined}
+                        >
+                          <span className="text-content-muted flex-1 truncate" title={t.label}>{t.label}</span>
+                          <ChevronRight className="w-3 h-3 text-content-muted shrink-0" />
+                          <span className="text-indigo-400 shrink-0">{t.type}</span>
+                          <span className="text-content-secondary shrink-0 max-w-[7rem] truncate" title={t.name}>{t.name}</span>
+                          {dnsEditFields.content ? (
+                            <input
+                              type="text"
+                              name={`dns-bulk-content-${t.record_id}`}
+                              autoComplete="off"
+                              value={batchEditContents[t.record_id] ?? ""}
+                              onChange={(e) =>
+                                setBatchEditContents({ ...batchEditContents, [t.record_id]: e.target.value })
+                              }
+                              placeholder={t.origin_content}
+                              title="留空则保持原记录值"
+                              className="flex-1 min-w-0 form-input px-2 py-1 rounded text-[11px] font-mono text-content-secondary"
+                            />
+                          ) : (
+                            <span className="text-content-secondary flex-1 truncate" title={t.content}>{t.content}</span>
+                          )}
+                          <span className="text-content-muted shrink-0">TTL {t.ttl}</span>
+                          {t.priority !== undefined && <span className="text-content-muted shrink-0">优先级 {t.priority}</span>}
+                          <span className="text-content-muted shrink-0">{t.line || "默认线路"}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleBatchUpdateDnsRecords}
+                        disabled={actionLoading === "batch-update-dns" || batchEditChanged.length === 0}
+                        className="flex-1 btn-primary py-2 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                      >
+                        {actionLoading === "batch-update-dns" ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 animate-spin" /> 正在逐条提交…
+                          </>
+                        ) : (
+                          <>
+                            <Save className="w-4 h-4" />
+                            {batchEditChanged.length === 0
+                              ? "没有需要提交的修改"
+                              : `应用到 ${batchEditChanged.length} 条记录${
+                                  batchEditChanged.length < batchEditTargets.length
+                                    ? `（跳过 ${batchEditTargets.length - batchEditChanged.length} 条无变化）`
+                                    : ""
+                                }`}
+                          </>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => setDnsEditPanelOpen(false)}
+                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold"
+                      >
+                        取消
+                      </button>
+                    </div>
+
+                    {/* 逐条提交结果回执 */}
+                    {dnsEditResults && dnsEditResults.length > 0 && (
+                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                        {dnsEditResults.map((r, idx) => (
+                          <div
+                            key={idx}
+                            className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
+                              r.success
+                                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                                : "bg-red-500/10 border-red-500/30 text-red-300"
+                            }`}
+                          >
+                            <div className="font-mono min-w-0 truncate" title={r.label}>{r.label}</div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                              <span>{r.success ? "成功" : r.message}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {loadingDns ? (
                   <div className="flex justify-center py-10">
@@ -5326,37 +6199,178 @@ export default function App() {
                       <table className="w-full text-left text-sm border-collapse">
                         <thead>
                           <tr className="bg-elevated text-content-muted text-[10px] uppercase font-bold tracking-wider border-b border-border-base">
+                            <th className="p-3 w-10">
+                              <input
+                                type="checkbox"
+                                checked={dnsRecords.length > 0 && selectedDnsKeys.size === dnsRecords.length}
+                                onChange={toggleAllDnsSelection}
+                                className="w-4 h-4 accent-indigo-500 cursor-pointer align-middle"
+                                title="全选 / 取消全选"
+                              />
+                            </th>
                             <th className="p-3">类型</th>
                             <th className="p-3">主机记录</th>
                             <th className="p-3">解析记录值</th>
                             <th className="p-3 w-20">TTL</th>
                             <th className="p-3 w-24">线路</th>
-                            <th className="p-3 w-16 text-center">操作</th>
+                            <th className="p-3 w-20 text-center">操作</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-border-soft text-content-secondary">
-                          {dnsRecords.map((rec) => (
-                            <tr key={rec.id} className="hover:bg-hovered">
-                              <td className="p-3 font-bold text-xs text-indigo-400">{rec.type}</td>
-                              <td className="p-3 font-mono text-xs">{rec.name}</td>
-                              <td className="p-3 font-mono text-xs break-all max-w-xs" title={rec.content}>
-                                {rec.priority !== null && rec.priority !== undefined && `[优先级: ${rec.priority}] `}
-                                {rec.content}
-                              </td>
-                              <td className="p-3 text-xs text-content-muted">{rec.ttl}</td>
-                              <td className="p-3 text-xs text-content-muted">{rec.line || "默认"}</td>
-                              <td className="p-3 text-center">
-                                <button
-                                  onClick={() => handleDeleteDnsRecord(rec.id ?? rec.record_id!)}
-                                  disabled={actionLoading === `delete-dns-${rec.id ?? rec.record_id}`}
-                                  className="text-red-400 hover:text-red-300 disabled:opacity-50 p-1 hover:bg-red-950/40 rounded transition-all"
-                                  title="删除此记录"
-                                >
-                                  <Trash2 className="w-4 h-4" />
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
+                          {dnsRecords.map((rec) => {
+                            const key = dnsRecordKey(rec);
+                            const isEditing = editingDnsKey === key;
+
+                            // 行内编辑态：整行换成输入控件，保存 / 取消就地完成
+                            if (isEditing) {
+                              return (
+                                <tr key={key} className="bg-indigo-500/5">
+                                  <td className="p-3" />
+                                  <td className="p-2">
+                                    <select
+                                      value={editDnsType}
+                                      onChange={(e) => setEditDnsType(e.target.value)}
+                                      className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+                                    >
+                                      {DNS_TYPE_OPTIONS.map((opt) => (
+                                        <option key={opt.value} value={opt.value}>{opt.value}</option>
+                                      ))}
+                                    </select>
+                                  </td>
+                                  <td className="p-2">
+                                    <input
+                                      type="text"
+                                      name="dns-edit-name"
+                                      autoComplete="off"
+                                      value={editDnsName}
+                                      onChange={(e) => setEditDnsName(e.target.value)}
+                                      onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+                                      placeholder="@ 或 jp"
+                                      title={`只能填相对名：@ 代表 ${selectedDomain.full_domain}，jp 代表 jp.${selectedDomain.full_domain}`}
+                                      autoFocus
+                                      className="w-full form-input px-2 py-1.5 rounded text-xs font-mono text-content-secondary"
+                                    />
+                                  </td>
+                                  <td className="p-2">
+                                    <div className="flex items-center gap-1.5">
+                                      <input
+                                        type="text"
+                                        name="dns-edit-content"
+                                        autoComplete="off"
+                                        value={editDnsContent}
+                                        onChange={(e) => setEditDnsContent(e.target.value)}
+                                        onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+                                        placeholder="记录值"
+                                        className="flex-1 form-input px-2 py-1.5 rounded text-xs font-mono text-content-secondary"
+                                      />
+                                      {needsDnsPriority(editDnsType) && (
+                                        <input
+                                          type="number"
+                                          name="dns-edit-priority"
+                                          autoComplete="off"
+                                          min={0}
+                                          max={65535}
+                                          value={editDnsPriority}
+                                          onChange={(e) => setEditDnsPriority(parseInt(e.target.value, 10) || 0)}
+                                          onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+                                          title="优先级"
+                                          className="w-16 form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+                                        />
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="p-2">
+                                    <input
+                                      type="number"
+                                      name="dns-edit-ttl"
+                                      autoComplete="off"
+                                      min={120}
+                                      max={86400}
+                                      value={editDnsTtl}
+                                      onChange={(e) => setEditDnsTtl(parseInt(e.target.value, 10) || 600)}
+                                      onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+                                      className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+                                    />
+                                  </td>
+                                  <td className="p-2">
+                                    <input
+                                      type="text"
+                                      name="dns-edit-line"
+                                      autoComplete="off"
+                                      value={editDnsLine}
+                                      onChange={(e) => setEditDnsLine(e.target.value)}
+                                      onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+                                      placeholder="默认"
+                                      className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+                                    />
+                                  </td>
+                                  <td className="p-2">
+                                    <div className="flex items-center justify-center gap-1">
+                                      <button
+                                        onClick={() => handleUpdateDnsRecord(key)}
+                                        disabled={actionLoading === `update-dns-${key}`}
+                                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 p-1 hover:bg-emerald-950/40 rounded transition-all"
+                                        title="保存修改（回车）"
+                                      >
+                                        {actionLoading === `update-dns-${key}` ? (
+                                          <RefreshCw className="w-4 h-4 animate-spin" />
+                                        ) : (
+                                          <Save className="w-4 h-4" />
+                                        )}
+                                      </button>
+                                      <button
+                                        onClick={() => setEditingDnsKey(null)}
+                                        className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded transition-all"
+                                        title="取消（Esc）"
+                                      >
+                                        <X className="w-4 h-4" />
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            }
+
+                            return (
+                              <tr key={key} className="hover:bg-hovered">
+                                <td className="p-3">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedDnsKeys.has(key)}
+                                    onChange={() => toggleDnsSelection(key)}
+                                    className="w-4 h-4 accent-indigo-500 cursor-pointer align-middle"
+                                  />
+                                </td>
+                                <td className="p-3 font-bold text-xs text-indigo-400">{rec.type}</td>
+                                <td className="p-3 font-mono text-xs">{rec.name}</td>
+                                <td className="p-3 font-mono text-xs break-all max-w-xs" title={rec.content}>
+                                  {rec.priority !== null && rec.priority !== undefined && `[优先级: ${rec.priority}] `}
+                                  {rec.content}
+                                </td>
+                                <td className="p-3 text-xs text-content-muted">{rec.ttl}</td>
+                                <td className="p-3 text-xs text-content-muted">{rec.line || "默认"}</td>
+                                <td className="p-3">
+                                  <div className="flex items-center justify-center gap-1">
+                                    <button
+                                      onClick={() => handleStartEditDnsRecord(rec)}
+                                      className="text-indigo-400 hover:text-indigo-300 p-1 hover:bg-indigo-950/40 rounded transition-all"
+                                      title="修改此记录"
+                                    >
+                                      <Pencil className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      onClick={() => handleDeleteDnsRecord(key)}
+                                      disabled={actionLoading === `delete-dns-${key}`}
+                                      className="text-red-400 hover:text-red-300 disabled:opacity-50 p-1 hover:bg-red-950/40 rounded transition-all"
+                                      title="删除此记录"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -5564,7 +6578,7 @@ export default function App() {
                         <span className="text-content-secondary">{rec.content}</span>
                         <button
                           onClick={async () => {
-                            await handleDeleteDnsRecord(rec.id ?? rec.record_id!);
+                            await handleDeleteDnsRecord(rec.id ?? rec.record_id!, nsModalDomain);
                             handleOpenNsModal(nsModalDomain);
                             handleSyncDomains();
                           }}

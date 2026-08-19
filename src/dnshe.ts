@@ -281,9 +281,19 @@ export class DNSHEClient {
 
   /**
    * 修改 DNS 解析记录
+   *
+   * NOTE: 与删除接口一致 —— 记录标识为纯数字时同时以内部 id 和 record_id 两种
+   * 形式下发，兼容上游对两种字段的不同要求。
    */
   async updateDnsRecord(params: UpdateDnsRecordParams): Promise<ActionResponse> {
-    return this.request<ActionResponse>("dns_records", "update", "POST", params as unknown as Record<string, unknown>);
+    const payload: Record<string, unknown> = { ...params };
+    const numId = Number(params.record_id);
+    if (!isNaN(numId) && numId > 0) {
+      payload.id = numId;
+    }
+    payload.record_id = String(params.record_id);
+
+    return this.request<ActionResponse>("dns_records", "update", "POST", payload);
   }
 
   /**

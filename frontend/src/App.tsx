@@ -155,6 +155,44 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
     () => localStorage.getItem("DNSHE_SIDEBAR_COLLAPSED") === "1"
   );
+
+  // 手机端侧栏抽屉开关（仅 <md 生效；≥md 侧栏常驻，这个状态用不上）
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  /**
+   * 是否处于 md 及以上宽度 —— 手机抽屉与桌面常驻侧栏的分界
+   *
+   * NOTE: 断点值必须与 Tailwind 的 md (768px) 保持一致：同一个 <aside> 既要在
+   * ≥md 作为常驻侧栏参与布局流，又要在 <md 作为 fixed 抽屉，而"折叠成图标条"
+   * 这件事只在桌面有意义 —— 折叠态是持久化的，若不区分宽度，从桌面带过来的
+   * sidebarCollapsed=1 会让手机抽屉也只剩图标，没有文字标签。
+   */
+  const [isDesktop, setIsDesktop] = useState<boolean>(
+    () => window.matchMedia("(min-width: 768px)").matches
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 768px)");
+    const onChange = (e: MediaQueryListEvent) => {
+      setIsDesktop(e.matches);
+      // 升到桌面宽度时顺手关掉抽屉，避免旋转屏幕后遗留一个打开状态
+      if (e.matches) setSidebarOpen(false);
+    };
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  // 图标条模式：只有桌面 + 已折叠时才成立
+  const railMode = isDesktop && sidebarCollapsed;
+
+  // 抽屉打开时支持 Esc 关闭
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sidebarOpen]);
   // 顶部全局搜索词与通知下拉开关
   const [globalSearch, setGlobalSearch] = useState("");
   const [notifOpen, setNotifOpen] = useState(false);
@@ -988,7 +1026,9 @@ export default function App() {
         <div className="flex items-center justify-between gap-2">
           <button
             onClick={handleCopyDomain}
-            className="font-mono text-base font-bold text-content-primary tracking-wide truncate hover:text-indigo-400 transition-colors cursor-pointer text-left"
+            /* 手机上小一号字号，让常见长度的域名不必省略；超长域名仍截断，
+               但 title 与「点击复制」拿到的都是完整域名 */
+            className="font-mono text-sm sm:text-base font-bold text-content-primary tracking-wide truncate min-w-0 hover:text-indigo-400 transition-colors cursor-pointer text-left"
             title={`点击复制：${dom.full_domain}`}
           >
             {unicodeDomain}
@@ -2143,6 +2183,148 @@ export default function App() {
     }
   };
 
+  /**
+   * 单条解析记录在「桌面表格行」与「手机卡片」两种布局下共用的字段节点
+   *
+   * NOTE: 表格行必须待在 <tbody> 里、卡片必须在表格外，两种布局无法共用一次 map；
+   * 但这 6 个受控输入的定义只写这一份 —— 复制两套的话，日后改一处漏一处，
+   * 行内编辑很快就会在其中一种宽度下失灵。
+   */
+  const dnsRowParts = (rec: DnsRecord) => {
+    const key = dnsRecordKey(rec);
+    const isEditing = editingDnsKey === key;
+    const saving = actionLoading === `update-dns-${key}`;
+
+    return {
+      key,
+      isEditing,
+      // ── 勾选（批量操作用）──
+      checkbox: (
+        <input
+          type="checkbox"
+          checked={selectedDnsKeys.has(key)}
+          onChange={() => toggleDnsSelection(key)}
+          className="w-4 h-4 accent-indigo-500 cursor-pointer align-middle"
+        />
+      ),
+      // ── 编辑态控件 ──
+      typeSelect: (
+        <select
+          value={editDnsType}
+          onChange={(e) => setEditDnsType(e.target.value)}
+          className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+        >
+          {DNS_TYPE_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.value}</option>
+          ))}
+        </select>
+      ),
+      nameInput: (
+        <input
+          type="text"
+          name="dns-edit-name"
+          autoComplete="off"
+          value={editDnsName}
+          onChange={(e) => setEditDnsName(e.target.value)}
+          onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+          placeholder="@ 或 jp"
+          title={`只能填相对名：@ 代表 ${selectedDomain?.full_domain ?? ""}，jp 代表 jp.${selectedDomain?.full_domain ?? ""}`}
+          className="w-full form-input px-2 py-1.5 rounded text-xs font-mono text-content-secondary"
+        />
+      ),
+      contentInput: (
+        <input
+          type="text"
+          name="dns-edit-content"
+          autoComplete="off"
+          value={editDnsContent}
+          onChange={(e) => setEditDnsContent(e.target.value)}
+          onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+          placeholder="记录值"
+          className="flex-1 min-w-0 form-input px-2 py-1.5 rounded text-xs font-mono text-content-secondary"
+        />
+      ),
+      priorityInput: needsDnsPriority(editDnsType) ? (
+        <input
+          type="number"
+          name="dns-edit-priority"
+          autoComplete="off"
+          min={0}
+          max={65535}
+          value={editDnsPriority}
+          onChange={(e) => setEditDnsPriority(parseInt(e.target.value, 10) || 0)}
+          onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+          title="优先级"
+          className="w-16 form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+        />
+      ) : null,
+      ttlInput: (
+        <input
+          type="number"
+          name="dns-edit-ttl"
+          autoComplete="off"
+          min={120}
+          max={86400}
+          value={editDnsTtl}
+          onChange={(e) => setEditDnsTtl(parseInt(e.target.value, 10) || 600)}
+          onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+          className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+        />
+      ),
+      lineInput: (
+        <input
+          type="text"
+          name="dns-edit-line"
+          autoComplete="off"
+          value={editDnsLine}
+          onChange={(e) => setEditDnsLine(e.target.value)}
+          onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
+          placeholder="默认"
+          className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
+        />
+      ),
+      saveButton: (
+        <button
+          onClick={() => handleUpdateDnsRecord(key)}
+          disabled={saving}
+          className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 p-2 md:p-1 hover:bg-emerald-950/40 rounded transition-all"
+          title="保存修改（回车）"
+        >
+          {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+        </button>
+      ),
+      cancelButton: (
+        <button
+          onClick={() => setEditingDnsKey(null)}
+          className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded transition-all"
+          title="取消（Esc）"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      ),
+      // ── 展示态操作 ──
+      editButton: (
+        <button
+          onClick={() => handleStartEditDnsRecord(rec)}
+          className="text-indigo-400 hover:text-indigo-300 p-2 md:p-1 hover:bg-indigo-950/40 rounded transition-all"
+          title="修改此记录"
+        >
+          <Pencil className="w-4 h-4" />
+        </button>
+      ),
+      deleteButton: (
+        <button
+          onClick={() => handleDeleteDnsRecord(key)}
+          disabled={actionLoading === `delete-dns-${key}`}
+          className="text-red-400 hover:text-red-300 disabled:opacity-50 p-2 md:p-1 hover:bg-red-950/40 rounded transition-all"
+          title="删除此记录"
+        >
+          <Trash2 className="w-4 h-4" />
+        </button>
+      ),
+    };
+  };
+
   // 删除 DNS 记录
   // NOTE: domain 显式传入 —— NS 弹窗里删除 NS 记录时打开的是 nsModalDomain，
   // 与 DNS 弹窗的 selectedDomain 不一定是同一个域名（甚至可能为 null）。
@@ -3166,6 +3348,31 @@ export default function App() {
     return logs.filter((l) => allowed.includes(l.category));
   }, [logs, logCategory]);
 
+  /**
+   * 单条日志在「表格行」与「手机卡片」两种布局下共用的字段节点
+   *
+   * NOTE: 表格行必须待在 <tbody> 里、卡片必须在表格外，两者无法共用一次 map，
+   * 但字段的格式化与样式只写这一份 —— 否则两套布局早晚各自走形。
+   */
+  const logRowParts = (log: AppLog) => ({
+    time: new Date(log.created_at).toLocaleString("zh-CN"),
+    badge: (
+      <span className={`inline-block px-2.5 py-0.5 rounded-full font-bold uppercase text-xs flex-shrink-0 ${
+        log.type === "success" ? "bg-emerald-950 text-emerald-400" :
+        log.type === "error" ? "bg-red-950 text-red-400 animate-pulse" :
+        log.type === "warning" ? "bg-amber-950 text-amber-400" :
+        "bg-elevated text-content-secondary"
+      }`}>
+        {log.type}
+      </span>
+    ),
+    details: log.details ? (
+      <pre className="mt-2 p-2.5 rounded bg-elevated text-content-muted text-[11px] md:text-xs font-mono max-h-40 overflow-auto whitespace-pre-wrap break-all">
+        {log.details}
+      </pre>
+    ) : null,
+  });
+
   // Dashboard 概览统计（纯前端计算）
   const dashboardStats = useMemo(() => {
     const now = Date.now();
@@ -3344,27 +3551,60 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden bg-base text-content-primary">
+    /*
+      NOTE: 高度用 100dvh 而非 100vh —— 移动浏览器的 100vh 把地址栏高度也算进去，
+      底部内容会被切掉一截。桌面上 dvh 与 vh 等价，渲染结果不变。
+    */
+    <div className="flex h-[100dvh] overflow-hidden bg-base text-content-primary">
 
-      {/* ===== 左侧可折叠菜单 ===== */}
+      {/* 手机抽屉遮罩：点击关闭；≥md 侧栏常驻，不需要遮罩 */}
+      {sidebarOpen && (
+        <div
+          onClick={() => setSidebarOpen(false)}
+          className="fixed inset-0 z-30 bg-slate-950/60 backdrop-blur-sm md:hidden"
+          aria-hidden="true"
+        />
+      )}
+
+      {/* ===== 左侧菜单：<md 为抽屉，≥md 为常驻可折叠侧栏 ===== */}
+      {/*
+        NOTE: 同一个 aside 兼任两种形态，导航项只写一份。
+        <md：fixed 定位 + translate-x 滑入滑出，不占布局流（否则会吃掉 224px 中的一半屏宽）；
+        ≥md：md:static 归位到布局流，宽度由 railMode 决定，与改造前完全一致。
+        根容器是 h-[100dvh] overflow-hidden、页面本身不滚动（滚动在 main 内部），
+        且抽屉是 fixed，所以不需要额外锁 body 滚动。
+      */}
       <aside
-        className={`${sidebarCollapsed ? "w-16" : "w-56"} flex-shrink-0 flex flex-col border-r border-border-base bg-surface transition-all duration-300`}
+        className={`fixed inset-y-0 left-0 z-40 w-64 flex flex-col border-r border-border-base bg-surface transition-transform duration-300 ${
+          sidebarOpen ? "translate-x-0" : "-translate-x-full"
+        } md:static md:z-auto md:translate-x-0 md:flex-shrink-0 md:transition-all ${
+          railMode ? "md:w-16" : "md:w-56"
+        }`}
       >
         {/* LOGO + 折叠按钮 */}
         <div className="h-16 flex items-center gap-2 px-3 border-b border-border-base">
+          {/* 折叠切换只在桌面有意义：手机上这个按钮所在的抽屉本身就是被汉堡唤出的 */}
           <button
             onClick={() => setSidebarCollapsed((v) => !v)}
-            className="p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0"
-            title={sidebarCollapsed ? "展开菜单" : "折叠菜单"}
+            className="hidden md:flex p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0"
+            title={railMode ? "展开菜单" : "折叠菜单"}
           >
             <Menu className="w-5 h-5" />
           </button>
-          {!sidebarCollapsed && (
+          {!railMode && (
             <div className="flex items-center gap-1.5 font-black text-content-primary whitespace-nowrap overflow-hidden">
               <Globe className="w-5 h-5 text-indigo-500 flex-shrink-0" />
               <span className="truncate">DNSHE 集控</span>
             </div>
           )}
+          {/* 抽屉关闭按钮（仅手机） */}
+          <button
+            onClick={() => setSidebarOpen(false)}
+            className="md:hidden ml-auto p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all"
+            title="关闭菜单"
+          >
+            <X className="w-5 h-5" />
+          </button>
         </div>
 
         {/* 菜单项 */}
@@ -3372,16 +3612,20 @@ export default function App() {
           {navItems.map((item) => (
             <button
               key={item.key}
-              onClick={() => setActiveTab(item.key)}
-              title={sidebarCollapsed ? item.label : undefined}
-              className={`group w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all ${
+              onClick={() => {
+                setActiveTab(item.key);
+                // 手机上选完就收起抽屉，否则内容被遮住还得再点一次
+                setSidebarOpen(false);
+              }}
+              title={railMode ? item.label : undefined}
+              className={`group w-full flex items-center gap-3 px-3 py-3 md:py-2.5 rounded-lg text-sm font-semibold transition-all ${
                 activeTab === item.key
                   ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20"
                   : "text-content-muted hover:text-content-primary hover:bg-hovered"
-              } ${sidebarCollapsed ? "justify-center" : ""}`}
+              } ${railMode ? "justify-center" : ""}`}
             >
               <span className="flex-shrink-0">{item.icon}</span>
-              {!sidebarCollapsed && (
+              {!railMode && (
                 <>
                   <span className="flex-1 text-left whitespace-nowrap">{item.label}</span>
                   {item.badge !== undefined && item.badge > 0 && (
@@ -3394,15 +3638,36 @@ export default function App() {
             </button>
           ))}
         </nav>
+
+        {/* 抽屉底部退出入口（仅手机）：头部横向空间紧张，退出按钮挪到这里 */}
+        <div className="md:hidden border-t border-border-base p-2">
+          <button
+            onClick={handleLogout}
+            className="w-full flex items-center gap-3 px-3 py-3 rounded-lg text-sm font-semibold text-content-secondary hover:text-content-primary hover:bg-hovered transition-all"
+          >
+            <LogIn className="w-5 h-5 text-amber-400 flex-shrink-0" />
+            退出登录
+          </button>
+        </div>
       </aside>
 
       {/* ===== 右侧主区（顶部栏 + 内容） ===== */}
       <div className="flex-1 flex flex-col overflow-hidden">
 
         {/* ===== 顶部栏 ===== */}
-        <header className="h-16 flex-shrink-0 flex items-center gap-3 px-4 md:px-6 border-b border-border-base bg-surface">
+        <header className="h-16 flex-shrink-0 flex items-center gap-2 sm:gap-3 px-3 sm:px-4 md:px-6 border-b border-border-base bg-surface">
+          {/* 汉堡按钮：唤出手机抽屉（≥md 侧栏常驻，折叠切换在侧栏内部） */}
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="md:hidden p-2 -ml-1 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0"
+            title="打开菜单"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
+
           {/* 全局搜索框 */}
-          <div className="flex-1 max-w-md relative">
+          {/* NOTE: min-w-0 是必需的 —— flex 子项默认 min-width:auto，没有它 flex-1 不会真的收缩 */}
+          <div className="flex-1 min-w-0 max-w-md relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-content-muted pointer-events-none" />
             {/*
               NOTE: type="search" + autoComplete="off" 是为了挡住 Chrome 密码管理器。
@@ -3424,14 +3689,15 @@ export default function App() {
             />
           </div>
 
-          <div className="flex-1" />
+          {/* 把右侧按钮推到最右；手机上让搜索框吃掉这部分空间 */}
+          <div className="hidden sm:block flex-1" />
 
           {/* 域名页快捷同步 */}
           {activeTab === "domains" && (
             <button
               onClick={handleSyncDomains}
               disabled={actionLoading === "sync" || loadingDomains}
-              className="btn-primary px-3.5 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="btn-primary px-2.5 sm:px-3.5 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
             >
               <RefreshCw className={`w-4 h-4 ${actionLoading === "sync" ? "animate-spin" : ""}`} />
               <span className="hidden sm:inline">同步所有账号</span>
@@ -3439,7 +3705,7 @@ export default function App() {
           )}
 
           {/* 通知铃铛 */}
-          <div className="relative">
+          <div className="relative flex-shrink-0">
             <button
               onClick={() => {
                 const next = !notifOpen;
@@ -3455,7 +3721,8 @@ export default function App() {
               )}
             </button>
             {notifOpen && (
-              <div className="absolute right-0 mt-2 w-80 max-h-96 overflow-y-auto bg-elevated border border-border-base rounded-xl shadow-2xl z-50 p-2">
+              /* NOTE: w-80 在 390px 屏上会顶出右边界，窄屏改用视口宽度减去两侧留白 */
+              <div className="absolute right-0 mt-2 w-[calc(100vw-1.5rem)] sm:w-80 max-h-96 overflow-y-auto bg-elevated border border-border-base rounded-xl shadow-2xl z-50 p-2">
                 <div className="px-2 py-1.5 text-xs font-bold text-content-muted flex items-center justify-between">
                   <span>最近告警</span>
                   <button
@@ -3484,16 +3751,16 @@ export default function App() {
           {/* 主题切换 */}
           <button
             onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-            className="p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all"
+            className="p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0"
             title={theme === "dark" ? "切换到亮色" : "切换到暗色"}
           >
             {theme === "dark" ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
           </button>
 
-          {/* 退出登录 */}
+          {/* 退出登录：手机上头部空间紧张，入口挪进抽屉底部 */}
           <button
             onClick={handleLogout}
-            className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-all"
+            className="hidden md:flex bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-sm font-semibold items-center gap-2 transition-all flex-shrink-0"
             title="退出登录"
           >
             <LogIn className="w-4 h-4 text-amber-400" />
@@ -3502,7 +3769,7 @@ export default function App() {
         </header>
 
         {/* 主面板内容 */}
-        <main className="flex-1 overflow-y-auto px-4 md:px-6 py-6">
+        <main className="flex-1 overflow-y-auto px-3 sm:px-4 md:px-6 py-5 md:py-6">
 
         {/* Tab 0: Dashboard 概览 */}
         {activeTab === "dashboard" && (
@@ -3515,7 +3782,7 @@ export default function App() {
             </div>
 
             {/* 顶部统计卡片 */}
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
               {[
                 { label: "总域名", value: dashboardStats.total, icon: <Globe className="w-5 h-5" />, color: "text-indigo-400", tab: "domains" as TabKey },
                 { label: "活跃域名", value: dashboardStats.active, icon: <CheckCircle2 className="w-5 h-5" />, color: "text-emerald-400", tab: "domains" as TabKey },
@@ -3525,20 +3792,20 @@ export default function App() {
                 <button
                   key={card.label}
                   onClick={() => setActiveTab(card.tab)}
-                  className="glass-card rounded-2xl p-5 text-left flex flex-col gap-3 group"
+                  className="glass-card rounded-2xl p-4 sm:p-5 text-left flex flex-col gap-2 sm:gap-3 group"
                 >
-                  <div className={`flex items-center gap-2 ${card.color}`}>
-                    {card.icon}
-                    <span className="text-xs font-semibold text-content-muted uppercase tracking-wide">{card.label}</span>
+                  <div className={`flex items-center gap-2 min-w-0 ${card.color}`}>
+                    <span className="flex-shrink-0">{card.icon}</span>
+                    <span className="text-[11px] sm:text-xs font-semibold text-content-muted uppercase tracking-wide truncate">{card.label}</span>
                   </div>
-                  <div className="text-3xl font-black text-content-primary">{card.value}</div>
+                  <div className="text-2xl sm:text-3xl font-black text-content-primary">{card.value}</div>
                 </button>
               ))}
             </div>
 
             {/* 中间：最近注册 */}
             <div className="bg-surface border border-border-base rounded-2xl overflow-hidden">
-              <div className="px-5 py-3.5 border-b border-border-base flex items-center gap-2">
+              <div className="px-4 sm:px-5 py-3.5 border-b border-border-base flex items-center gap-2">
                 <Activity className="w-4 h-4 text-indigo-400" />
                 <h3 className="font-bold text-content-primary text-sm">最近注册</h3>
               </div>
@@ -3547,9 +3814,11 @@ export default function App() {
                   <div className="px-5 py-10 text-center text-content-muted text-sm">暂无数据</div>
                 ) : (
                   dashboardStats.recent.map((d) => (
-                    <div key={d.id} className="px-5 py-3 flex items-center justify-between hover:bg-hovered transition-colors">
-                      <span className="font-mono text-sm text-content-primary">{d.full_domain}</span>
-                      <span className="text-xs text-content-muted">{d.account_alias}</span>
+                    /* NOTE: 手机上域名与账号别名各占一行 —— 挤在一行里两者都会被截断，
+                       而这两个信息都要看（长别名在 390px 下会丢掉一半） */
+                    <div key={d.id} className="px-4 sm:px-5 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-0.5 sm:gap-2 hover:bg-hovered transition-colors">
+                      <span className="font-mono text-xs sm:text-sm text-content-primary truncate min-w-0">{d.full_domain}</span>
+                      <span className="text-[11px] sm:text-xs text-content-muted truncate min-w-0 sm:flex-shrink-0 sm:max-w-[35%]">{d.account_alias}</span>
                     </div>
                   ))
                 )}
@@ -3563,7 +3832,7 @@ export default function App() {
           <div className="space-y-6 max-w-5xl mx-auto">
             
             {/* 模式选择导航 */}
-            <div className="flex bg-surface p-1.5 rounded-2xl border border-border-base gap-2">
+            <div className="flex flex-col sm:flex-row bg-surface p-1.5 rounded-2xl border border-border-base gap-2">
               <button
                 onClick={() => setRegMode("single")}
                 className={`flex-1 py-3 text-sm font-bold rounded-xl transition-all flex items-center justify-center gap-2 ${
@@ -3656,18 +3925,18 @@ export default function App() {
                   <div>
                     {!whoisResult.registered ? (
                       /* 未注册：绿色可注册卡片 */
-                      <div className="bg-surface border border-emerald-500/30 rounded-2xl p-6 shadow-xl space-y-4">
-                        <div className="flex items-center justify-between border-b border-border-base pb-4">
-                          <div>
+                      <div className="bg-surface border border-emerald-500/30 rounded-2xl p-4 sm:p-6 shadow-xl space-y-4">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-border-base pb-4">
+                          <div className="min-w-0">
                             <span className="inline-block bg-emerald-500/20 text-emerald-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
                               尚未注册
                             </span>
-                            <h4 className="text-xl font-bold text-content-primary">
+                            <h4 className="text-lg sm:text-xl font-bold text-content-primary break-all">
                               {whoisResult.searchedDomain}
                             </h4>
                           </div>
-                          <div className="text-emerald-400 text-sm font-semibold flex items-center gap-1">
-                            <CheckCircle2 className="w-5 h-5" />
+                          <div className="text-emerald-400 text-xs sm:text-sm font-semibold flex items-start sm:items-center gap-1 min-w-0">
+                            <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0 mt-0.5 sm:mt-0" />
                             该域名目前仍处于未注册状态，可以立即在线注册！
                           </div>
                         </div>
@@ -3708,18 +3977,18 @@ export default function App() {
                       </div>
                     ) : (
                       /* 已被注册：红色提示卡片 */
-                      <div className="bg-surface border border-red-500/30 rounded-2xl p-6 shadow-xl space-y-4">
-                        <div className="flex items-center justify-between border-b border-border-base pb-4">
-                          <div>
+                      <div className="bg-surface border border-red-500/30 rounded-2xl p-4 sm:p-6 shadow-xl space-y-4">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-border-base pb-4">
+                          <div className="min-w-0">
                             <span className="inline-block bg-red-500/20 text-red-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
                               已被注册
                             </span>
-                            <h4 className="text-xl font-bold text-content-secondary">
+                            <h4 className="text-lg sm:text-xl font-bold text-content-secondary break-all">
                               {whoisResult.searchedDomain}
                             </h4>
                           </div>
-                          <div className="text-red-400 text-sm font-semibold flex items-center gap-1">
-                            <AlertTriangle className="w-5 h-5" />
+                          <div className="text-red-400 text-xs sm:text-sm font-semibold flex items-center gap-1 flex-shrink-0">
+                            <AlertTriangle className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />
                             已被他人抢先注册
                           </div>
                         </div>
@@ -3950,7 +4219,7 @@ export default function App() {
                                   {/* 主体：点击追加到规则框 */}
                                   <button
                                     onClick={() => appendWordbank(bank.words, bank.name)}
-                                    className={`text-content-secondary ${meta.hoverTextClass} text-xs px-3 py-1.5 transition-all`}
+                                    className={`text-content-secondary ${meta.hoverTextClass} text-xs px-3 py-2.5 md:py-1.5 transition-all`}
                                     title={`点击追加 ${bank.words.length} 个词到规则框`}
                                   >
                                     {bank.name}
@@ -3961,17 +4230,17 @@ export default function App() {
                                   {/* 编辑 / 删除 */}
                                   <button
                                     onClick={() => openEditBank(bank)}
-                                    className="px-1.5 py-1.5 text-content-muted hover:text-indigo-400 hover:bg-hovered transition-all border-l border-border-base"
+                                    className="px-2.5 py-2.5 md:px-1.5 md:py-1.5 text-content-muted hover:text-indigo-400 hover:bg-hovered transition-all border-l border-border-base"
                                     title="编辑该词库"
                                   >
-                                    <Pencil className="w-3 h-3" />
+                                    <Pencil className="w-3.5 h-3.5 md:w-3 md:h-3" />
                                   </button>
                                   <button
                                     onClick={() => handleDeleteBank(bank)}
-                                    className="px-1.5 py-1.5 text-content-muted hover:text-red-400 hover:bg-hovered transition-all border-l border-border-base"
+                                    className="px-2.5 py-2.5 md:px-1.5 md:py-1.5 text-content-muted hover:text-red-400 hover:bg-hovered transition-all border-l border-border-base"
                                     title="删除该词库"
                                   >
-                                    <Trash2 className="w-3 h-3" />
+                                    <Trash2 className="w-3.5 h-3.5 md:w-3 md:h-3" />
                                   </button>
                                 </div>
                               ))}
@@ -4183,7 +4452,7 @@ export default function App() {
                         return (
                           <div
                             key={root}
-                            className={`group relative flex items-center justify-between p-2 rounded-lg border text-xs font-mono transition-all ${
+                            className={`group relative flex items-center justify-between p-2.5 md:p-2 rounded-lg border text-xs font-mono transition-all ${
                               isChecked
                                 ? "bg-indigo-950/40 border-indigo-500/50 text-indigo-300"
                                 : "bg-elevated border-border-base text-content-muted hover:text-content-primary"
@@ -4210,9 +4479,14 @@ export default function App() {
                                 type="button"
                                 title="删除该自定义根域名"
                                 onClick={() => handleRemoveCustomRootDomain(root)}
-                                className="opacity-0 group-hover:opacity-100 text-content-muted hover:text-red-400 p-0.5 ml-1 transition-opacity"
+                                /*
+                                  NOTE: 原本是 opacity-0 group-hover:opacity-100 —— 触屏没有
+                                  hover，这个按钮在手机上永远显不出来也点不到。窄屏改为常显，
+                                  ≥md 才保留"悬停才出现"的桌面观感。
+                                */
+                                className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-content-muted hover:text-red-400 p-1.5 md:p-0.5 ml-1 transition-opacity"
                               >
-                                <X className="w-3 h-3" />
+                                <X className="w-3.5 h-3.5 md:w-3 md:h-3" />
                               </button>
                             )}
                           </div>
@@ -4320,10 +4594,10 @@ export default function App() {
                           {availableDomainsList.map((item, idx) => (
                             <div
                               key={idx}
-                              className="bg-emerald-950/30 border border-emerald-500/30 rounded-xl p-3 flex items-center justify-between hover:border-emerald-500 transition-all"
+                              className="bg-emerald-950/30 border border-emerald-500/30 rounded-xl p-3 flex items-center justify-between gap-2 hover:border-emerald-500 transition-all"
                             >
-                              <div>
-                                <span className="font-mono text-sm font-bold text-content-primary block">
+                              <div className="min-w-0">
+                                <span className="font-mono text-sm font-bold text-content-primary block truncate">
                                   {item.fullDomain}
                                 </span>
                                 <span className="text-[10px] text-content-muted block mt-0.5">
@@ -4349,7 +4623,7 @@ export default function App() {
                                   // 显式带参数自动触发后台 WHOIS 重新拉取详细元数据
                                   handleCheckWhois(undefined, sub, root);
                                 }}
-                                className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-1.5 rounded-lg shadow transition-all flex items-center gap-1"
+                                className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-2 sm:py-1.5 rounded-lg shadow transition-all flex items-center gap-1 flex-shrink-0"
                               >
                                 <Plus className="w-3.5 h-3.5" /> 注册
                               </button>
@@ -4378,15 +4652,15 @@ export default function App() {
                           </div>
                         ) : (
                           scanLogs.map((log) => (
-                            <div key={log.id} className="flex items-center gap-2 border-b border-border-base pb-1 last:border-0">
-                              <span className="text-content-muted font-semibold">[{log.time}]</span>
-                              <span className={
+                            <div key={log.id} className="flex items-start gap-2 border-b border-border-base pb-1 last:border-0">
+                              <span className="text-content-muted font-semibold flex-shrink-0">[{log.time}]</span>
+                              <span className={`min-w-0 break-all ${
                                 log.status === "available"
                                   ? "text-emerald-400 font-bold"
                                   : log.status === "error"
                                   ? "text-amber-400"
                                   : "text-content-muted"
-                              }>
+                              }`}>
                                 {log.text}
                               </span>
                             </div>
@@ -4406,10 +4680,12 @@ export default function App() {
         {activeTab === "domains" && (
           <div className="space-y-8">
             {/* 账号与 DNS 筛选控制器 */}
-            <div className="flex flex-col md:flex-row items-center justify-between gap-4 bg-surface border border-border-base p-4 rounded-xl">
-              <div className="flex flex-wrap items-center gap-4 w-full md:w-auto">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-semibold text-content-secondary flex items-center gap-1.5 whitespace-nowrap">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 md:gap-4 bg-surface border border-border-base p-3 sm:p-4 rounded-xl">
+              <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-3 sm:gap-4 w-full md:w-auto">
+                {/* NOTE: 下拉框原先是 min-w-[180px]，配上 whitespace-nowrap 的标签在手机上是
+                    硬溢出（不是"挤"）。窄屏改为占满行宽并允许收缩，≥md 才恢复最小宽度。 */}
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-sm font-semibold text-content-secondary flex items-center gap-1.5 whitespace-nowrap flex-shrink-0">
                     <UserCheck className="w-4 h-4 text-indigo-400" /> 选择账号:
                   </span>
                   <select
@@ -4418,7 +4694,7 @@ export default function App() {
                       setSelectedAccountFilter(e.target.value);
                       fetchDomains(e.target.value);
                     }}
-                    className="form-input px-3 py-2 rounded-lg text-sm text-content-secondary min-w-[180px]"
+                    className="form-input px-3 py-2 rounded-lg text-sm text-content-secondary flex-1 min-w-0 md:flex-none md:min-w-[180px]"
                   >
                     <option value="all">全部账号 (按账号独立分组)</option>
                     {accounts.map((acc) => (
@@ -4429,14 +4705,14 @@ export default function App() {
                   </select>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-semibold text-content-secondary flex items-center gap-1.5 whitespace-nowrap">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-sm font-semibold text-content-secondary flex items-center gap-1.5 whitespace-nowrap flex-shrink-0">
                     <Server className="w-4 h-4 text-sky-400" /> DNS 类型:
                   </span>
                   <select
                     value={nsTypeFilter}
                     onChange={(e) => setNsTypeFilter(e.target.value as "all" | "default" | "external")}
-                    className="form-input px-3 py-2 rounded-lg text-sm text-content-secondary min-w-[150px]"
+                    className="form-input px-3 py-2 rounded-lg text-sm text-content-secondary flex-1 min-w-0 md:flex-none md:min-w-[150px]"
                   >
                     <option value="all">全部 DNS 类型</option>
                     <option value="default">仅系统默认 DNS</option>
@@ -4445,7 +4721,8 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="flex items-center gap-4">
+              {/* NOTE: 这一组原先没有 flex-wrap，却装着三个 whitespace-nowrap 的元素 */}
+              <div className="flex flex-wrap items-center gap-2 sm:gap-4 w-full md:w-auto">
                 {globalSearch.trim() && (
                   <div className="flex items-center gap-1.5 text-xs bg-amber-950/40 text-amber-300 border border-amber-900/60 px-2.5 py-1 rounded-full whitespace-nowrap">
                     <Search className="w-3 h-3 shrink-0" />
@@ -4460,14 +4737,14 @@ export default function App() {
                     </button>
                   </div>
                 )}
-                <div className="text-xs text-content-muted font-mono">
+                <div className="text-xs text-content-muted font-mono whitespace-nowrap">
                   已绑定账户: <span className="text-indigo-400 font-bold">{accounts.length}</span> |
                   托管域名: <span className="text-emerald-400 font-bold">{domains.length}</span> 个
                 </div>
                 {domains.length > 0 && (
                   <button
                     onClick={toggleAllAccounts}
-                    className="px-3 py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap"
+                    className="px-3 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap ml-auto sm:ml-0"
                   >
                     {collapsedAccounts.size > 0 ? (
                       <>
@@ -4514,8 +4791,8 @@ export default function App() {
                   return (
                     <div
                       key={group.accountId}
-                      className={`bg-hovered p-6 rounded-2xl border border-border-base ${
-                        isCollapsed ? "" : "space-y-6"
+                      className={`bg-hovered p-3 sm:p-4 md:p-6 rounded-2xl border border-border-base ${
+                        isCollapsed ? "" : "space-y-4 md:space-y-6"
                       }`}
                     >
                       {/* 账号大标题（可点击展开/收起）；收起时去掉分隔线与下边距，保持上下留白对称 */}
@@ -4525,7 +4802,7 @@ export default function App() {
                           isCollapsed ? "" : "border-b border-border-base pb-4"
                         }`}
                       >
-                        <h3 className="text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap">
+                        <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
                           {isCollapsed ? (
                             <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
                           ) : (
@@ -4538,8 +4815,8 @@ export default function App() {
                               <span className="text-content-muted">·</span>
                             </>
                           )}
-                          <span className="text-indigo-300">{group.alias}</span>
-                          <span className="text-xs bg-indigo-950/80 text-indigo-300 border border-indigo-900/60 px-2.5 py-0.5 rounded-full font-normal">
+                          <span className="text-indigo-300 truncate max-w-full">{group.alias}</span>
+                          <span className="text-[11px] md:text-xs bg-indigo-950/80 text-indigo-300 border border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
                             共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
                           </span>
                         </h3>
@@ -4551,12 +4828,12 @@ export default function App() {
                       {/* 子分块 1：系统默认 DNS 域名 */}
                       {showDefault && defaultDomains.length > 0 && (
                         <div className="space-y-3">
-                          <div className="flex items-center gap-2 text-sm font-bold text-content-secondary">
-                            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block" />
+                          <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-sm font-bold text-content-secondary">
+                            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block shrink-0" />
                             <span>系统默认 DNS 域名 ({defaultDomains.length})</span>
-                            <span className="text-xs text-content-muted font-normal">—— 支持直接在线管理 DNS 解析记录</span>
+                            <span className="hidden sm:inline text-xs text-content-muted font-normal">—— 支持直接在线管理 DNS 解析记录</span>
                           </div>
-                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 md:gap-6">
                             {defaultDomains.map(renderDomainCard)}
                           </div>
                         </div>
@@ -4565,12 +4842,12 @@ export default function App() {
                       {/* 子分块 2：外部 DNS 委派域名 */}
                       {showExternal && externalDomains.length > 0 && (
                         <div className="space-y-3 pt-2">
-                          <div className="flex items-center gap-2 text-sm font-bold text-content-secondary">
-                            <span className="w-2.5 h-2.5 rounded-full bg-sky-400 inline-block" />
+                          <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-sm font-bold text-content-secondary">
+                            <span className="w-2.5 h-2.5 rounded-full bg-sky-400 inline-block shrink-0" />
                             <span>外部 DNS 委派域名 ({externalDomains.length})</span>
-                            <span className="text-xs text-content-muted font-normal">—— 已托管至 Cloudflare 等第三方服务商</span>
+                            <span className="hidden sm:inline text-xs text-content-muted font-normal">—— 已托管至 Cloudflare 等第三方服务商</span>
                           </div>
-                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 md:gap-6">
                             {externalDomains.map(renderDomainCard)}
                           </div>
                         </div>
@@ -4589,7 +4866,7 @@ export default function App() {
         {activeTab === "accounts" && (
           <div className="space-y-6">
             {/* 顶部：绑定按钮（横排，点击打开弹窗） */}
-            <div className="flex gap-3">
+            <div className="flex flex-col sm:flex-row gap-3">
               <button
                 type="button"
                 onClick={() => setBindModal("single")}
@@ -4625,9 +4902,9 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {accounts.map((acc) => (
                     <div key={acc.id} className="glass-card rounded-xl p-5 border border-border-base flex justify-between items-start gap-4">
-                      <div>
-                        <h3 className="font-bold text-content-primary text-base">{acc.alias}</h3>
-                        <p className="text-content-muted text-xs mt-1.5 font-mono">
+                      <div className="min-w-0">
+                        <h3 className="font-bold text-content-primary text-base truncate">{acc.alias}</h3>
+                        <p className="text-content-muted text-xs mt-1.5 font-mono break-all">
                           Key: {acc.api_key.substring(0, 8)}***{acc.api_key.substring(acc.api_key.length - 4)}
                         </p>
                         <p className="text-[10px] text-content-muted mt-2">
@@ -4635,7 +4912,7 @@ export default function App() {
                         </p>
                       </div>
 
-                      <div className="flex flex-col gap-2">
+                      <div className="flex flex-col gap-2 flex-shrink-0">
                         <button
                           onClick={() => openEditAccount(acc)}
                           disabled={actionLoading === `update-account-${acc.id}`}
@@ -4663,21 +4940,23 @@ export default function App() {
 
         {/* 修改账号弹窗 */}
         {editingAccount && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-            <div className="bg-surface border border-border-base w-full max-w-md rounded-xl overflow-hidden shadow-2xl">
-              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+            {/* NOTE: max-h + flex-col + 正文 overflow-y-auto 三件套缺一不可 —— 少了 max-h，
+                内容超过屏高时会被 overflow-hidden 直接裁掉且滚不到（手机上尤其明显） */}
+            <div className="bg-surface border border-border-base w-full max-w-md max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
                 <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
                   <Settings className="w-5 h-5 text-indigo-400" /> 修改账号
                 </h3>
                 <button
                   onClick={() => setEditingAccount(null)}
-                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              <div className="p-6 space-y-4">
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
                 {/*
                   NOTE: 这三个输入框必须显式标注 autoComplete 与不像凭据的 name。
                   缺了这些提示，Chrome 密码管理器会把「API Secret」当成登录密码框，
@@ -4759,9 +5038,9 @@ export default function App() {
         {/* 绑定单个账号弹窗 */}
         {/* 词库新建 / 编辑模态框 */}
         {bankModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-            <div className="bg-surface border border-border-base w-full max-w-lg rounded-xl overflow-hidden shadow-2xl">
-              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-lg max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
                 <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
                   {editingBank ? (
                     <>
@@ -4775,13 +5054,13 @@ export default function App() {
                 </h3>
                 <button
                   onClick={() => setBankModalOpen(false)}
-                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              <div className="p-6 space-y-4">
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
                 <div>
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">
                     词库类型
@@ -4852,21 +5131,21 @@ export default function App() {
         )}
 
         {bindModal === "single" && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-            <div className="bg-surface border border-border-base w-full max-w-md rounded-xl overflow-hidden shadow-2xl">
-              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-md max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
                 <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
                   <Plus className="w-5 h-5 text-indigo-400" /> 绑定单个账号
                 </h3>
                 <button
                   onClick={() => setBindModal(null)}
-                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              <form onSubmit={handleAddAccount} className="p-6 space-y-4">
+              <form onSubmit={handleAddAccount} className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
                 {/* NOTE: 与「修改账号」弹窗同理，避免 Chrome 把 API Key/Secret 当成登录凭据对填充 */}
                 <div>
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (可选，留空自动解析)</label>
@@ -4939,21 +5218,21 @@ export default function App() {
 
         {/* 批量绑定账号弹窗 */}
         {bindModal === "batch" && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85">
-            <div className="bg-surface border border-border-base w-full max-w-lg rounded-xl overflow-hidden shadow-2xl">
-              <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/85">
+            <div className="bg-surface border border-border-base w-full max-w-lg max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
                 <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
                   <Sparkles className="w-5 h-5 text-emerald-400" /> 批量绑定账号
                 </h3>
                 <button
                   onClick={() => setBindModal(null)}
-                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              <div className="p-6 space-y-4">
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
                 <p className="text-xs text-content-muted leading-relaxed">
                   每行填入一组 <span className="font-mono text-indigo-400">API Key + API Secret</span>（用空格 / Tab / 逗号分隔），别名自动从 API Key 解析，无需填写。
                 </p>
@@ -5024,12 +5303,12 @@ export default function App() {
         {/* Tab 3: 账户配额 */}
         {activeTab === "quota" && (
           <div>
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-lg font-bold text-content-primary">各账户域名配额概览</h2>
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-4 sm:mb-6">
+              <h2 className="text-base sm:text-lg font-bold text-content-primary">各账户域名配额概览</h2>
               <button
                 onClick={() => fetchQuotas(true)}
                 disabled={loadingQuotas}
-                className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-60"
+                className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-60 flex-shrink-0"
                 title="强制从 DNSHE 重新拉取配额"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${loadingQuotas ? "animate-spin" : ""}`} />
@@ -5047,27 +5326,27 @@ export default function App() {
                 <p className="text-content-muted">没有查到配额数据。请确保至少绑定了一个账户，并且密钥配置无误。</p>
               </div>
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
                 {quotas.map((q, idx) => {
                   if (q.error) {
                     return (
-                      <div key={idx} className="bg-red-950/20 border border-red-900/50 rounded-xl p-5">
-                        <h3 className="font-bold text-red-400">{q.alias}</h3>
-                        <p className="text-red-300 text-sm mt-2 flex items-center gap-1.5">
-                          <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-                          API 调用异常: {q.error}
+                      <div key={idx} className="bg-red-950/20 border border-red-900/50 rounded-xl p-4 sm:p-5">
+                        <h3 className="font-bold text-red-400 truncate">{q.alias}</h3>
+                        <p className="text-red-300 text-sm mt-2 flex items-start gap-1.5">
+                          <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                          <span className="min-w-0 break-words">API 调用异常: {q.error}</span>
                         </p>
                       </div>
                     );
                   }
 
                   const percent = q.total > 0 ? Math.round((q.used / q.total) * 100) : 0;
-                  
+
                   return (
-                    <div key={q.account_id} className="glass-card rounded-xl p-5 border border-border-base">
-                      <div className="flex justify-between items-center mb-4">
-                        <h3 className="font-bold text-content-primary text-lg">{q.alias}</h3>
-                        <span className="text-xs bg-indigo-950 text-indigo-300 px-2 py-0.5 rounded-full">
+                    <div key={q.account_id} className="glass-card rounded-xl p-4 sm:p-5 border border-border-base">
+                      <div className="flex justify-between items-center gap-2 mb-4">
+                        <h3 className="font-bold text-content-primary text-base sm:text-lg truncate min-w-0">{q.alias}</h3>
+                        <span className="text-xs bg-indigo-950 text-indigo-300 px-2 py-0.5 rounded-full flex-shrink-0">
                           可用: {q.available}
                         </span>
                       </div>
@@ -5090,15 +5369,15 @@ export default function App() {
 
                       <div className="grid grid-cols-3 gap-2 mt-6 pt-4 border-t border-border-base text-center">
                         <div>
-                          <span className="block text-[10px] text-content-muted">基础配额</span>
+                          <span className="block text-[11px] text-content-muted">基础配额</span>
                           <span className="text-sm font-semibold text-content-secondary">{q.base}</span>
                         </div>
                         <div>
-                          <span className="block text-[10px] text-content-muted">邀请赠送</span>
+                          <span className="block text-[11px] text-content-muted">邀请赠送</span>
                           <span className="text-sm font-semibold text-content-secondary">+{q.invite_bonus}</span>
                         </div>
                         <div>
-                          <span className="block text-[10px] text-content-muted">总配额</span>
+                          <span className="block text-[11px] text-content-muted">总配额</span>
                           <span className="text-sm font-semibold text-content-primary">{q.total}</span>
                         </div>
                       </div>
@@ -5113,12 +5392,12 @@ export default function App() {
         {/* Tab 4: 运行日志 */}
         {activeTab === "logs" && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-bold text-content-primary">运行日志 (最近100条)</h2>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-base sm:text-lg font-bold text-content-primary">运行日志 (最近100条)</h2>
               <button
                 onClick={handleClearLogs}
                 disabled={actionLoading === "clear-logs"}
-                className="bg-red-950/60 hover:bg-red-900/60 text-red-400 hover:text-red-200 border border-red-900/50 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition-all"
+                className="bg-red-950/60 hover:bg-red-900/60 text-red-400 hover:text-red-200 border border-red-900/50 px-3 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition-all flex-shrink-0"
               >
                 清空运行日志
               </button>
@@ -5156,50 +5435,65 @@ export default function App() {
                 <p className="text-content-muted">该分类下暂无运行日志</p>
               </div>
             ) : (
-              <div className="bg-surface border border-border-base rounded-xl overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm border-collapse">
-                    <thead>
-                      <tr className="bg-elevated text-content-muted text-xs border-b border-border-base">
-                        <th className="p-4 w-44">时间</th>
-                        <th className="p-4 w-28">类型</th>
-                        <th className="p-4 w-32">模块</th>
-                        <th className="p-4">描述信息</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-border-soft font-medium">
-                      {filteredLogs.map((log) => (
-                        <tr key={log.id} className="hover:bg-hovered transition-colors">
-                          <td className="p-4 text-xs text-content-muted font-mono">
-                            {new Date(log.created_at).toLocaleString("zh-CN")}
-                          </td>
-                          <td className="p-4 text-xs">
-                            <span className={`inline-block px-2.5 py-0.5 rounded-full font-bold uppercase ${
-                              log.type === "success" ? "bg-emerald-950 text-emerald-400" :
-                              log.type === "error" ? "bg-red-950 text-red-400 animate-pulse" :
-                              log.type === "warning" ? "bg-amber-950 text-amber-400" :
-                              "bg-elevated text-content-secondary"
-                            }`}>
-                              {log.type}
-                            </span>
-                          </td>
-                          <td className="p-4 text-xs text-content-secondary font-semibold capitalize">
-                            {log.category}
-                          </td>
-                          <td className="p-4 text-content-secondary">
-                            <div>{log.message}</div>
-                            {log.details && (
-                              <pre className="mt-2 p-2.5 rounded bg-elevated text-content-muted text-xs font-mono max-h-40 overflow-y-auto whitespace-pre-wrap">
-                                {log.details}
-                              </pre>
-                            )}
-                          </td>
+              <>
+                {/* ≥md：保持原有 4 列表格（固定列宽合计 416px + p-4 内边距，在手机上必然横向溢出） */}
+                <div className="hidden md:block bg-surface border border-border-base rounded-xl overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm border-collapse">
+                      <thead>
+                        <tr className="bg-elevated text-content-muted text-xs border-b border-border-base">
+                          <th className="p-4 w-44">时间</th>
+                          <th className="p-4 w-28">类型</th>
+                          <th className="p-4 w-32">模块</th>
+                          <th className="p-4">描述信息</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody className="divide-y divide-border-soft font-medium">
+                        {filteredLogs.map((log) => {
+                          const parts = logRowParts(log);
+                          return (
+                            <tr key={log.id} className="hover:bg-hovered transition-colors">
+                              <td className="p-4 text-xs text-content-muted font-mono">{parts.time}</td>
+                              <td className="p-4 text-xs">{parts.badge}</td>
+                              <td className="p-4 text-xs text-content-secondary font-semibold capitalize">
+                                {log.category}
+                              </td>
+                              <td className="p-4 text-content-secondary">
+                                <div>{log.message}</div>
+                                {parts.details}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
-              </div>
+
+                {/* <md：每条日志一张卡片，字段纵向堆叠 */}
+                <div className="md:hidden space-y-2">
+                  {filteredLogs.map((log) => {
+                    const parts = logRowParts(log);
+                    return (
+                      <div
+                        key={log.id}
+                        className="bg-surface border border-border-base rounded-xl p-3 space-y-2"
+                      >
+                        <div className="flex items-center justify-between gap-2 text-xs">
+                          {parts.badge}
+                          <span className="text-content-muted font-mono truncate">{parts.time}</span>
+                        </div>
+                        <div className="text-sm text-content-secondary break-words">{log.message}</div>
+                        <div className="flex items-center gap-1.5 text-[11px] text-content-muted">
+                          <Server className="w-3 h-3 flex-shrink-0" />
+                          <span className="capitalize">{log.category}</span>
+                        </div>
+                        {parts.details}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
             )}
           </div>
         )}
@@ -5221,25 +5515,25 @@ export default function App() {
             ) : (
               <>
                 {/* 外观 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-5 space-y-4">
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     {theme === "dark" ? <Moon className="w-4 h-4 text-indigo-400" /> : <Sun className="w-4 h-4 text-amber-400" />} 外观
                   </h3>
-                  <div className="flex items-center justify-between">
-                    <div>
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="min-w-0">
                       <div className="text-sm font-semibold text-content-primary">主题模式</div>
                       <div className="text-xs text-content-muted mt-0.5">切换明亮 / 暗黑界面配色</div>
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex gap-2 flex-shrink-0">
                       <button
                         onClick={() => setTheme("light")}
-                        className={`px-3 py-1.5 rounded-lg text-sm font-semibold flex items-center gap-1.5 transition-all ${theme === "light" ? "bg-indigo-600 text-white" : "bg-elevated text-content-muted border border-border-base"}`}
+                        className={`px-3 py-2 sm:py-1.5 rounded-lg text-sm font-semibold flex items-center gap-1.5 transition-all ${theme === "light" ? "bg-indigo-600 text-white" : "bg-elevated text-content-muted border border-border-base"}`}
                       >
                         <Sun className="w-4 h-4" /> 亮色
                       </button>
                       <button
                         onClick={() => setTheme("dark")}
-                        className={`px-3 py-1.5 rounded-lg text-sm font-semibold flex items-center gap-1.5 transition-all ${theme === "dark" ? "bg-indigo-600 text-white" : "bg-elevated text-content-muted border border-border-base"}`}
+                        className={`px-3 py-2 sm:py-1.5 rounded-lg text-sm font-semibold flex items-center gap-1.5 transition-all ${theme === "dark" ? "bg-indigo-600 text-white" : "bg-elevated text-content-muted border border-border-base"}`}
                       >
                         <Moon className="w-4 h-4" /> 暗色
                       </button>
@@ -5248,7 +5542,7 @@ export default function App() {
                 </div>
 
                 {/* 后端地址 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-5 space-y-4">
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <Server className="w-4 h-4 text-indigo-400" /> 后端地址
                   </h3>
@@ -5298,17 +5592,17 @@ export default function App() {
                 </div>
 
                 {/* 账户安全：修改密码 + 两步验证 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-5 space-y-5">
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-5">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <ShieldCheck className="w-4 h-4 text-emerald-400" /> 账户安全
                   </h3>
 
                   {/* 当前账户 */}
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-content-muted">当前管理员</span>
-                    <span className="font-mono font-semibold text-content-primary flex items-center gap-1.5">
-                      <UserCheck className="w-4 h-4 text-indigo-400" />
-                      {accountInfo.username || "—"}
+                  <div className="flex items-center justify-between gap-2 text-sm">
+                    <span className="text-content-muted flex-shrink-0">当前管理员</span>
+                    <span className="font-mono font-semibold text-content-primary flex items-center gap-1.5 min-w-0">
+                      <UserCheck className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+                      <span className="truncate">{accountInfo.username || "—"}</span>
                     </span>
                   </div>
 
@@ -5379,14 +5673,14 @@ export default function App() {
 
                   {/* 两步验证 (2FA) */}
                   <div className="space-y-3 pt-3 border-t border-border-soft">
-                    <div className="flex items-center justify-between">
-                      <div>
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="min-w-0">
                         <div className="text-sm font-semibold text-content-primary flex items-center gap-1.5">
-                          <ShieldCheck className="w-4 h-4 text-emerald-400" /> 两步验证 (2FA / TOTP)
+                          <ShieldCheck className="w-4 h-4 text-emerald-400 flex-shrink-0" /> 两步验证 (2FA / TOTP)
                         </div>
                         <div className="text-xs text-content-muted mt-0.5">开启后登录需额外输入身份验证器的 6 位动态码</div>
                       </div>
-                      <span className={`text-xs px-2.5 py-1 rounded-full font-semibold ${accountInfo.two_fa_enabled ? "bg-emerald-500/20 text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
+                      <span className={`text-xs px-2.5 py-1 rounded-full font-semibold self-start sm:self-auto flex-shrink-0 ${accountInfo.two_fa_enabled ? "bg-emerald-500/20 text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
                         {accountInfo.two_fa_enabled ? "已开启" : "未开启"}
                       </span>
                     </div>
@@ -5419,7 +5713,7 @@ export default function App() {
                               {twoFaSetup.secret}
                             </div>
                             <p className="text-xs text-content-secondary">2. 输入验证器当前显示的 6 位动态码以完成开启：</p>
-                            <div className="flex gap-2">
+                            <div className="flex flex-wrap gap-2">
                               <input
                                 type="text"
                                 inputMode="numeric"
@@ -5450,7 +5744,7 @@ export default function App() {
 
                     {/* 已开启：输入当前动态码确认关闭 */}
                     {accountInfo.two_fa_enabled && (
-                      <div className="flex gap-2">
+                      <div className="flex flex-wrap gap-2">
                         <input
                           type="text"
                           inputMode="numeric"
@@ -5473,18 +5767,18 @@ export default function App() {
                 </div>
 
                 {/* 自动续期 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-5 space-y-4">
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <RefreshCw className="w-4 h-4 text-emerald-400" /> 自动续期
                   </h3>
-                  <div className="flex items-center justify-between">
-                    <div>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
                       <div className="text-sm font-semibold text-content-primary">启用自动续期</div>
                       <div className="text-xs text-content-muted mt-0.5">定时任务自动为即将到期的域名续期</div>
                     </div>
                     <button
                       onClick={() => setSettings((s) => ({ ...s, auto_renew: s.auto_renew === "1" ? "0" : "1" }))}
-                      className={`w-12 h-6 rounded-full transition-all relative ${settings.auto_renew === "1" ? "bg-indigo-600" : "bg-elevated border border-border-base"}`}
+                      className={`w-12 h-6 rounded-full transition-all relative flex-shrink-0 ${settings.auto_renew === "1" ? "bg-indigo-600" : "bg-elevated border border-border-base"}`}
                     >
                       <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${settings.auto_renew === "1" ? "left-6" : "left-0.5"}`} />
                     </button>
@@ -5502,7 +5796,7 @@ export default function App() {
                 </div>
 
                 {/* 通知 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-5 space-y-4">
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <Bell className="w-4 h-4 text-amber-400" /> 通知渠道
                   </h3>
@@ -5577,31 +5871,32 @@ export default function App() {
 
       {/* DNS 解析管理模态框 (Modal) */}
       {dnsModalOpen && selectedDomain && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-          <div className="bg-surface border border-border-base w-full max-w-4xl max-h-[85vh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-surface border border-border-base w-full max-w-4xl max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
             {/* 模态框头部 */}
-            <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
-              <div>
-                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
-                  <ShieldCheck className="text-indigo-400 w-5 h-5" />
-                  DNS 解析记录管理
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between gap-2 border-b border-border-base flex-shrink-0">
+              {/* NOTE: min-w-0 + truncate —— 长 IDN 域名（xn-- 形式很长）会把右侧按钮挤出屏幕 */}
+              <div className="min-w-0">
+                <h3 className="text-base sm:text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  <ShieldCheck className="text-indigo-400 w-5 h-5 flex-shrink-0" />
+                  <span className="truncate">DNS 解析记录管理</span>
                 </h3>
-                <p className="text-xs text-content-muted mt-0.5 font-mono">
+                <p className="text-xs text-content-muted mt-0.5 font-mono truncate">
                   域名: {selectedDomain.full_domain}
                 </p>
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 flex-shrink-0">
                 <button
                   onClick={() => reloadDnsRecords(selectedDomain, true)}
                   disabled={loadingDns}
-                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded disabled:opacity-50"
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded disabled:opacity-50"
                   title="强制刷新（重新从 DNSHE 拉取）"
                 >
                   <RefreshCw className={`w-4 h-4 ${loadingDns ? "animate-spin" : ""}`} />
                 </button>
-                <button 
+                <button
                   onClick={() => setDnsModalOpen(false)}
-                  className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -5609,7 +5904,7 @@ export default function App() {
             </div>
 
             {/* 模态框主体 */}
-            <div className="p-6 overflow-y-auto flex-1 space-y-6">
+            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4 sm:space-y-6">
               
               {/* 新建 DNS 记录表单折叠面板 */}
               <div className="border border-border-base rounded-lg overflow-hidden bg-hovered">
@@ -5623,7 +5918,7 @@ export default function App() {
                 {dnsFormOpen && (
                   <form onSubmit={handleCreateDnsRecord} className="p-4 grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 border-t border-border-base">
                     <div>
-                      <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">记录类型</label>
+                      <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">记录类型</label>
                       <select
                         value={newDnsType}
                         onChange={(e) => setNewDnsType(e.target.value)}
@@ -5636,7 +5931,7 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">主机记录</label>
+                      <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">主机记录</label>
                       <input
                         type="text"
                         name="dns-new-name"
@@ -5649,13 +5944,13 @@ export default function App() {
                     </div>
 
                     <div className="md:col-span-2 lg:col-span-1">
-                      <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">记录值 (Content)</label>
+                      <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">记录值 (Content)</label>
                       <input
                         type="text"
                         name="dns-new-content"
                         autoComplete="off"
                         required
-                        placeholder="例如 192.168.1.1"
+                        placeholder="例如 192.0.2.1"
                         value={newDnsContent}
                         onChange={(e) => setNewDnsContent(e.target.value)}
                         className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
@@ -5663,7 +5958,7 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">TTL (秒)</label>
+                      <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">TTL (秒)</label>
                       <input
                         type="number"
                         name="dns-new-ttl"
@@ -5678,7 +5973,7 @@ export default function App() {
 
                     {needsDnsPriority(newDnsType) && (
                       <div>
-                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">优先级</label>
+                        <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">优先级</label>
                         <input
                           type="number"
                           name="dns-new-priority"
@@ -5693,7 +5988,7 @@ export default function App() {
                     )}
 
                     <div>
-                      <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
+                      <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
                       <input
                         type="text"
                         name="dns-new-line"
@@ -5748,9 +6043,9 @@ export default function App() {
                       填完整域名会自动剥成相对名。
                     </p>
 
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
                       <div>
-                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认类型</label>
+                        <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">默认类型</label>
                         <select
                           value={dnsBatchType}
                           onChange={(e) => setDnsBatchType(e.target.value)}
@@ -5763,7 +6058,7 @@ export default function App() {
                       </div>
 
                       <div>
-                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认主机记录</label>
+                        <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">默认主机记录</label>
                         <input
                           type="text"
                           name="dns-batch-name"
@@ -5776,7 +6071,7 @@ export default function App() {
                       </div>
 
                       <div>
-                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认 TTL (秒)</label>
+                        <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">默认 TTL (秒)</label>
                         <input
                           type="number"
                           name="dns-batch-ttl"
@@ -5791,7 +6086,7 @@ export default function App() {
 
                       {needsDnsPriority(dnsBatchType) && (
                         <div>
-                          <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">默认优先级</label>
+                          <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">默认优先级</label>
                           <input
                             type="number"
                             name="dns-batch-priority"
@@ -5806,7 +6101,7 @@ export default function App() {
                       )}
 
                       <div>
-                        <label className="block text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
+                        <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
                         <input
                           type="text"
                           name="dns-batch-line"
@@ -5819,6 +6114,8 @@ export default function App() {
                       </div>
                     </div>
 
+                    {/* NOTE: 占位示例一律用文档保留段（RFC 3849 的 2001:db8::/32、
+                        RFC 5737 的 192.0.2.0/24、RFC 2606 的 example.com），不放真实地址 */}
                     <textarea
                       value={dnsBatchInput}
                       onChange={(e) => setDnsBatchInput(e.target.value)}
@@ -5826,7 +6123,7 @@ export default function App() {
                       name="dns-batch-input"
                       autoComplete="off"
                       spellCheck={false}
-                      placeholder={"2606:4700:52::5010:e191\n2606:4700:57::527:8a4e\nAAAA ipv6 2606:4700:5a::e095:d9aa\nA www 1.2.3.4 600\nMX @ mail.example.com 600 10"}
+                      placeholder={"2001:db8::5010:e191\n2001:db8::527:8a4e\nAAAA ipv6 2001:db8::e095:d9aa\nA www 192.0.2.1 600\nMX @ mail.example.com 600 10"}
                       className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-y"
                     />
 
@@ -5858,10 +6155,10 @@ export default function App() {
                     {validDnsBatchLines.length > 0 && (
                       <div className="max-h-40 overflow-y-auto pr-1 space-y-1">
                         {validDnsBatchLines.map((r, idx) => (
-                          <div key={idx} className="text-[11px] font-mono text-content-muted flex items-center gap-2">
+                          <div key={idx} className="text-[11px] font-mono text-content-muted flex flex-wrap sm:flex-nowrap items-center gap-x-2 gap-y-0.5">
                             <span className="text-indigo-400 font-bold w-12 shrink-0">{r.type}</span>
-                            <span className="w-24 shrink-0 truncate" title={r.name}>{r.name}</span>
-                            <span className="flex-1 truncate text-content-secondary" title={r.content}>{r.content}</span>
+                            <span className="w-20 sm:w-24 shrink-0 truncate" title={r.name}>{r.name}</span>
+                            <span className="w-full sm:flex-1 sm:w-auto truncate text-content-secondary" title={r.content}>{r.content}</span>
                             <span className="shrink-0">TTL {r.ttl}</span>
                             {r.priority !== undefined && <span className="shrink-0">优先级 {r.priority}</span>}
                           </div>
@@ -5905,17 +6202,17 @@ export default function App() {
                   </h4>
 
                   {selectedDnsKeys.size > 0 && (
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                       <span className="text-xs text-content-muted">已选 {selectedDnsKeys.size} 条</span>
                       <button
                         onClick={() => setSelectedDnsKeys(new Set())}
-                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-2.5 py-1.5 rounded-lg text-xs font-semibold"
+                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-semibold"
                       >
                         取消选择
                       </button>
                       <button
                         onClick={() => (dnsEditPanelOpen ? setDnsEditPanelOpen(false) : handleOpenDnsEditPanel())}
-                        className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
+                        className={`px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
                           dnsEditPanelOpen
                             ? "bg-indigo-500/20 border-indigo-500/50 text-indigo-200"
                             : "bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-300 border-indigo-900/60"
@@ -5928,7 +6225,7 @@ export default function App() {
                       <button
                         onClick={handleBatchDeleteDnsRecords}
                         disabled={actionLoading === "batch-delete-dns"}
-                        className="bg-red-950/60 hover:bg-red-900/60 text-red-300 border border-red-900/60 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                        className="bg-red-950/60 hover:bg-red-900/60 text-red-300 border border-red-900/60 px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
                         title="批量删除已勾选的解析记录"
                       >
                         {actionLoading === "batch-delete-dns" ? (
@@ -5950,8 +6247,9 @@ export default function App() {
                         <Pencil className="w-3.5 h-3.5" />
                         批量修改 {selectedDnsKeys.size} 条记录
                       </h5>
-                      <span className="text-[10px] text-content-muted">只有勾选的字段会被覆盖，其余字段保留各自原值</span>
+                      <span className="text-[10px] text-content-muted hidden sm:inline">只有勾选的字段会被覆盖，其余字段保留各自原值</span>
                     </div>
+                    <p className="text-[11px] text-content-muted sm:hidden -mt-2">只有勾选的字段会被覆盖，其余保留原值</p>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                       {/* 记录类型 */}
@@ -6098,15 +6396,18 @@ export default function App() {
                       {batchEditTargets.map((t) => (
                         <div
                           key={t.record_id}
-                          className={`text-[11px] font-mono flex items-center gap-2 rounded px-1 py-0.5 ${
+                          /* NOTE: 窄屏改为纵向两段（原记录 / 改后），横排 7 段在手机上必然溢出 */
+                          className={`text-[11px] font-mono flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 rounded px-1 py-1 sm:py-0.5 border-b border-border-soft sm:border-0 last:border-0 ${
                             t.unchanged ? "opacity-45" : ""
                           }`}
                           title={t.unchanged ? "与原记录一致，提交时会跳过" : undefined}
                         >
-                          <span className="text-content-muted flex-1 truncate" title={t.label}>{t.label}</span>
-                          <ChevronRight className="w-3 h-3 text-content-muted shrink-0" />
-                          <span className="text-indigo-400 shrink-0">{t.type}</span>
-                          <span className="text-content-secondary shrink-0 max-w-[7rem] truncate" title={t.name}>{t.name}</span>
+                          <span className="text-content-muted flex-1 truncate min-w-0" title={t.label}>{t.label}</span>
+                          <ChevronRight className="w-3 h-3 text-content-muted shrink-0 rotate-90 sm:rotate-0" />
+                          <span className="flex items-center gap-2 min-w-0 sm:contents">
+                            <span className="text-indigo-400 shrink-0">{t.type}</span>
+                            <span className="text-content-secondary shrink-0 max-w-[7rem] truncate" title={t.name}>{t.name}</span>
+                          </span>
                           {dnsEditFields.content ? (
                             <input
                               type="text"
@@ -6121,11 +6422,13 @@ export default function App() {
                               className="flex-1 min-w-0 form-input px-2 py-1 rounded text-[11px] font-mono text-content-secondary"
                             />
                           ) : (
-                            <span className="text-content-secondary flex-1 truncate" title={t.content}>{t.content}</span>
+                            <span className="text-content-secondary flex-1 truncate min-w-0" title={t.content}>{t.content}</span>
                           )}
-                          <span className="text-content-muted shrink-0">TTL {t.ttl}</span>
-                          {t.priority !== undefined && <span className="text-content-muted shrink-0">优先级 {t.priority}</span>}
-                          <span className="text-content-muted shrink-0">{t.line || "默认线路"}</span>
+                          <span className="flex items-center gap-2 sm:contents">
+                            <span className="text-content-muted shrink-0">TTL {t.ttl}</span>
+                            {t.priority !== undefined && <span className="text-content-muted shrink-0">优先级 {t.priority}</span>}
+                            <span className="text-content-muted shrink-0">{t.line || "默认线路"}</span>
+                          </span>
                         </div>
                       ))}
                     </div>
@@ -6194,194 +6497,189 @@ export default function App() {
                     暂无解析记录。请点击上方按钮添加第一条记录。
                   </div>
                 ) : (
-                  <div className="bg-hovered border border-border-base rounded-lg overflow-hidden">
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left text-sm border-collapse">
-                        <thead>
-                          <tr className="bg-elevated text-content-muted text-[10px] uppercase font-bold tracking-wider border-b border-border-base">
-                            <th className="p-3 w-10">
-                              <input
-                                type="checkbox"
-                                checked={dnsRecords.length > 0 && selectedDnsKeys.size === dnsRecords.length}
-                                onChange={toggleAllDnsSelection}
-                                className="w-4 h-4 accent-indigo-500 cursor-pointer align-middle"
-                                title="全选 / 取消全选"
-                              />
-                            </th>
-                            <th className="p-3">类型</th>
-                            <th className="p-3">主机记录</th>
-                            <th className="p-3">解析记录值</th>
-                            <th className="p-3 w-20">TTL</th>
-                            <th className="p-3 w-24">线路</th>
-                            <th className="p-3 w-20 text-center">操作</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-border-soft text-content-secondary">
-                          {dnsRecords.map((rec) => {
-                            const key = dnsRecordKey(rec);
-                            const isEditing = editingDnsKey === key;
+                  <>
+                    {/* ≥md：保持原有 7 列表格（手机上这张表最小需要约 750px，只能横拖） */}
+                    <div className="hidden md:block bg-hovered border border-border-base rounded-lg overflow-hidden">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-sm border-collapse">
+                          <thead>
+                            <tr className="bg-elevated text-content-muted text-[10px] uppercase font-bold tracking-wider border-b border-border-base">
+                              <th className="p-3 w-10">
+                                <input
+                                  type="checkbox"
+                                  checked={dnsRecords.length > 0 && selectedDnsKeys.size === dnsRecords.length}
+                                  onChange={toggleAllDnsSelection}
+                                  className="w-4 h-4 accent-indigo-500 cursor-pointer align-middle"
+                                  title="全选 / 取消全选"
+                                />
+                              </th>
+                              <th className="p-3">类型</th>
+                              <th className="p-3">主机记录</th>
+                              <th className="p-3">解析记录值</th>
+                              <th className="p-3 w-20">TTL</th>
+                              <th className="p-3 w-24">线路</th>
+                              <th className="p-3 w-20 text-center">操作</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-border-soft text-content-secondary">
+                            {dnsRecords.map((rec) => {
+                              const p = dnsRowParts(rec);
 
-                            // 行内编辑态：整行换成输入控件，保存 / 取消就地完成
-                            if (isEditing) {
+                              // 行内编辑态：整行换成输入控件，保存 / 取消就地完成
+                              if (p.isEditing) {
+                                return (
+                                  <tr key={p.key} className="bg-indigo-500/5">
+                                    <td className="p-3" />
+                                    <td className="p-2">{p.typeSelect}</td>
+                                    <td className="p-2">{p.nameInput}</td>
+                                    <td className="p-2">
+                                      <div className="flex items-center gap-1.5">
+                                        {p.contentInput}
+                                        {p.priorityInput}
+                                      </div>
+                                    </td>
+                                    <td className="p-2">{p.ttlInput}</td>
+                                    <td className="p-2">{p.lineInput}</td>
+                                    <td className="p-2">
+                                      <div className="flex items-center justify-center gap-1">
+                                        {p.saveButton}
+                                        {p.cancelButton}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                );
+                              }
+
                               return (
-                                <tr key={key} className="bg-indigo-500/5">
-                                  <td className="p-3" />
-                                  <td className="p-2">
-                                    <select
-                                      value={editDnsType}
-                                      onChange={(e) => setEditDnsType(e.target.value)}
-                                      className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
-                                    >
-                                      {DNS_TYPE_OPTIONS.map((opt) => (
-                                        <option key={opt.value} value={opt.value}>{opt.value}</option>
-                                      ))}
-                                    </select>
+                                <tr key={p.key} className="hover:bg-hovered">
+                                  <td className="p-3">{p.checkbox}</td>
+                                  <td className="p-3 font-bold text-xs text-indigo-400">{rec.type}</td>
+                                  <td className="p-3 font-mono text-xs">{rec.name}</td>
+                                  <td className="p-3 font-mono text-xs break-all max-w-xs" title={rec.content}>
+                                    {rec.priority !== null && rec.priority !== undefined && `[优先级: ${rec.priority}] `}
+                                    {rec.content}
                                   </td>
-                                  <td className="p-2">
-                                    <input
-                                      type="text"
-                                      name="dns-edit-name"
-                                      autoComplete="off"
-                                      value={editDnsName}
-                                      onChange={(e) => setEditDnsName(e.target.value)}
-                                      onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
-                                      placeholder="@ 或 jp"
-                                      title={`只能填相对名：@ 代表 ${selectedDomain.full_domain}，jp 代表 jp.${selectedDomain.full_domain}`}
-                                      autoFocus
-                                      className="w-full form-input px-2 py-1.5 rounded text-xs font-mono text-content-secondary"
-                                    />
-                                  </td>
-                                  <td className="p-2">
-                                    <div className="flex items-center gap-1.5">
-                                      <input
-                                        type="text"
-                                        name="dns-edit-content"
-                                        autoComplete="off"
-                                        value={editDnsContent}
-                                        onChange={(e) => setEditDnsContent(e.target.value)}
-                                        onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
-                                        placeholder="记录值"
-                                        className="flex-1 form-input px-2 py-1.5 rounded text-xs font-mono text-content-secondary"
-                                      />
-                                      {needsDnsPriority(editDnsType) && (
-                                        <input
-                                          type="number"
-                                          name="dns-edit-priority"
-                                          autoComplete="off"
-                                          min={0}
-                                          max={65535}
-                                          value={editDnsPriority}
-                                          onChange={(e) => setEditDnsPriority(parseInt(e.target.value, 10) || 0)}
-                                          onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
-                                          title="优先级"
-                                          className="w-16 form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
-                                        />
-                                      )}
-                                    </div>
-                                  </td>
-                                  <td className="p-2">
-                                    <input
-                                      type="number"
-                                      name="dns-edit-ttl"
-                                      autoComplete="off"
-                                      min={120}
-                                      max={86400}
-                                      value={editDnsTtl}
-                                      onChange={(e) => setEditDnsTtl(parseInt(e.target.value, 10) || 600)}
-                                      onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
-                                      className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
-                                    />
-                                  </td>
-                                  <td className="p-2">
-                                    <input
-                                      type="text"
-                                      name="dns-edit-line"
-                                      autoComplete="off"
-                                      value={editDnsLine}
-                                      onChange={(e) => setEditDnsLine(e.target.value)}
-                                      onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
-                                      placeholder="默认"
-                                      className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
-                                    />
-                                  </td>
-                                  <td className="p-2">
+                                  <td className="p-3 text-xs text-content-muted">{rec.ttl}</td>
+                                  <td className="p-3 text-xs text-content-muted">{rec.line || "默认"}</td>
+                                  <td className="p-3">
                                     <div className="flex items-center justify-center gap-1">
-                                      <button
-                                        onClick={() => handleUpdateDnsRecord(key)}
-                                        disabled={actionLoading === `update-dns-${key}`}
-                                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 p-1 hover:bg-emerald-950/40 rounded transition-all"
-                                        title="保存修改（回车）"
-                                      >
-                                        {actionLoading === `update-dns-${key}` ? (
-                                          <RefreshCw className="w-4 h-4 animate-spin" />
-                                        ) : (
-                                          <Save className="w-4 h-4" />
-                                        )}
-                                      </button>
-                                      <button
-                                        onClick={() => setEditingDnsKey(null)}
-                                        className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded transition-all"
-                                        title="取消（Esc）"
-                                      >
-                                        <X className="w-4 h-4" />
-                                      </button>
+                                      {p.editButton}
+                                      {p.deleteButton}
                                     </div>
                                   </td>
                                 </tr>
                               );
-                            }
-
-                            return (
-                              <tr key={key} className="hover:bg-hovered">
-                                <td className="p-3">
-                                  <input
-                                    type="checkbox"
-                                    checked={selectedDnsKeys.has(key)}
-                                    onChange={() => toggleDnsSelection(key)}
-                                    className="w-4 h-4 accent-indigo-500 cursor-pointer align-middle"
-                                  />
-                                </td>
-                                <td className="p-3 font-bold text-xs text-indigo-400">{rec.type}</td>
-                                <td className="p-3 font-mono text-xs">{rec.name}</td>
-                                <td className="p-3 font-mono text-xs break-all max-w-xs" title={rec.content}>
-                                  {rec.priority !== null && rec.priority !== undefined && `[优先级: ${rec.priority}] `}
-                                  {rec.content}
-                                </td>
-                                <td className="p-3 text-xs text-content-muted">{rec.ttl}</td>
-                                <td className="p-3 text-xs text-content-muted">{rec.line || "默认"}</td>
-                                <td className="p-3">
-                                  <div className="flex items-center justify-center gap-1">
-                                    <button
-                                      onClick={() => handleStartEditDnsRecord(rec)}
-                                      className="text-indigo-400 hover:text-indigo-300 p-1 hover:bg-indigo-950/40 rounded transition-all"
-                                      title="修改此记录"
-                                    >
-                                      <Pencil className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      onClick={() => handleDeleteDnsRecord(key)}
-                                      disabled={actionLoading === `delete-dns-${key}`}
-                                      className="text-red-400 hover:text-red-300 disabled:opacity-50 p-1 hover:bg-red-950/40 rounded transition-all"
-                                      title="删除此记录"
-                                    >
-                                      <Trash2 className="w-4 h-4" />
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
                     </div>
-                  </div>
+
+                    {/* <md：每条记录一张卡片，字段纵向堆叠；编辑态在同一张卡里展开 */}
+                    <div className="md:hidden space-y-2">
+                      {/* 卡片模式下表头消失了，全选入口单独给一行 */}
+                      <label className="flex items-center gap-2 px-1 py-1 text-xs text-content-muted">
+                        <input
+                          type="checkbox"
+                          checked={dnsRecords.length > 0 && selectedDnsKeys.size === dnsRecords.length}
+                          onChange={toggleAllDnsSelection}
+                          className="w-4 h-4 accent-indigo-500 cursor-pointer"
+                        />
+                        全选（共 {dnsRecords.length} 条）
+                      </label>
+
+                      {dnsRecords.map((rec) => {
+                        const p = dnsRowParts(rec);
+
+                        if (p.isEditing) {
+                          return (
+                            <div
+                              key={p.key}
+                              className="bg-indigo-500/5 border border-indigo-500/40 rounded-lg p-3 space-y-2.5"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-[11px] font-bold text-indigo-300 uppercase tracking-wider">
+                                  修改解析记录
+                                </span>
+                                <div className="flex items-center gap-1">
+                                  {p.saveButton}
+                                  {p.cancelButton}
+                                </div>
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-content-muted mb-1">记录类型</label>
+                                {p.typeSelect}
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-content-muted mb-1">主机记录</label>
+                                {p.nameInput}
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-content-muted mb-1">
+                                  记录值{p.priorityInput ? " / 优先级" : ""}
+                                </label>
+                                <div className="flex items-center gap-1.5">
+                                  {p.contentInput}
+                                  {p.priorityInput}
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-2 gap-2">
+                                <div>
+                                  <label className="block text-[11px] text-content-muted mb-1">TTL (秒)</label>
+                                  {p.ttlInput}
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] text-content-muted mb-1">解析线路</label>
+                                  {p.lineInput}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <div
+                            key={p.key}
+                            className={`bg-hovered border rounded-lg p-3 space-y-2 ${
+                              selectedDnsKeys.has(p.key) ? "border-indigo-500/50" : "border-border-base"
+                            }`}
+                          >
+                            <div className="flex items-center gap-2">
+                              {p.checkbox}
+                              <span className="font-bold text-xs text-indigo-400">{rec.type}</span>
+                              <span className="ml-auto flex items-center gap-1">
+                                {p.editButton}
+                                {p.deleteButton}
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-[4.5rem_1fr] gap-x-2 gap-y-1 text-xs">
+                              <span className="text-content-muted">主机记录</span>
+                              <span className="font-mono text-content-secondary break-all">{rec.name}</span>
+
+                              <span className="text-content-muted">记录值</span>
+                              <span className="font-mono text-content-secondary break-all">
+                                {rec.priority !== null && rec.priority !== undefined && `[优先级: ${rec.priority}] `}
+                                {rec.content}
+                              </span>
+
+                              <span className="text-content-muted">TTL</span>
+                              <span className="text-content-secondary">{rec.ttl}</span>
+
+                              <span className="text-content-muted">线路</span>
+                              <span className="text-content-secondary">{rec.line || "默认"}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
                 )}
               </div>
 
             </div>
 
             {/* 模态框页脚 */}
-            <div className="bg-elevated px-6 py-4 border-t border-border-base flex justify-end">
+            <div className="bg-elevated px-4 sm:px-6 py-4 border-t border-border-base flex justify-end flex-shrink-0">
               <button
                 onClick={() => setDnsModalOpen(false)}
                 className="bg-elevated hover:bg-hovered text-content-secondary text-sm font-semibold px-4 py-2 rounded-lg"
@@ -6396,29 +6694,29 @@ export default function App() {
       {/* NS 域名服务器修改与重置模态框 (NS Modal) */}
       {/* 删除域名确认弹窗 —— 不可逆操作，需输入完整域名二次确认 */}
       {deleteModalDomain && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-          <div className="bg-surface border border-rose-900/60 w-full max-w-lg rounded-2xl overflow-hidden flex flex-col shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-surface border border-rose-900/60 w-full max-w-lg max-h-[90dvh] rounded-2xl overflow-hidden flex flex-col shadow-2xl">
             {/* 头部 */}
-            <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
-              <div>
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between gap-2 border-b border-border-base flex-shrink-0">
+              <div className="min-w-0">
                 <h3 className="text-lg font-bold text-content-primary flex items-center gap-2">
-                  <Trash2 className="text-rose-400 w-5 h-5" />
+                  <Trash2 className="text-rose-400 w-5 h-5 flex-shrink-0" />
                   删除域名
                 </h3>
-                <p className="text-xs text-content-muted mt-0.5 font-mono">
+                <p className="text-xs text-content-muted mt-0.5 font-mono truncate">
                   {toUnicode(deleteModalDomain.full_domain)}
                 </p>
               </div>
               <button
                 onClick={() => setDeleteModalDomain(null)}
-                className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded flex-shrink-0"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             {/* 内容 */}
-            <div className="p-6 space-y-4">
+            <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
               <div className="p-4 rounded-xl border border-rose-900/60 bg-rose-950/30 text-sm text-rose-200 flex gap-3">
                 <AlertTriangle className="w-5 h-5 shrink-0 text-rose-400 mt-0.5" />
                 <div className="space-y-1">
@@ -6465,7 +6763,7 @@ export default function App() {
             </div>
 
             {/* 底部操作 */}
-            <div className="bg-elevated px-6 py-4 flex items-center justify-end gap-3 border-t border-border-base">
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-end gap-3 border-t border-border-base flex-shrink-0">
               <button
                 onClick={() => setDeleteModalDomain(null)}
                 className="text-xs font-semibold px-4 py-2 rounded-lg bg-elevated hover:bg-hovered text-content-secondary border border-border-base"
@@ -6498,29 +6796,29 @@ export default function App() {
       )}
 
       {nsModalOpen && nsModalDomain && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-          <div className="bg-surface border border-border-base w-full max-w-2xl rounded-2xl overflow-hidden flex flex-col shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-surface border border-border-base w-full max-w-2xl max-h-[90dvh] rounded-2xl overflow-hidden flex flex-col shadow-2xl">
             {/* 模态框头部 */}
-            <div className="bg-elevated px-6 py-4 flex items-center justify-between border-b border-border-base">
-              <div>
-                <h3 className="text-lg font-bold text-content-primary flex items-center gap-2">
-                  <Server className="text-sky-400 w-5 h-5" />
-                  NS 域名服务器设置 / 域名委派
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between gap-2 border-b border-border-base flex-shrink-0">
+              <div className="min-w-0">
+                <h3 className="text-base sm:text-lg font-bold text-content-primary flex items-center gap-2">
+                  <Server className="text-sky-400 w-5 h-5 flex-shrink-0" />
+                  <span className="truncate">NS 域名服务器设置 / 域名委派</span>
                 </h3>
-                <p className="text-xs text-content-muted mt-0.5 font-mono">
+                <p className="text-xs text-content-muted mt-0.5 font-mono truncate">
                   域名: {nsModalDomain.full_domain}
                 </p>
               </div>
-              <button 
+              <button
                 onClick={() => setNsModalOpen(false)}
-                className="text-content-muted hover:text-content-primary p-1 hover:bg-hovered rounded"
+                className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded flex-shrink-0"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             {/* 模态框内容 */}
-            <div className="p-6 overflow-y-auto space-y-6">
+            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4 sm:space-y-6">
               
               {/* 当前 NS 状态指示
                   以域名自身的委派状态（checkHasDns，来自同步的 ns1/ns2 字段）为准，
@@ -6583,7 +6881,7 @@ export default function App() {
                             handleSyncDomains();
                           }}
                           disabled={actionLoading === `delete-dns-${rec.id ?? rec.record_id}`}
-                          className="text-red-400 hover:text-red-300 p-1 hover:bg-red-950/40 rounded transition-all"
+                          className="text-red-400 hover:text-red-300 p-2 md:p-1 hover:bg-red-950/40 rounded transition-all"
                           title="删除此 NS 记录"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -6663,7 +6961,7 @@ export default function App() {
             </div>
 
             {/* 页脚 */}
-            <div className="bg-elevated px-6 py-4 border-t border-border-base flex justify-end">
+            <div className="bg-elevated px-4 sm:px-6 py-4 border-t border-border-base flex justify-end flex-shrink-0">
               <button
                 onClick={() => setNsModalOpen(false)}
                 className="bg-elevated hover:bg-hovered text-content-secondary text-sm font-semibold px-4 py-2 rounded-lg"

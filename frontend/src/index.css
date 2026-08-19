@@ -48,7 +48,54 @@
     background-color: var(--bg-base);
     color: var(--text-primary);
     transition: background-color 0.3s ease, color 0.3s ease;
+    /* 阻止 iOS 横竖屏切换时自动放大字号，避免布局在横屏下走形 */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
   }
+}
+
+/*
+ * 触控设备适配
+ *
+ * NOTE: hover 态在触屏上是"点完粘住"的 —— 手指离开后 :hover 仍然生效，
+ * 于是卡片/按钮会停在位移后的位置，看起来像错位。这里只在没有真实悬停能力的
+ * 设备上取消位移（颜色与阴影保留，仍有按下反馈），桌面完全不受影响。
+ */
+@media (hover: none) {
+  .glass-card:hover,
+  .btn-primary:hover {
+    transform: none;
+  }
+}
+
+/* 去掉触屏点击时的蓝色高亮方块，改由各自的 hover/active 样式表达反馈 */
+@media (hover: none) and (pointer: coarse) {
+  button,
+  a,
+  select,
+  [role="button"] {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* 细滚动条（长列表容器用，如批量扫描日志） */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-base) transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: var(--border-base);
+  border-radius: 3px;
 }
 
 /* 高端玻璃微卡特效 */
@@ -92,6 +139,20 @@
   border-color: #6366f1;
   box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
   outline: none;
+}
+
+/*
+ * 窄屏下把输入框字号提到 16px
+ *
+ * NOTE: iOS Safari 在聚焦 font-size < 16px 的输入框时会强制放大整个页面
+ * （放大后不会自动还原，用户得手动缩回去）。调用处普遍是 text-sm / text-xs /
+ * text-[11px]，所以在这里统一兜底。断点与 Tailwind md 对齐：≥768px 仍用调用处
+ * 的紧凑字号，密集表单（如 DNS 记录表格的行内编辑）在桌面上的观感不变。
+ */
+@media (max-width: 767px) {
+  .form-input {
+    font-size: 16px;
+  }
 }
 
 /*

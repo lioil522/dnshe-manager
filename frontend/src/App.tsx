@@ -34,7 +34,9 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsDownUp,
-  ChevronsUpDown
+  ChevronsUpDown,
+  Eye,
+  EyeOff
 } from "lucide-react";
 import { toASCII, hasNonASCII, toUnicode } from "./punycode";
 import {
@@ -134,6 +136,61 @@ interface AppLog {
 
 /** 简易异步等待工具（用于轮询后台同步进度） */
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 带「显示 / 隐藏」小眼睛的密码输入框
+ *
+ * 用在所有 type="password" 的位置（登录、初始化、修改密码、API Secret），
+ * 让用户能自查手输 / 粘贴的内容，省掉「输了两遍还是不匹配」的来回。
+ *
+ * NOTE: 必须定义在 App() 外面。若写成 App 内部的组件，App 每次重渲染都会生成
+ * 新的组件类型，React 会卸载重挂载整棵子树 —— 明暗态会被重置，输入框还会丢焦点。
+ *
+ * NOTE: 眼睛按钮一定要写 type="button"。登录页与初始化表单是真 <form onSubmit>，
+ * button 默认 type="submit"，点一下眼睛就会顺手把表单提交掉。
+ *
+ * NOTE: name / autoComplete 一律原样透传给 input，不在这里加工。本项目为了压制
+ * Chrome 的凭据预填，刻意把修改密码的三个框都标成 new-password、并给 name 取了
+ * 不像 username 的值（见「修改登录密码」处的注释），组件替调用处改写会破坏这套约定。
+ */
+const PasswordInput: React.FC<{
+  value: string;
+  onChange: (value: string) => void;
+  className: string;
+  placeholder?: string;
+  name?: string;
+  autoComplete?: string;
+  required?: boolean;
+}> = ({ value, onChange, className, placeholder, name, autoComplete, required }) => {
+  const [visible, setVisible] = useState(false);
+
+  return (
+    <div className="relative">
+      <input
+        /* 明文态切成 type="text"；pr-10 给右侧眼睛让位，避免长密码钻到图标底下。
+           Tailwind 生成的 CSS 里 pr-* 排在 px-* 之后，所以能盖住调用处的 px-3 / px-3.5 */
+        type={visible ? "text" : "password"}
+        name={name}
+        autoComplete={autoComplete}
+        required={required}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className={`${className} pr-10`}
+      />
+      <button
+        type="button"
+        onClick={() => setVisible((v) => !v)}
+        /* 命中区撑满输入框高度，窄屏上也够点 */
+        className="absolute inset-y-0 right-0 px-3 flex items-center text-content-muted hover:text-content-primary transition-colors"
+        title={visible ? "隐藏密码" : "显示密码"}
+        aria-label={visible ? "隐藏密码" : "显示密码"}
+      >
+        {visible ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+      </button>
+    </div>
+  );
+};
 
 /**
  * 主应用组件 - 提供 DNSHE 域名管理控制面板
@@ -986,14 +1043,14 @@ export default function App() {
 
     if (statusText === "已委派") {
       return (
-        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-sky-950/80 text-sky-300 border border-sky-800/60">
+        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-800/60">
           已委派
         </span>
       );
     }
     if (statusText === "已解析") {
       return (
-        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-emerald-950/80 text-emerald-400 border border-emerald-900/60">
+        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60">
           已解析
         </span>
       );
@@ -1059,7 +1116,7 @@ export default function App() {
             系统默认
           </span>
         ) : (
-          <span className="bg-sky-950/80 text-sky-300 border border-sky-800/60 text-xs font-medium px-2.5 py-0.5 rounded-md">
+          <span className="bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-800/60 text-xs font-medium px-2.5 py-0.5 rounded-md">
             {getDnsProviderLabel(dom)}
           </span>
         )}
@@ -1126,7 +1183,7 @@ export default function App() {
                   setOpenActionMenuId(null);
                   handleOpenDeleteModal(dom);
                 }}
-                className="w-full text-left px-3.5 py-2.5 hover:bg-rose-950/40 text-rose-400 hover:text-rose-300 flex items-center gap-2 border-t border-border-base"
+                className="w-full text-left px-3.5 py-2.5 hover:bg-rose-50 text-rose-600 hover:text-rose-700 dark:hover:bg-rose-950/40 dark:text-rose-400 dark:hover:text-rose-300 flex items-center gap-2 border-t border-border-base"
               >
                 <Trash2 className="w-3.5 h-3.5" /> 删除域名
               </button>
@@ -2287,7 +2344,7 @@ export default function App() {
         <button
           onClick={() => handleUpdateDnsRecord(key)}
           disabled={saving}
-          className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 p-2 md:p-1 hover:bg-emerald-950/40 rounded transition-all"
+          className="text-emerald-700 hover:text-emerald-800 disabled:opacity-50 p-2 md:p-1 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:text-emerald-300 dark:hover:bg-emerald-950/40 rounded transition-all"
           title="保存修改（回车）"
         >
           {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
@@ -2306,7 +2363,7 @@ export default function App() {
       editButton: (
         <button
           onClick={() => handleStartEditDnsRecord(rec)}
-          className="text-indigo-400 hover:text-indigo-300 p-2 md:p-1 hover:bg-indigo-950/40 rounded transition-all"
+          className="text-indigo-600 hover:text-indigo-700 p-2 md:p-1 hover:bg-indigo-50 dark:text-indigo-400 dark:hover:text-indigo-300 dark:hover:bg-indigo-950/40 rounded transition-all"
           title="修改此记录"
         >
           <Pencil className="w-4 h-4" />
@@ -2316,7 +2373,7 @@ export default function App() {
         <button
           onClick={() => handleDeleteDnsRecord(key)}
           disabled={actionLoading === `delete-dns-${key}`}
-          className="text-red-400 hover:text-red-300 disabled:opacity-50 p-2 md:p-1 hover:bg-red-950/40 rounded transition-all"
+          className="text-red-600 hover:text-red-700 disabled:opacity-50 p-2 md:p-1 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-950/40 rounded transition-all"
           title="删除此记录"
         >
           <Trash2 className="w-4 h-4" />
@@ -3408,14 +3465,14 @@ export default function App() {
     // 鉴权状态尚未加载完成时，先展示加载态，避免登录/初始化界面闪烁
     if (!authStatusLoaded) {
       return (
-        <div className="flex h-screen items-center justify-center bg-base text-content-primary">
+        <div className="flex h-screen items-center justify-center bg-page text-content-primary">
           <RefreshCw className="w-6 h-6 animate-spin text-indigo-500" />
         </div>
       );
     }
 
     return (
-      <div className="flex h-screen items-center justify-center bg-base text-content-primary px-4">
+      <div className="flex h-screen items-center justify-center bg-page text-content-primary px-4">
         <div className="w-full max-w-sm bg-surface border border-border-base rounded-2xl shadow-2xl p-7 space-y-6">
           {/* 头部 LOGO */}
           <div className="flex flex-col items-center gap-2 text-center">
@@ -3430,7 +3487,7 @@ export default function App() {
 
           {/* 错误提示 */}
           {loginError && (
-            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-xs">
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-400 text-xs">
               <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
               <span>{loginError}</span>
             </div>
@@ -3452,11 +3509,10 @@ export default function App() {
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs font-semibold text-content-secondary">密码</label>
-                <input
-                  type="password"
+                <PasswordInput
                   autoComplete="current-password"
                   value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
+                  onChange={setLoginPassword}
                   placeholder="登录密码"
                   className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                 />
@@ -3502,22 +3558,20 @@ export default function App() {
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs font-semibold text-content-secondary">设置密码</label>
-                <input
-                  type="password"
+                <PasswordInput
                   autoComplete="new-password"
                   value={setupPassword}
-                  onChange={(e) => setSetupPassword(e.target.value)}
+                  onChange={setSetupPassword}
                   placeholder="至少 8 个字符"
                   className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                 />
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs font-semibold text-content-secondary">确认密码</label>
-                <input
-                  type="password"
+                <PasswordInput
                   autoComplete="new-password"
                   value={setupPassword2}
-                  onChange={(e) => setSetupPassword2(e.target.value)}
+                  onChange={setSetupPassword2}
                   placeholder="再次输入密码"
                   className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                 />
@@ -3555,7 +3609,7 @@ export default function App() {
       NOTE: 高度用 100dvh 而非 100vh —— 移动浏览器的 100vh 把地址栏高度也算进去，
       底部内容会被切掉一截。桌面上 dvh 与 vh 等价，渲染结果不变。
     */
-    <div className="flex h-[100dvh] overflow-hidden bg-base text-content-primary">
+    <div className="flex h-[100dvh] overflow-hidden bg-page text-content-primary">
 
       {/* 手机抽屉遮罩：点击关闭；≥md 侧栏常驻，不需要遮罩 */}
       {sidebarOpen && (
@@ -3727,7 +3781,7 @@ export default function App() {
                   <span>最近告警</span>
                   <button
                     onClick={() => { markAlertsRead(); setActiveTab("logs"); setNotifOpen(false); }}
-                    className="text-indigo-400 hover:text-indigo-300"
+                    className="text-indigo-600 hover:text-indigo-700 dark:text-indigo-400 dark:hover:text-indigo-300"
                   >
                     查看全部
                   </button>
@@ -3928,7 +3982,7 @@ export default function App() {
                       <div className="bg-surface border border-emerald-500/30 rounded-2xl p-4 sm:p-6 shadow-xl space-y-4">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-border-base pb-4">
                           <div className="min-w-0">
-                            <span className="inline-block bg-emerald-500/20 text-emerald-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
+                            <span className="inline-block bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
                               尚未注册
                             </span>
                             <h4 className="text-lg sm:text-xl font-bold text-content-primary break-all">
@@ -3980,7 +4034,7 @@ export default function App() {
                       <div className="bg-surface border border-red-500/30 rounded-2xl p-4 sm:p-6 shadow-xl space-y-4">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-border-base pb-4">
                           <div className="min-w-0">
-                            <span className="inline-block bg-red-500/20 text-red-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
+                            <span className="inline-block bg-red-50 text-red-700 dark:bg-red-500/20 dark:text-red-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
                               已被注册
                             </span>
                             <h4 className="text-lg sm:text-xl font-bold text-content-secondary break-all">
@@ -4064,7 +4118,7 @@ export default function App() {
                           showToast("info", "已清空生成规则");
                         }}
                         disabled={!batchRules}
-                        className="shrink-0 text-xs font-semibold text-content-muted hover:text-red-400 border border-border-base hover:border-red-500/40 bg-elevated hover:bg-red-950/30 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="shrink-0 text-xs font-semibold text-content-muted hover:text-red-700 border border-border-base hover:border-red-300 bg-elevated hover:bg-red-50 dark:hover:text-red-400 dark:hover:border-red-500/40 dark:hover:bg-red-950/30 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                         一键清空
@@ -4163,7 +4217,7 @@ export default function App() {
                         <button
                           key={tag}
                           onClick={() => setBatchRules(prev => `${prev}{${tag}}`)}
-                          className="bg-elevated hover:bg-indigo-950/60 text-content-secondary hover:text-indigo-300 border border-border-base hover:border-indigo-500/40 text-xs px-3 py-1.5 rounded-lg transition-all"
+                          className="bg-elevated hover:bg-indigo-50 text-content-secondary hover:text-indigo-700 border border-border-base hover:border-indigo-300 dark:hover:bg-indigo-950/60 dark:hover:text-indigo-300 dark:hover:border-indigo-500/40 text-xs px-3 py-1.5 rounded-lg transition-all"
                         >
                           {tag}
                         </button>
@@ -4180,7 +4234,7 @@ export default function App() {
                       <div className="flex items-center gap-2 shrink-0">
                         <button
                           onClick={openCreateBank}
-                          className="text-xs font-semibold text-indigo-400 hover:text-indigo-300 border border-indigo-500/40 hover:border-indigo-500 bg-indigo-950/30 hover:bg-indigo-950/60 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5"
+                          className="text-xs font-semibold text-indigo-700 hover:text-indigo-800 border border-indigo-200 hover:border-indigo-300 bg-indigo-50 hover:bg-indigo-100 dark:text-indigo-400 dark:hover:text-indigo-300 dark:border-indigo-500/40 dark:hover:border-indigo-500 dark:bg-indigo-950/30 dark:hover:bg-indigo-950/60 px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5"
                         >
                           <Plus className="w-3.5 h-3.5" />
                           新建词库
@@ -4289,12 +4343,12 @@ export default function App() {
                             reservedPrefixes.map((p) => (
                               <span
                                 key={p}
-                                className="group flex items-center bg-red-950/30 border border-red-500/30 text-red-300 text-xs rounded-lg overflow-hidden"
+                                className="group flex items-center bg-red-50 border border-red-200 text-red-700 dark:bg-red-950/30 dark:border-red-500/30 dark:text-red-300 text-xs rounded-lg overflow-hidden"
                               >
                                 <span className="px-2.5 py-1 font-mono">{p}</span>
                                 <button
                                   onClick={() => handleRemoveReserved(p)}
-                                  className="px-1.5 py-1 text-red-400/60 hover:text-red-300 hover:bg-red-900/40 transition-all border-l border-red-500/30"
+                                  className="px-1.5 py-1 text-red-500/70 hover:text-red-800 hover:bg-red-100 border-l border-red-200 dark:text-red-400/60 dark:hover:text-red-300 dark:hover:bg-red-900/40 dark:border-red-500/30 transition-all"
                                   title={`从名单移除 ${p}`}
                                 >
                                   <X className="w-3 h-3" />
@@ -4397,8 +4451,8 @@ export default function App() {
 
                     {/* 断点续查提示条 */}
                     {scanCursor && scanStatus !== "running" && (
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-amber-950/30 border border-amber-500/30 rounded-xl px-4 py-3">
-                        <div className="text-xs text-amber-300">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-amber-50 border border-amber-200 dark:bg-amber-950/30 dark:border-amber-500/30 rounded-xl px-4 py-3">
+                        <div className="text-xs text-amber-800 dark:text-amber-300">
                           🔖 检测到上次未完成的扫描断点：
                           <span className="font-mono font-bold mx-1">{scanCursor.lastCandidate || "起点"}</span>
                           （已查 {scanCursor.checked} 个 · 保存于 {scanCursor.savedAt}）
@@ -4454,7 +4508,7 @@ export default function App() {
                             key={root}
                             className={`group relative flex items-center justify-between p-2.5 md:p-2 rounded-lg border text-xs font-mono transition-all ${
                               isChecked
-                                ? "bg-indigo-950/40 border-indigo-500/50 text-indigo-300"
+                                ? "bg-indigo-100 border-indigo-300 text-indigo-800 dark:bg-indigo-950/40 dark:border-indigo-500/50 dark:text-indigo-300"
                                 : "bg-elevated border-border-base text-content-muted hover:text-content-primary"
                             }`}
                           >
@@ -4506,7 +4560,7 @@ export default function App() {
                       <button
                         type="submit"
                         disabled={!newRootInput.trim()}
-                        className="bg-elevated hover:bg-hovered text-indigo-400 hover:text-indigo-300 border border-border-base text-xs px-3 py-1.5 rounded-lg transition-all flex items-center gap-1 disabled:opacity-40"
+                        className="bg-elevated hover:bg-hovered text-indigo-600 hover:text-indigo-700 dark:text-indigo-400 dark:hover:text-indigo-300 border border-border-base text-xs px-3 py-1.5 rounded-lg transition-all flex items-center gap-1 disabled:opacity-40"
                       >
                         <Plus className="w-3.5 h-3.5" /> 添加根域
                       </button>
@@ -4594,7 +4648,7 @@ export default function App() {
                           {availableDomainsList.map((item, idx) => (
                             <div
                               key={idx}
-                              className="bg-emerald-950/30 border border-emerald-500/30 rounded-xl p-3 flex items-center justify-between gap-2 hover:border-emerald-500 transition-all"
+                              className="bg-emerald-50 border border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-500/30 rounded-xl p-3 flex items-center justify-between gap-2 hover:border-emerald-500 transition-all"
                             >
                               <div className="min-w-0">
                                 <span className="font-mono text-sm font-bold text-content-primary block truncate">
@@ -4724,14 +4778,14 @@ export default function App() {
               {/* NOTE: 这一组原先没有 flex-wrap，却装着三个 whitespace-nowrap 的元素 */}
               <div className="flex flex-wrap items-center gap-2 sm:gap-4 w-full md:w-auto">
                 {globalSearch.trim() && (
-                  <div className="flex items-center gap-1.5 text-xs bg-amber-950/40 text-amber-300 border border-amber-900/60 px-2.5 py-1 rounded-full whitespace-nowrap">
+                  <div className="flex items-center gap-1.5 text-xs bg-amber-50 text-amber-800 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900/60 px-2.5 py-1 rounded-full whitespace-nowrap">
                     <Search className="w-3 h-3 shrink-0" />
                     <span className="font-mono">
                       搜索「{globalSearch.trim()}」· 命中 {searchHitCount} 个
                     </span>
                     <button
                       onClick={() => setGlobalSearch("")}
-                      className="ml-0.5 font-semibold underline decoration-dotted hover:text-amber-100 transition-colors"
+                      className="ml-0.5 font-semibold underline decoration-dotted hover:text-amber-900 dark:hover:text-amber-100 transition-colors"
                     >
                       清除
                     </button>
@@ -4815,8 +4869,8 @@ export default function App() {
                               <span className="text-content-muted">·</span>
                             </>
                           )}
-                          <span className="text-indigo-300 truncate max-w-full">{group.alias}</span>
-                          <span className="text-[11px] md:text-xs bg-indigo-950/80 text-indigo-300 border border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
+                          <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
+                          <span className="text-[11px] md:text-xs bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
                             共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
                           </span>
                         </h3>
@@ -4916,7 +4970,7 @@ export default function App() {
                         <button
                           onClick={() => openEditAccount(acc)}
                           disabled={actionLoading === `update-account-${acc.id}`}
-                          className="bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-400 hover:text-indigo-200 border border-indigo-900/50 p-2 rounded-lg transition-all"
+                          className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 hover:text-indigo-800 border border-indigo-200 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/60 dark:text-indigo-400 dark:hover:text-indigo-200 dark:border-indigo-900/50 p-2 rounded-lg transition-all"
                           title="修改账号"
                         >
                           <Pencil className="w-4 h-4" />
@@ -4924,7 +4978,7 @@ export default function App() {
                         <button
                           onClick={() => handleDeleteAccount(acc.id)}
                           disabled={actionLoading === `delete-account-${acc.id}`}
-                          className="bg-red-950/60 hover:bg-red-900/60 text-red-400 hover:text-red-200 border border-red-900/50 p-2 rounded-lg transition-all"
+                          className="bg-red-50 hover:bg-red-100 text-red-700 hover:text-red-800 border border-red-200 dark:bg-red-950/60 dark:hover:bg-red-900/60 dark:text-red-400 dark:hover:text-red-200 dark:border-red-900/50 p-2 rounded-lg transition-all"
                           title="删除账号"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -4995,12 +5049,11 @@ export default function App() {
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret（留空保持不变）</label>
-                  <input
-                    type="password"
+                  <PasswordInput
                     name="dnshe-edit-api-secret"
                     autoComplete="new-password"
                     value={editApiSecret}
-                    onChange={(e) => setEditApiSecret(e.target.value)}
+                    onChange={setEditApiSecret}
                     placeholder="如需更换密钥则填写新的 API Secret"
                     className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
                   />
@@ -5174,14 +5227,13 @@ export default function App() {
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret</label>
-                  <input
-                    type="password"
+                  <PasswordInput
                     required
                     name="dnshe-bind-api-secret"
                     autoComplete="new-password"
                     placeholder="请输入 API Secret"
                     value={newApiSecret}
-                    onChange={(e) => setNewApiSecret(e.target.value)}
+                    onChange={setNewApiSecret}
                     className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
                   />
                 </div>
@@ -5279,8 +5331,8 @@ export default function App() {
                         key={idx}
                         className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
                           r.success
-                            ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
-                            : "bg-red-500/10 border-red-500/30 text-red-300"
+                            ? "bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-500/10 dark:border-emerald-500/30 dark:text-emerald-300"
+                            : "bg-red-50 border-red-200 text-red-700 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300"
                         }`}
                       >
                         <div className="min-w-0">
@@ -5330,9 +5382,9 @@ export default function App() {
                 {quotas.map((q, idx) => {
                   if (q.error) {
                     return (
-                      <div key={idx} className="bg-red-950/20 border border-red-900/50 rounded-xl p-4 sm:p-5">
-                        <h3 className="font-bold text-red-400 truncate">{q.alias}</h3>
-                        <p className="text-red-300 text-sm mt-2 flex items-start gap-1.5">
+                      <div key={idx} className="bg-red-50 border border-red-200 dark:bg-red-950/20 dark:border-red-900/50 rounded-xl p-4 sm:p-5">
+                        <h3 className="font-bold text-red-700 dark:text-red-400 truncate">{q.alias}</h3>
+                        <p className="text-red-800 dark:text-red-300 text-sm mt-2 flex items-start gap-1.5">
                           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
                           <span className="min-w-0 break-words">API 调用异常: {q.error}</span>
                         </p>
@@ -5346,7 +5398,7 @@ export default function App() {
                     <div key={q.account_id} className="glass-card rounded-xl p-4 sm:p-5 border border-border-base">
                       <div className="flex justify-between items-center gap-2 mb-4">
                         <h3 className="font-bold text-content-primary text-base sm:text-lg truncate min-w-0">{q.alias}</h3>
-                        <span className="text-xs bg-indigo-950 text-indigo-300 px-2 py-0.5 rounded-full flex-shrink-0">
+                        <span className="text-xs bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300 px-2 py-0.5 rounded-full flex-shrink-0">
                           可用: {q.available}
                         </span>
                       </div>
@@ -5397,7 +5449,7 @@ export default function App() {
               <button
                 onClick={handleClearLogs}
                 disabled={actionLoading === "clear-logs"}
-                className="bg-red-950/60 hover:bg-red-900/60 text-red-400 hover:text-red-200 border border-red-900/50 px-3 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition-all flex-shrink-0"
+                className="bg-red-50 hover:bg-red-100 text-red-700 hover:text-red-800 border border-red-200 dark:bg-red-950/60 dark:hover:bg-red-900/60 dark:text-red-400 dark:hover:text-red-200 dark:border-red-900/50 px-3 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition-all flex-shrink-0"
               >
                 清空运行日志
               </button>
@@ -5583,7 +5635,7 @@ export default function App() {
                       </div>
                       <button
                         onClick={() => { setBackendUrlInput(localStorage.getItem("DNSHE_BACKEND_URL") || ""); setBackendUrlEditing(true); }}
-                        className="bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-400 hover:text-indigo-200 border border-indigo-900/50 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 flex-shrink-0"
+                        className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 hover:text-indigo-800 border border-indigo-200 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/60 dark:text-indigo-400 dark:hover:text-indigo-200 dark:border-indigo-900/50 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 flex-shrink-0"
                       >
                         <Pencil className="w-3.5 h-3.5" /> {backendUrl ? "修改" : "配置"}
                       </button>
@@ -5621,31 +5673,28 @@ export default function App() {
                       Chrome 就不会发起这次凭据填充，也就不会再去找用户名字段。
                       name 也故意取成不像 username 的值，避免命中它的启发式。
                     */}
-                    <input
-                      type="password"
+                    <PasswordInput
                       name="dnshe-old-password"
                       autoComplete="new-password"
                       value={pwOld}
-                      onChange={(e) => setPwOld(e.target.value)}
+                      onChange={setPwOld}
                       placeholder="原密码"
                       className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                     />
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      <input
-                        type="password"
+                      <PasswordInput
                         name="dnshe-new-password"
                         autoComplete="new-password"
                         value={pwNew}
-                        onChange={(e) => setPwNew(e.target.value)}
+                        onChange={setPwNew}
                         placeholder="新密码（至少 8 位）"
                         className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                       />
-                      <input
-                        type="password"
+                      <PasswordInput
                         name="dnshe-new-password-confirm"
                         autoComplete="new-password"
                         value={pwNew2}
-                        onChange={(e) => setPwNew2(e.target.value)}
+                        onChange={setPwNew2}
                         placeholder="确认新密码"
                         className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                       />
@@ -5680,7 +5729,7 @@ export default function App() {
                         </div>
                         <div className="text-xs text-content-muted mt-0.5">开启后登录需额外输入身份验证器的 6 位动态码</div>
                       </div>
-                      <span className={`text-xs px-2.5 py-1 rounded-full font-semibold self-start sm:self-auto flex-shrink-0 ${accountInfo.two_fa_enabled ? "bg-emerald-500/20 text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
+                      <span className={`text-xs px-2.5 py-1 rounded-full font-semibold self-start sm:self-auto flex-shrink-0 ${accountInfo.two_fa_enabled ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
                         {accountInfo.two_fa_enabled ? "已开启" : "未开启"}
                       </span>
                     </div>
@@ -5757,7 +5806,7 @@ export default function App() {
                         <button
                           onClick={handleDisable2fa}
                           disabled={actionLoading === "2fa-disable"}
-                          className="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
+                          className="bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 dark:bg-red-500/10 dark:hover:bg-red-500/20 dark:text-red-400 dark:border-red-500/30 px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
                         >
                           关闭 2FA
                         </button>
@@ -6174,8 +6223,8 @@ export default function App() {
                             key={idx}
                             className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
                               r.success
-                                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
-                                : "bg-red-500/10 border-red-500/30 text-red-300"
+                                ? "bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-500/10 dark:border-emerald-500/30 dark:text-emerald-300"
+                                : "bg-red-50 border-red-200 text-red-700 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300"
                             }`}
                           >
                             <div className="font-mono min-w-0 truncate" title={r.label}>{r.label}</div>
@@ -6214,8 +6263,8 @@ export default function App() {
                         onClick={() => (dnsEditPanelOpen ? setDnsEditPanelOpen(false) : handleOpenDnsEditPanel())}
                         className={`px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
                           dnsEditPanelOpen
-                            ? "bg-indigo-500/20 border-indigo-500/50 text-indigo-200"
-                            : "bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-300 border-indigo-900/60"
+                            ? "bg-indigo-100 border-indigo-300 text-indigo-800 dark:bg-indigo-500/20 dark:border-indigo-500/50 dark:text-indigo-200"
+                            : "bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/60 dark:text-indigo-300 dark:border-indigo-900/60"
                         }`}
                         title="批量修改已勾选记录的指定字段"
                       >
@@ -6225,7 +6274,7 @@ export default function App() {
                       <button
                         onClick={handleBatchDeleteDnsRecords}
                         disabled={actionLoading === "batch-delete-dns"}
-                        className="bg-red-950/60 hover:bg-red-900/60 text-red-300 border border-red-900/60 px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                        className="bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 dark:bg-red-950/60 dark:hover:bg-red-900/60 dark:text-red-300 dark:border-red-900/60 px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
                         title="批量删除已勾选的解析记录"
                       >
                         {actionLoading === "batch-delete-dns" ? (
@@ -6241,9 +6290,14 @@ export default function App() {
 
                 {/* 批量修改面板：勾选哪个字段就只覆盖那个字段 */}
                 {dnsEditPanelOpen && selectedDnsKeys.size > 0 && (
-                  <div className="mb-3 border border-indigo-900/60 bg-indigo-950/20 rounded-lg p-4 space-y-4">
+                  <div className="mb-3 border border-indigo-200 bg-indigo-50 dark:border-indigo-900/60 dark:bg-indigo-950/20 rounded-lg p-4 space-y-4">
                     <div className="flex items-center justify-between gap-2">
-                      <h5 className="text-xs font-bold text-indigo-200 flex items-center gap-1.5">
+                      {/* NOTE: 强调色必须分主题给值 —— 浅色字（*-200/300）只在暗色底上成立，
+                          压在亮色主题的浅底上对比度会掉到 1.1:1 左右，等于没画。
+                          全项目的 tint chip 都按「亮色 bg-*-50 + text-*-700，暗色原值加
+                          dark: 前缀」这一套写，dark 变体带 :is(.dark *) 后缀，特异性比
+                          同名亮色类多一个 class，所以暗色渲染与改造前完全一致。 */}
+                      <h5 className="text-xs font-bold text-indigo-700 dark:text-indigo-200 flex items-center gap-1.5">
                         <Pencil className="w-3.5 h-3.5" />
                         批量修改 {selectedDnsKeys.size} 条记录
                       </h5>
@@ -6472,8 +6526,8 @@ export default function App() {
                             key={idx}
                             className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
                               r.success
-                                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
-                                : "bg-red-500/10 border-red-500/30 text-red-300"
+                                ? "bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-500/10 dark:border-emerald-500/30 dark:text-emerald-300"
+                                : "bg-red-50 border-red-200 text-red-700 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300"
                             }`}
                           >
                             <div className="font-mono min-w-0 truncate" title={r.label}>{r.label}</div>
@@ -6598,7 +6652,7 @@ export default function App() {
                               className="bg-indigo-500/5 border border-indigo-500/40 rounded-lg p-3 space-y-2.5"
                             >
                               <div className="flex items-center justify-between gap-2">
-                                <span className="text-[11px] font-bold text-indigo-300 uppercase tracking-wider">
+                                <span className="text-[11px] font-bold text-indigo-700 dark:text-indigo-300 uppercase tracking-wider">
                                   修改解析记录
                                 </span>
                                 <div className="flex items-center gap-1">
@@ -6695,7 +6749,7 @@ export default function App() {
       {/* 删除域名确认弹窗 —— 不可逆操作，需输入完整域名二次确认 */}
       {deleteModalDomain && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
-          <div className="bg-surface border border-rose-900/60 w-full max-w-lg max-h-[90dvh] rounded-2xl overflow-hidden flex flex-col shadow-2xl">
+          <div className="bg-surface border border-rose-200 dark:border-rose-900/60 w-full max-w-lg max-h-[90dvh] rounded-2xl overflow-hidden flex flex-col shadow-2xl">
             {/* 头部 */}
             <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between gap-2 border-b border-border-base flex-shrink-0">
               <div className="min-w-0">
@@ -6717,11 +6771,11 @@ export default function App() {
 
             {/* 内容 */}
             <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
-              <div className="p-4 rounded-xl border border-rose-900/60 bg-rose-950/30 text-sm text-rose-200 flex gap-3">
-                <AlertTriangle className="w-5 h-5 shrink-0 text-rose-400 mt-0.5" />
+              <div className="p-4 rounded-xl border border-rose-200 bg-rose-50 text-sm text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-200 flex gap-3">
+                <AlertTriangle className="w-5 h-5 shrink-0 text-rose-600 dark:text-rose-400 mt-0.5" />
                 <div className="space-y-1">
                   <p className="font-bold">此操作不可逆</p>
-                  <p className="text-xs text-rose-300/90 leading-relaxed">
+                  <p className="text-xs text-rose-700/90 dark:text-rose-300/90 leading-relaxed">
                     删除后域名将立即释放，可能被他人抢注，且无法恢复。
                   </p>
                 </div>
@@ -6755,7 +6809,7 @@ export default function App() {
               </div>
 
               {deleteError && (
-                <div className="p-3 rounded-lg border border-amber-900/60 bg-amber-950/30 text-xs text-amber-300 flex gap-2">
+                <div className="p-3 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300 flex gap-2">
                   <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span className="leading-relaxed">{deleteError}</span>
                 </div>
@@ -6845,11 +6899,11 @@ export default function App() {
                     </div>
                     <div className="shrink-0">
                       {isDefaultNs ? (
-                        <span className="bg-emerald-950/80 text-emerald-400 border border-emerald-900/60 text-xs px-3 py-1 rounded-full font-semibold">
+                        <span className="bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60 text-xs px-3 py-1 rounded-full font-semibold">
                           系统默认
                         </span>
                       ) : (
-                        <span className="bg-sky-950/80 text-sky-300 border border-sky-800/60 text-xs px-3 py-1 rounded-full font-semibold">
+                        <span className="bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-800/60 text-xs px-3 py-1 rounded-full font-semibold">
                           {providerLabel}
                         </span>
                       )}
@@ -6881,7 +6935,7 @@ export default function App() {
                             handleSyncDomains();
                           }}
                           disabled={actionLoading === `delete-dns-${rec.id ?? rec.record_id}`}
-                          className="text-red-400 hover:text-red-300 p-2 md:p-1 hover:bg-red-950/40 rounded transition-all"
+                          className="text-red-600 hover:text-red-700 p-2 md:p-1 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-950/40 rounded transition-all"
                           title="删除此 NS 记录"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -6893,7 +6947,7 @@ export default function App() {
                   <button
                     onClick={handleResetToDefaultNs}
                     disabled={actionLoading === "reset-ns"}
-                    className="w-full bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-900/60 py-2.5 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all shadow-inner mt-2"
+                    className="w-full bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:hover:bg-emerald-900/60 dark:text-emerald-300 dark:border-emerald-900/60 py-2.5 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all shadow-inner mt-2"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${actionLoading === "reset-ns" ? "animate-spin" : ""}`} />
                     {checkHasDns(nsModalDomain)

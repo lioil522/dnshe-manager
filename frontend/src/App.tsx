@@ -1487,6 +1487,33 @@ export default function App() {
     }
   };
 
+  // 测试 Webhook 推送
+  const handleTestWebhook = async () => {
+    setActionLoading("test-webhook");
+    try {
+      const payload: Record<string, string> = { webhook_type: settings.webhook_type };
+      // 打码值（已配置但未改动）不回传，让后端用库里的原值
+      if (settings.webhook_url && !settings.webhook_url.startsWith("****")) {
+        payload.webhook_url = settings.webhook_url;
+      }
+      const res = await apiFetch("/api/settings/test-webhook", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "测试消息已发送");
+      } else {
+        showToast("error", data.message || "测试推送失败");
+      }
+    } catch (e) {
+      showToast("error", "测试推送网络请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   // 保存本地后端地址
   const handleSaveBackendUrl = () => {
     const v = backendUrlInput.trim().replace(/\/$/, "");
@@ -3747,14 +3774,14 @@ export default function App() {
           {/* 登录页 Toast 通知 */}
         </div>
 
-        {/* 登录页也需要 Toast 通知 */}
+        {/* 登录页也需要 Toast 通知（限宽与换行同全局 Toast，理由见那处注释） */}
         {toast && (
-          <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-lg shadow-2xl border text-sm font-semibold bg-surface text-content-primary border-border-base">
+          <div className="fixed bottom-5 right-5 z-50 max-w-[min(90vw,28rem)] flex items-start gap-2.5 px-4 py-3 rounded-lg shadow-2xl border text-sm font-semibold bg-surface text-content-primary border-border-base">
             {toast.type === "success" && <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0" />}
             {toast.type === "error" && <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0" />}
             {toast.type === "info" && <Info className="w-5 h-5 text-indigo-500 flex-shrink-0" />}
             {toast.type === "warning" && <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0" />}
-            <span>{toast.message}</span>
+            <span className="min-w-0 break-words line-clamp-6">{toast.message}</span>
           </div>
         )}
       </div>
@@ -6099,19 +6126,46 @@ export default function App() {
                     <input
                       value={settings.webhook_url}
                       onChange={(e) => setSettings((s) => ({ ...s, webhook_url: e.target.value }))}
-                      placeholder={settingsConfigured.webhook_url ? "已配置（留空不修改）" : "Webhook URL"}
+                      placeholder={
+                        settingsConfigured.webhook_url
+                          ? "已配置（留空不修改）"
+                          : settings.webhook_type === "serverchan"
+                          ? "SendKey，如 SCTxxxxxxxxxxxxxxxx"
+                          : "Webhook URL"
+                      }
                       className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                     />
-                    <select
-                      value={settings.webhook_type}
-                      onChange={(e) => setSettings((s) => ({ ...s, webhook_type: e.target.value }))}
-                      className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary"
-                    >
-                      <option value="custom">通用 (custom)</option>
-                      <option value="dingtalk">钉钉 (dingtalk)</option>
-                      <option value="feishu">飞书 (feishu)</option>
-                      <option value="wecom">企业微信 (wecom)</option>
-                    </select>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <select
+                        value={settings.webhook_type}
+                        onChange={(e) => setSettings((s) => ({ ...s, webhook_type: e.target.value }))}
+                        className="form-input flex-1 px-3 py-2 rounded-lg text-sm text-content-primary"
+                      >
+                        <option value="custom">通用 (custom)</option>
+                        <option value="dingtalk">钉钉 (dingtalk)</option>
+                        <option value="feishu">飞书 (feishu)</option>
+                        <option value="wecom">企业微信 (wecom)</option>
+                        <option value="serverchan">Server酱 · 方糖 (serverchan)</option>
+                      </select>
+                      <button
+                        onClick={handleTestWebhook}
+                        disabled={actionLoading === "test-webhook"}
+                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50 flex-shrink-0"
+                      >
+                        <Send className="w-4 h-4" /> 测试推送
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-content-muted leading-relaxed">
+                      {settings.webhook_type === "serverchan" ? (
+                        <>
+                          直接填 Server酱 控制台首页的 <b>SendKey</b> 即可，系统会自动补全推送地址
+                          （Turbo 版与 Server酱³ 都支持）；<b>不要</b>填「快速创建入口链接」那种网页地址。
+                        </>
+                      ) : (
+                        <>平台类型要与 URL 来源对上，否则对方会因字段名不认而拒收。</>
+                      )}
+                      {" "}续期报告只在<b>确实有域名被续期时</b>推送，平时不会有心跳消息；推送失败会在「运行日志」里留一条 warning。
+                    </p>
                   </div>
                 </div>
 
@@ -7236,12 +7290,14 @@ export default function App() {
 
       {/* 全局 Toast 通知 */}
       {toast && (
-        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-lg shadow-2xl border transition-all duration-300 transform translate-y-0 text-sm font-semibold bg-surface text-content-primary border-border-base">
+        /* NOTE: 必须限宽 + 换行 —— 推送失败会把平台返回的原文带上来（Server酱 填错地址时
+           对方回的是一整段 XML），不限宽的话 toast 会横着铺满整个视口。 */
+        <div className="fixed bottom-5 right-5 z-50 max-w-[min(90vw,28rem)] flex items-start gap-2.5 px-4 py-3 rounded-lg shadow-2xl border transition-all duration-300 transform translate-y-0 text-sm font-semibold bg-surface text-content-primary border-border-base">
           {toast.type === "success" && <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0" />}
           {toast.type === "error" && <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0" />}
           {toast.type === "info" && <Info className="w-5 h-5 text-indigo-500 flex-shrink-0" />}
           {toast.type === "warning" && <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0" />}
-          <span>{toast.message}</span>
+          <span className="min-w-0 break-words line-clamp-6">{toast.message}</span>
         </div>
       )}
 

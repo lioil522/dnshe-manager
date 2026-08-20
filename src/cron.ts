@@ -8,13 +8,53 @@ import { computeDnsState } from "./dns-provider";
  * NOTE: 支持按 WEBHOOK_TYPE 环境变量构造对应平台的规范 payload，
  * 而非同时携带所有平台的字段。
  */
-type WebhookType = "dingtalk" | "feishu" | "wecom" | "custom";
+export type WebhookType = "dingtalk" | "feishu" | "wecom" | "serverchan" | "custom";
+
+/**
+ * Webhook 推送结果
+ *
+ * NOTE: 这个函数刻意不抛异常 —— 它在 cron 里是「续期已经做完之后」的收尾步骤，
+ * 推送失败不该让整个定时任务中断。所以改为回传结果供调用方决定怎么处理：
+ * cron 写一条 warning 日志，测试接口把原因回给前端。
+ */
+export interface WebhookSendResult {
+  ok: boolean;
+  status?: number;
+  detail?: string;
+}
+
+/**
+ * 把 Server酱 的 SendKey 补全成推送端点
+ *
+ * 让用户只填 SendKey 就能用 —— 控制台首页给的就是一串 key，而「快速创建入口链接」
+ * 那种网页地址反倒最容易被误当成推送地址（POST 上去只会回一段 MethodNotAllowed）。
+ *
+ * NOTE: 已经是 http(s):// 开头的一律原样透传，不做任何猜测 —— 用户可能用了自建
+ * 转发或将来出现的新域名。
+ * NOTE: Server酱³ 的 key 形如 sctp<uid>t<随机串>，端点带 uid 子域；Turbo 版
+ * （SCT 开头，含 AppKey）统一走 sctapi.ftqq.com。认不出格式时按 Turbo 处理，
+ * 失败会由平台返回明确错误码，不会静默。
+ */
+export function normalizeServerChanEndpoint(input: string): string {
+  const v = input.trim();
+  if (!v) return v;
+  if (/^https?:\/\//i.test(v)) return v;
+  const sc3 = v.match(/^sctp(\d+)t/i);
+  if (sc3) return `https://${sc3[1]}.push.ft07.com/send/${v}.send`;
+  return `https://sctapi.ftqq.com/${v}.send`;
+}
 
 /**
  * 推送 Webhook 通知
  */
-export async function sendWebhookNotification(webhookUrl: string, message: string, webhookType: WebhookType = "custom") {
-  if (!webhookUrl) return;
+export async function sendWebhookNotification(
+  webhookUrl: string,
+  message: string,
+  webhookType: WebhookType = "custom"
+): Promise<WebhookSendResult> {
+  if (!webhookUrl) return { ok: false, detail: "未配置 Webhook 地址" };
+  // Server酱 允许只填 SendKey，其余平台一律要求完整地址
+  const endpoint = webhookType === "serverchan" ? normalizeServerChanEndpoint(webhookUrl) : webhookUrl;
   try {
     let payload: Record<string, unknown>;
 
@@ -40,6 +80,18 @@ export async function sendWebhookNotification(webhookUrl: string, message: strin
           text: { content: message }
         };
         break;
+      case "serverchan":
+        // Server酱（方糖）Turbo / ³ ——「标题 + 正文」两段式，与其他平台的单字段不同。
+        //
+        // NOTE: title 上限 32 字符，正文必须走 desp。用通用格式（text/content）虽然能通
+        // （text 会被当成标题），但多行续期报告会被截成一行标题、正文全丢，所以必须单列。
+        // 首行正好是「【DNSHE 域名自动续期报告】」这类摘要，拿来做标题最合适；
+        // 消息本身仍完整放进 desp，不做截断。
+        payload = {
+          title: (message.split("\n")[0] || "DNSHE 通知").slice(0, 32),
+          desp: message
+        };
+        break;
       case "custom":
       default:
         // 通用格式，兼容大多数 Webhook 服务
@@ -50,17 +102,39 @@ export async function sendWebhookNotification(webhookUrl: string, message: strin
         break;
     }
 
-    const res = await fetch(webhookUrl, {
+    const res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    
+
+    const bodyText = (await res.text().catch(() => "")).slice(0, 500);
+
     if (!res.ok) {
       console.error(`Webhook push failed with status: ${res.status}`);
+      return { ok: false, status: res.status, detail: bodyText || `HTTP ${res.status}` };
     }
+
+    // NOTE: 钉钉 / 飞书 / 企业微信 / Server酱 在「token 失效」「机器人被移出群」这类
+    // 错误上一律回 HTTP 200，真正的错误码藏在响应体里（钉钉与企微是 errcode/errmsg，
+    // 飞书与 Server酱 是 code/message 或 code/msg）。只看 res.ok 会把这些失败当成
+    // 推送成功 —— 界面显示已发送、群里什么都没有，比没有测试按钮更误导。
+    try {
+      const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+      const code = parsed.errcode ?? parsed.code;
+      if (code !== undefined && Number(code) !== 0) {
+        const reason = String(parsed.errmsg ?? parsed.msg ?? parsed.message ?? bodyText);
+        console.error(`Webhook rejected by platform: ${code} ${reason}`);
+        return { ok: false, status: res.status, detail: `平台返回错误 ${code}：${reason}` };
+      }
+    } catch {
+      // 通用 Webhook 往往回非 JSON（甚至空响应），HTTP 2xx 即视为成功
+    }
+
+    return { ok: true, status: res.status, detail: bodyText };
   } catch (e) {
     console.error("Failed to send Webhook notification:", e);
+    return { ok: false, detail: e instanceof Error ? e.message : "请求异常" };
   }
 }
 
@@ -280,7 +354,17 @@ export async function runDailySyncAndRenewal(
   if (renewLogs.length > 0) {
     const notifyBody = `【DNSHE 域名自动续期报告】\n${summaryMsg}\n\n详细明细：\n${renewLogs.join("\n")}`;
     if (effectiveWebhookUrl) {
-      await sendWebhookNotification(effectiveWebhookUrl, notifyBody, effectiveWebhookType);
+      // NOTE: 推送失败要留痕 —— 原先只 console.error，用户在面板里完全看不到，
+      // 表现为「续期成功了但一直没收到通知」且无从排查。
+      const result = await sendWebhookNotification(effectiveWebhookUrl, notifyBody, effectiveWebhookType);
+      if (!result.ok) {
+        await dbManager.writeLog(
+          "warning",
+          "system",
+          `续期报告 Webhook 推送失败（${effectiveWebhookType}）`,
+          result.detail || `HTTP ${result.status ?? "?"}`
+        );
+      }
     }
     if (tgToken && tgChatId) {
       await sendTelegramNotification(tgToken, tgChatId, notifyBody);

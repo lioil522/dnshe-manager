@@ -4,7 +4,8 @@ import { cors } from "hono/cors";
 import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
-import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
+import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification, sendWebhookNotification } from "./cron";
+import type { WebhookType } from "./cron";
 import { computeDnsState } from "./dns-provider";
 import type { DnsState } from "./dns-provider";
 import { toASCII } from "./punycode";
@@ -862,7 +863,7 @@ app.post("/api/domains/sync", async (c) => {
   const dbManager = c.get("db");
   try {
     // 异步执行同步以防止 HTTP 响应超时 (Cloudflare Worker 允许在 waitUntil 里跑异步)
-    const webhookType = (c.env.WEBHOOK_TYPE || "custom") as "dingtalk" | "feishu" | "wecom" | "custom";
+    const webhookType = (c.env.WEBHOOK_TYPE || "custom") as WebhookType;
     c.executionCtx.waitUntil(runDailySyncAndRenewal(dbManager, c.env.WEBHOOK_URL, webhookType));
     return c.json(successRes({ message: "域名同步后台任务已启动，请稍后刷新查看最新数据" }));
   } catch (e: unknown) {
@@ -1793,10 +1794,56 @@ app.post("/api/settings/test-telegram", async (c) => {
   }
 });
 
+// 4. 测试 Webhook 推送
+app.post("/api/settings/test-webhook", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const cfg = await dbManager.getAllAppSettings();
+    // 优先用请求体里传入的新值（用户可能还没保存），否则用库里已存的。
+    // webhook_url 是加密存储、读回前端时打了码，因此 **** 开头的值一律视为「沿用旧值」。
+    const url = (body.webhook_url && !String(body.webhook_url).startsWith("****"))
+      ? String(body.webhook_url).trim()
+      : String(cfg.webhook_url || "");
+    const type = String(body.webhook_type || cfg.webhook_type || "custom") as WebhookType;
+
+    if (!url) {
+      return c.json(errorRes(type === "serverchan" ? "请先填写 SendKey" : "请先填写 Webhook 地址", "bad_request"), 400);
+    }
+    // Server酱 允许只填 SendKey（由 normalizeServerChanEndpoint 补全），其余平台必须是完整地址
+    if (type !== "serverchan" && !/^https?:\/\//i.test(url)) {
+      return c.json(errorRes("Webhook 地址必须以 http:// 或 https:// 开头", "bad_request"), 400);
+    }
+
+    const result = await sendWebhookNotification(
+      url,
+      "🎉 DNSHE Manager 测试推送：Webhook 通知配置成功！",
+      type
+    );
+
+    if (!result.ok) {
+      // 把平台返回的原因透传给前端 —— 钉钉/飞书/企微的 token 失效都是 HTTP 200
+      // 里带错误码，不给出原文用户根本无从判断是 URL 错了还是类型选错了
+      let detail = result.detail || `推送失败（HTTP ${result.status ?? "?"}）`;
+
+      // NOTE: Server酱 最容易填错的是把控制台的「快速创建入口链接」当成推送地址
+      //（那是给用户创建 AppKey 的网页，POST 上去只会回一段 MethodNotAllowed XML）。
+      // 只填 SendKey 会被自动补全，所以这里只针对「填了 http 地址但不是推送端点」提示。
+      if (type === "serverchan" && /^https?:\/\//i.test(url) && !/\.send(\?|$)/i.test(url)) {
+        detail = `这个地址不像 Server酱 的推送端点（应以 .send 结尾）。直接把 SendKey 填进来即可，不要填控制台的「快速创建入口链接」。原始返回：${detail}`;
+      }
+      return c.json(errorRes(detail), 400);
+    }
+    return c.json(successRes({ message: "测试消息已发送，请检查对应的群/服务" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
 /**
  * 8. WHOIS 查询域名可注册性 (代理接口)
- */
-app.get("/api/whois", async (c) => {
+ */app.get("/api/whois", async (c) => {
   const domain = c.req.query("domain");
   const accountIdParam = c.req.query("account_id");
   if (!domain) {
@@ -1956,7 +2003,7 @@ export default {
   // 处理 scheduled 定时任务 (Cron Trigger)
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     const dbManager = new DatabaseManager(env.DB, env.AES_KEY);
-    const webhookType = (env.WEBHOOK_TYPE || "custom") as "dingtalk" | "feishu" | "wecom" | "custom";
+    const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
     // 使用 ctx.waitUntil 保证 Worker 不会在异步任务未结束时被回收
     ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType));
   }

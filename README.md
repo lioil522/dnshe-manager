@@ -21,7 +21,7 @@
 | **DNS 解析记录** | `A / AAAA / CNAME / TXT / MX / NS / CAA / SRV` 八种类型的增 / 改 / 删。行内编辑就地保存；批量添加（多行文本 ≤ 50 条，提交前有解析预览）、批量修改（逐字段勾选覆盖，记录值可逐条编辑）、批量删除（勾选 + 确认清单）；逐条返回成功 / 失败原因，不会一条失败就整体报错。 |
 | **NS 智能切换** | 一键添加自定义 NS（可一次多个，自动去重）、强制替换冲突记录、一键恢复官方默认 NS 或清理残留 NS 记录；上游禁用 NS 管理时给出中文指引。 |
 | **自动续期** | Cloudflare Cron 每日 02:00 (UTC) 巡检，剩余有效期低于阈值（默认 180 天）时自动续期，并清理过期日志。 |
-| **消息通知** | 钉钉 / 飞书 / 企业微信 / 自定义 Webhook，以及 Telegram Bot 原生推送，支持在控制台做连通性测试。 |
+| **消息通知** | 钉钉 / 飞书 / 企业微信 / Server酱（方糖）/ 自定义 Webhook，以及 Telegram Bot 原生推送，两者都可在控制台做连通性测试。各平台按自己的规范构造 payload（Server酱 是「标题 + 正文」两段式）；这些平台在 token 失效时往往回 HTTP 200 并把错误码藏在响应体里，因此推送结果按响应体判定，失败会写入运行日志。 |
 | **安全防护** | API Secret 与 2FA 密钥经 256 位 AES-GCM 加密入库；管理员密码 PBKDF2 加盐哈希；支持 2FA (TOTP)；`ADMIN_TOKEN` 应急通道；Session 有效期 7 天，过期会话由每日 Cron 清理。 |
 | **WHOIS 与注册** | 在线查询可注册状态、面板内一键注册（成功后增量入库）。域名删除需手动回填完整域名二次确认，并在提交前拦截 `ServerHold` / `PendingDelete` / 仍存在解析记录等情形。 |
 | **中文域名** | 内置零依赖 RFC 3492 Punycode 编解码器（前后端同源）：直接输入中文注册并实时预览编码、列表反解为中文显示、点击复制 ASCII 原文；中文与 `xn--` 双形态索引，两种关键词都能搜到。 |
@@ -87,7 +87,7 @@
 | :--- | :---: | :---: | :--- |
 | `DB` | 必要 🔴 | `dnshe-manager-db` | D1 绑定句柄（`[[d1_databases]]` 节点） |
 | `ALLOWED_ORIGIN` | 可选 🟢 | `*` | 允许的前端 Origin，逗号分隔多个。**前端同时挂 `pages.dev` 与自定义域名时两个都要写**，否则未列出的那个登录会报 `Failed to fetch` |
-| `WEBHOOK_TYPE` | 可选 🟢 | `custom` | `dingtalk` / `feishu` / `wecom` / `custom` |
+| `WEBHOOK_TYPE` | 可选 🟢 | `custom` | `dingtalk` / `feishu` / `wecom` / `serverchan` / `custom` |
 | `DEFAULT_API_KEY` | 可选 🟢 | 无 | 首次启动时自动绑定该账号，省去手动录入 |
 | `DEFAULT_API_SECRET` | 可选 🟢 | 无 | 配合 `DEFAULT_API_KEY` |
 | `DEFAULT_API_ALIAS` | 可选 🟢 | `默认账号` | 默认账号别名 |

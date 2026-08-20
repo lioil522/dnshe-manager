@@ -88,6 +88,7 @@ interface Domain {
   ns1?: string;
   ns2?: string;
   dns_provider?: string | null;
+  provider_account_id?: string | number | null;
   disable_ns_management?: boolean;
 }
 
@@ -191,6 +192,66 @@ const PasswordInput: React.FC<{
     </div>
   );
 };
+
+/**
+ * 解析线路（Line）可选值
+ *
+ * NOTE: 取自官网 DNS 管理页 <select name="line"> 的 option value —— 提交值是英文代码
+ * 而不是中文标签（「电信」只是显示文案，实际提交 telecom），且 oversea 没有尾部的 s。
+ * API 文档只把 line 描述为「解析线路（us.ci/cn.mt可用，其他域名自动忽略）」，从未列出
+ * 合法取值，因此这份清单以官网表单为准。
+ */
+const DNS_LINE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "default", label: "默认" },
+  { value: "telecom", label: "电信" },
+  { value: "unicom", label: "联通" },
+  { value: "mobile", label: "移动" },
+  { value: "oversea", label: "海外" },
+  { value: "edu", label: "教育网" }
+];
+
+/**
+ * 已知支持按线路解析的解析服务商账号 ID（domains_cache.provider_account_id）
+ *
+ * NOTE: 实测 us.ci / cn.mt（官网标注支持线路）均为 1，其余 7 个根域名为 7 或 8。
+ * 上游没有任何「是否支持线路」的字段或接口，这是目前唯一可查的信号，详见
+ * src/dnshe.ts 里 provider_account_id 的注释。名单可在设置页增删。
+ */
+const DEFAULT_LINE_PROVIDERS = ["1"];
+
+/**
+ * 解析线路下拉框
+ *
+ * NOTE: 不支持线路的域名是「禁用」而不是隐藏 —— 一是保持表单网格对齐，二是上游对
+ * 这类域名会静默忽略 line（不报错），不显式拦住的话用户会以为自己设置生效了。
+ */
+const DnsLineSelect: React.FC<{
+  value: string;
+  onChange: (value: string) => void;
+  supported: boolean;
+  className: string;
+  disabled?: boolean;
+  onKeyDown?: (e: React.KeyboardEvent) => void;
+}> = ({ value, onChange, supported, className, disabled, onKeyDown }) => (
+  <select
+    value={supported ? value || "default" : "default"}
+    onChange={(e) => onChange(e.target.value)}
+    onKeyDown={onKeyDown}
+    disabled={disabled || !supported}
+    title={
+      supported
+        ? "不同运营商/地域可选择对应的解析线路，无特殊需求保持默认"
+        : "该域名所在的解析服务商不支持按线路解析，填了也会被上游静默忽略"
+    }
+    className={`${className} disabled:opacity-50 disabled:cursor-not-allowed`}
+  >
+    {(supported ? DNS_LINE_OPTIONS : DNS_LINE_OPTIONS.slice(0, 1)).map((opt) => (
+      <option key={opt.value} value={opt.value}>
+        {opt.label}
+      </option>
+    ))}
+  </select>
+);
 
 /**
  * 主应用组件 - 提供 DNSHE 域名管理控制面板
@@ -569,6 +630,21 @@ export default function App() {
   );
   // 新增保留前缀的输入框
   const [newReservedInput, setNewReservedInput] = useState("");
+
+  // 支持按线路解析的解析服务商账号名单（可增删，持久化于浏览器本地）。
+  // 判定依据是域名的 provider_account_id —— 上游没有「是否支持线路」的字段。
+  const [lineProviders, setLineProviders] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("DNSHE_LINE_PROVIDERS");
+      if (!raw) return DEFAULT_LINE_PROVIDERS;
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map((v) => String(v)) : DEFAULT_LINE_PROVIDERS;
+    } catch {
+      return DEFAULT_LINE_PROVIDERS;
+    }
+  });
+  // 新增线路服务商 ID 的输入框
+  const [newLineProviderInput, setNewLineProviderInput] = useState("");
 
   // ===== 可编辑词库状态 =====
   // 词库分组列表（首次从内置种子导入，之后持久化在 localStorage）
@@ -2095,7 +2171,10 @@ export default function App() {
       const res = await apiFetch(`/api/domains/${domain.id}/dns${forceRefresh ? "?refresh=1" : ""}`);
       const data = await res.json();
       if (data.success) {
-        setDnsRecords(data.records || []);
+        const records: DnsRecord[] = data.records || [];
+        setDnsRecords(records);
+        // 顺手自学习线路支持名单（数据本来就要读，零额外上游调用）
+        learnLineProviderFrom(domain, records);
       } else {
         showToast("error", data.message || "加载 DNS 解析记录失败");
       }
@@ -2329,14 +2408,11 @@ export default function App() {
         />
       ),
       lineInput: (
-        <input
-          type="text"
-          name="dns-edit-line"
-          autoComplete="off"
+        <DnsLineSelect
           value={editDnsLine}
-          onChange={(e) => setEditDnsLine(e.target.value)}
+          onChange={setEditDnsLine}
+          supported={domainSupportsLine(selectedDomain)}
           onKeyDown={(e) => handleEditDnsKeyDown(e, key)}
-          placeholder="默认"
           className="w-full form-input px-1.5 py-1.5 rounded text-xs text-content-secondary"
         />
       ),
@@ -2919,12 +2995,93 @@ export default function App() {
     setScanCursor(null);
   };
 
+  // ===== 线路解析支持名单 =====
+  const persistLineProviders = (next: string[]) => {
+    const cleaned = Array.from(new Set(next.map((v) => String(v).trim()).filter(Boolean)));
+    setLineProviders(cleaned);
+    localStorage.setItem("DNSHE_LINE_PROVIDERS", JSON.stringify(cleaned));
+  };
+
+  /** 该域名是否支持按线路（运营商/地域）解析 */
+  const domainSupportsLine = (dom: Domain | null | undefined): boolean => {
+    const pid = dom?.provider_account_id;
+    if (pid === undefined || pid === null || String(pid).trim() === "") return false;
+    return lineProviders.includes(String(pid).trim());
+  };
+
+  /**
+   * 从解析记录反推「该服务商支持线路」并自动补进名单
+   *
+   * NOTE: 只加不减。支持线路的域名如果所有记录都留在默认线路，line 全是空值，
+   * 据此判「不支持」会误杀 —— 所以这里是单向补充。好处是即便 DNSHE 以后另开一个
+   * 支持线路的服务商，只要有人在上面成功设过线路就会被学到，不用等改代码。
+   * 数据来自本来就要读的解析记录，零额外上游调用。
+   */
+  const learnLineProviderFrom = (dom: Domain, records: DnsRecord[]) => {
+    const pid = String(dom.provider_account_id ?? "").trim();
+    if (!pid || lineProviders.includes(pid)) return;
+    const usesLine = records.some((r) => {
+      const v = String(r.line || "").trim().toLowerCase();
+      return v !== "" && v !== "default";
+    });
+    if (!usesLine) return;
+
+    // NOTE: 走函数式更新而不是 persistLineProviders([...lineProviders, pid]) ——
+    // 闭包里的 lineProviders 可能已过期（连续打开两个域名时后一次会覆盖前一次的补充）。
+    setLineProviders((prev) => {
+      if (prev.includes(pid)) return prev;
+      const next = [...prev, pid];
+      localStorage.setItem("DNSHE_LINE_PROVIDERS", JSON.stringify(next));
+      return next;
+    });
+    showToast("info", `检测到 ${dom.full_domain} 使用了线路解析，已将服务商 ${pid} 加入线路支持名单`);
+  };
+
+  // 添加线路服务商 ID（支持一次粘贴多个）
+  const handleAddLineProvider = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const incoming = parseWords(newLineProviderInput);
+    if (incoming.length === 0) return;
+    const merged = Array.from(new Set([...lineProviders, ...incoming]));
+    const added = merged.length - lineProviders.length;
+    persistLineProviders(merged);
+    setNewLineProviderInput("");
+    showToast(added > 0 ? "success" : "info", added > 0 ? `已添加 ${added} 个服务商 ID` : "输入的 ID 都已在名单中");
+  };
+
+  const handleRemoveLineProvider = (pid: string) => {
+    persistLineProviders(lineProviders.filter((p) => p !== pid));
+  };
+
+  const handleRestoreLineProviders = () => {
+    persistLineProviders(DEFAULT_LINE_PROVIDERS);
+    showToast("success", "已恢复默认线路支持名单");
+  };
+
+  /**
+   * 已缓存域名按解析服务商 ID 归并
+   *
+   * NOTE: 给设置页做参照用 —— 服务商 ID 是个裸数字，光让用户填很难猜。把「哪个 ID
+   * 底下挂着哪些根域名」摊出来，对着官网标注支持线路的后缀就能判断该加哪个。
+   */
+  const providerRootMap = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const d of domains) {
+      const pid = String(d.provider_account_id ?? "").trim();
+      if (!pid) continue;
+      if (!map.has(pid)) map.set(pid, new Set<string>());
+      map.get(pid)!.add(d.rootdomain);
+    }
+    return Array.from(map.entries())
+      .map(([pid, roots]) => ({ pid, roots: Array.from(roots).sort() }))
+      .sort((a, b) => a.pid.localeCompare(b.pid, undefined, { numeric: true }));
+  }, [domains]);
+
   // ===== 保留前缀名单增删 =====
   const persistReserved = (next: string[]) => {
     setReservedPrefixes(next);
     localStorage.setItem("DNSHE_RESERVED_PREFIXES", JSON.stringify(next));
   };
-
   // 添加保留前缀（支持一次粘贴多个，逗号/空格/换行分隔）
   const handleAddReserved = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -5566,32 +5723,9 @@ export default function App() {
               </div>
             ) : (
               <>
-                {/* 外观 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
-                  <h3 className="font-bold text-content-primary flex items-center gap-2">
-                    {theme === "dark" ? <Moon className="w-4 h-4 text-indigo-400" /> : <Sun className="w-4 h-4 text-amber-400" />} 外观
-                  </h3>
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="text-sm font-semibold text-content-primary">主题模式</div>
-                      <div className="text-xs text-content-muted mt-0.5">切换明亮 / 暗黑界面配色</div>
-                    </div>
-                    <div className="flex gap-2 flex-shrink-0">
-                      <button
-                        onClick={() => setTheme("light")}
-                        className={`px-3 py-2 sm:py-1.5 rounded-lg text-sm font-semibold flex items-center gap-1.5 transition-all ${theme === "light" ? "bg-indigo-600 text-white" : "bg-elevated text-content-muted border border-border-base"}`}
-                      >
-                        <Sun className="w-4 h-4" /> 亮色
-                      </button>
-                      <button
-                        onClick={() => setTheme("dark")}
-                        className={`px-3 py-2 sm:py-1.5 rounded-lg text-sm font-semibold flex items-center gap-1.5 transition-all ${theme === "dark" ? "bg-indigo-600 text-white" : "bg-elevated text-content-muted border border-border-base"}`}
-                      >
-                        <Moon className="w-4 h-4" /> 暗色
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                {/* NOTE: 这里原有一个「外观 / 主题模式」卡片，与顶栏的太阳/月亮切换按钮
+                    完全同源（都改 theme 这一个 state），属重复入口，已移除。
+                    主题切换保留在顶栏，任何页面都能直接点到，不必先进设置页。 */}
 
                 {/* 后端地址 */}
                 <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
@@ -5844,6 +5978,87 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* 解析线路支持名单 */}
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
+                  <h3 className="font-bold text-content-primary flex items-center gap-2">
+                    <Server className="w-4 h-4 text-sky-600 dark:text-sky-400" /> 解析线路支持名单
+                  </h3>
+                  <p className="text-xs text-content-muted leading-relaxed">
+                    上游 API 没有「域名是否支持按线路解析」的字段，本面板按域名所属的
+                    <span className="font-mono text-indigo-600 dark:text-indigo-400"> 解析服务商 ID </span>
+                    判断：名单内服务商的域名可以选择电信 / 联通 / 移动 / 海外 / 教育网，其余只能保持默认。
+                    上游对不支持的域名会<b>静默忽略</b>线路参数而不报错，所以这里主动拦住，
+                    避免出现「设了线路却没生效」。读取解析记录时若发现某域名实际用了非默认线路，
+                    会自动把它的服务商补进名单。
+                  </p>
+
+                  <div className="flex flex-wrap gap-2">
+                    {lineProviders.length === 0 ? (
+                      <span className="text-xs text-content-muted">名单为空，所有域名都会按「不支持线路」处理</span>
+                    ) : (
+                      lineProviders.map((pid) => (
+                        <span
+                          key={pid}
+                          className="group flex items-center bg-sky-50 border border-sky-200 text-sky-700 dark:bg-sky-950/30 dark:border-sky-500/30 dark:text-sky-300 text-xs rounded-lg overflow-hidden"
+                        >
+                          <span className="px-2.5 py-1 font-mono">服务商 {pid}</span>
+                          <button
+                            onClick={() => handleRemoveLineProvider(pid)}
+                            className="px-1.5 py-1 text-sky-500/70 hover:text-sky-800 hover:bg-sky-100 border-l border-sky-200 dark:text-sky-400/60 dark:hover:text-sky-300 dark:hover:bg-sky-900/40 dark:border-sky-500/30 transition-all"
+                            title={`从名单移除服务商 ${pid}`}
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </span>
+                      ))
+                    )}
+                  </div>
+
+                  <form onSubmit={handleAddLineProvider} className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      name="dnshe-line-provider"
+                      autoComplete="off"
+                      value={newLineProviderInput}
+                      onChange={(e) => setNewLineProviderInput(e.target.value)}
+                      placeholder="服务商 ID，可一次填多个（逗号 / 空格分隔）"
+                      className="form-input flex-1 min-w-[12rem] px-3 py-2 rounded-lg text-sm font-mono text-content-primary placeholder:text-content-muted"
+                    />
+                    <button
+                      type="submit"
+                      className="btn-primary px-3 py-2 rounded-lg text-xs font-bold text-white flex items-center gap-1.5 flex-shrink-0"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> 添加
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRestoreLineProviders}
+                      className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-xs font-semibold flex-shrink-0"
+                    >
+                      恢复默认
+                    </button>
+                  </form>
+
+                  {providerRootMap.length > 0 && (
+                    <div className="pt-3 border-t border-border-soft space-y-1.5">
+                      <div className="text-xs font-semibold text-content-secondary">已缓存域名的服务商分布（对照官网标注即可判断该加哪个）</div>
+                      {providerRootMap.map(({ pid, roots }) => {
+                        const on = lineProviders.includes(pid);
+                        return (
+                          <div key={pid} className="text-[11px] font-mono flex flex-wrap items-baseline gap-x-2">
+                            <span className={on ? "text-sky-700 dark:text-sky-300 font-bold" : "text-content-muted"}>
+                              服务商 {pid}
+                            </span>
+                            <span className="text-content-muted">→</span>
+                            <span className="text-content-secondary break-all">{roots.join("、")}</span>
+                            {on && <span className="text-[10px] text-sky-700 dark:text-sky-300">（支持线路）</span>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
                 {/* 通知 */}
                 <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
@@ -6037,14 +6252,11 @@ export default function App() {
                     )}
 
                     <div>
-                      <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
-                      <input
-                        type="text"
-                        name="dns-new-line"
-                        autoComplete="off"
-                        placeholder="如 us.ci / cn.mt"
+                      <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">解析线路</label>
+                      <DnsLineSelect
                         value={newDnsLine}
-                        onChange={(e) => setNewDnsLine(e.target.value)}
+                        onChange={setNewDnsLine}
+                        supported={domainSupportsLine(selectedDomain)}
                         className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
                       />
                     </div>
@@ -6150,14 +6362,11 @@ export default function App() {
                       )}
 
                       <div>
-                        <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">解析线路 (特定域名)</label>
-                        <input
-                          type="text"
-                          name="dns-batch-line"
-                          autoComplete="off"
-                          placeholder="如 us.ci / cn.mt"
+                        <label className="block text-[11px] md:text-[10px] text-content-muted font-bold uppercase mb-1">解析线路</label>
+                        <DnsLineSelect
                           value={dnsBatchLine}
-                          onChange={(e) => setDnsBatchLine(e.target.value)}
+                          onChange={setDnsBatchLine}
+                          supported={domainSupportsLine(selectedDomain)}
                           className="w-full form-input px-2.5 py-2 rounded text-sm text-content-secondary"
                         />
                       </div>
@@ -6377,16 +6586,14 @@ export default function App() {
                           type="checkbox"
                           checked={dnsEditFields.line}
                           onChange={(e) => setDnsEditFields({ ...dnsEditFields, line: e.target.checked })}
-                          className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0"
+                          disabled={!domainSupportsLine(selectedDomain)}
+                          className="w-4 h-4 accent-indigo-500 cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
                         />
                         <span className="text-xs text-content-secondary w-20 shrink-0">解析线路</span>
-                        <input
-                          type="text"
-                          name="dns-bulk-line"
-                          autoComplete="off"
-                          placeholder="留空为默认线路"
+                        <DnsLineSelect
                           value={batchEditLine}
-                          onChange={(e) => setBatchEditLine(e.target.value)}
+                          onChange={setBatchEditLine}
+                          supported={domainSupportsLine(selectedDomain)}
                           disabled={!dnsEditFields.line}
                           className="flex-1 form-input px-2 py-1.5 rounded text-xs text-content-secondary disabled:opacity-40"
                         />

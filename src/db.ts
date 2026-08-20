@@ -151,6 +151,8 @@ export interface DBDomain {
   last_renewed_at: string | null;
   has_dns?: number;
   dns_provider?: string | null;
+  /** 解析服务商账号 ID，用于判断该域名是否支持按线路解析（见 dnshe.ts 的字段注释） */
+  provider_account_id?: string | null;
   updated_at: string;
 }
 
@@ -183,6 +185,7 @@ export interface UpstreamSubdomain {
   ns1?: string;
   ns2?: string;
   dns_provider?: string;
+  provider_account_id?: number | string | null;
   dns_state_known?: boolean;
 }
 
@@ -240,6 +243,7 @@ export class DatabaseManager {
             last_renewed_at TEXT,
             has_dns INTEGER DEFAULT 1,
             dns_provider TEXT,
+            provider_account_id TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
           );
@@ -271,9 +275,20 @@ export class DatabaseManager {
       ]);
 
       // 兼容已部署的旧数据库：仅在缺少字段时执行一次轻量迁移。
+      //
+      // NOTE: 一次 PRAGMA 取回全部列名后统一补齐，缺几个字段都只多一次批量写，
+      // 保持「自举 = 2 次串行往返」这个开销不变（见 README 的性能小节）。
       const domainColumns = await this.db.prepare("PRAGMA table_info(domains_cache)").all<{ name: string }>();
-      if (!(domainColumns.results || []).some((column) => column.name === "dns_provider")) {
-        await this.db.prepare("ALTER TABLE domains_cache ADD COLUMN dns_provider TEXT").run();
+      const existingColumns = new Set((domainColumns.results || []).map((column) => column.name));
+      const migrations: string[] = [];
+      if (!existingColumns.has("dns_provider")) {
+        migrations.push("ALTER TABLE domains_cache ADD COLUMN dns_provider TEXT");
+      }
+      if (!existingColumns.has("provider_account_id")) {
+        migrations.push("ALTER TABLE domains_cache ADD COLUMN provider_account_id TEXT");
+      }
+      if (migrations.length > 0) {
+        await this.db.batch(migrations.map((sql) => this.db.prepare(sql)));
       }
       return true;
     } catch (e) {
@@ -1049,6 +1064,14 @@ export class DatabaseManager {
     }
     const dnsProvider = sub.dns_provider ?? null;
 
+    // 解析服务商账号 ID —— 与三态不同，它来自 subdomains/list，任何一次同步都可信，
+    // 因此不受 dns_state_known 约束；统一转成字符串存，避免上游在 number / string
+    // 之间摇摆时前端比较失配。
+    const providerAccountId =
+      sub.provider_account_id === undefined || sub.provider_account_id === null
+        ? null
+        : String(sub.provider_account_id);
+
     // 解析状态未知时，冲突分支保持数据库中的原值不动
     const dnsStateAssignments = sub.dns_state_known
       ? `status = excluded.status,
@@ -1066,10 +1089,11 @@ export class DatabaseManager {
       : "未解析";
 
     return this.db.prepare(`
-      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, provider_account_id, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         account_id = excluded.account_id,
+        provider_account_id = COALESCE(excluded.provider_account_id, domains_cache.provider_account_id),
         ${dnsStateAssignments}
         created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
         expires_at = excluded.expires_at,
@@ -1085,6 +1109,7 @@ export class DatabaseManager {
       sub.expires_at || "",
       hasDnsVal,
       dnsProvider,
+      providerAccountId,
       this.getBeijingNow()
     );
   }

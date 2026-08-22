@@ -211,11 +211,26 @@ const DNS_LINE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
 ];
 
 /**
- * 已知支持按线路解析的解析服务商账号 ID（domains_cache.provider_account_id）
+ * 支持按线路解析的 NS 后缀默认名单
  *
- * NOTE: 实测 us.ci / cn.mt（官网标注支持线路）均为 1，其余 7 个根域名为 7 或 8。
- * 上游没有任何「是否支持线路」的字段或接口，这是目前唯一可查的信号，详见
- * src/dnshe.ts 里 provider_account_id 的注释。名单可在设置页增删。
+ * NOTE: 根域的 NS 记录暴露了它实际托管在谁家 DNS 上，这是判断「是否支持按线路
+ * （运营商/地域）解析」最有语义的信号 —— 阿里云 DNS 本身就提供运营商线路，
+ * 而 DNSHE 自建 NS 不提供。实测九个根域名分成三组，与官网标注完全对得上：
+ *   cn.mt / us.ci                  -> vip7/vip8.alidns.com    支持线路
+ *   bbroot.com / bot.cd / ccwu.cc  -> a/b.nic.dnshe.org       不支持
+ *   cc.cd / ddns.ge / de5.net/l.cd -> a/b.ns.dnshe.org        不支持
+ * 名单可在设置页增删，厂商日后把根域迁到别家（或另接一家支持线路的 DNS）时
+ * 不必改代码。
+ */
+const DEFAULT_LINE_NS_SUFFIXES = ["alidns.com"];
+
+/**
+ * 线路支持判定的兜底信号：解析服务商账号 ID（domains_cache.provider_account_id）
+ *
+ * NOTE: 这是 NS 判定之前用的主信号，现已降级为兜底 —— 仅在拿不到根域 NS 时
+ * （首次加载未完成、后端 DoH 出站失败）使用，因此不再提供设置页 UI。
+ * 实测 us.ci / cn.mt 该值为 1，其余 7 个根域名为 7 或 8，两组无交集；但文档
+ * 从未说明该字段语义，属实测相关性而非契约，详见 src/dnshe.ts 里的注释。
  */
 const DEFAULT_LINE_PROVIDERS = ["1"];
 
@@ -241,7 +256,7 @@ const DnsLineSelect: React.FC<{
     title={
       supported
         ? "不同运营商/地域可选择对应的解析线路，无特殊需求保持默认"
-        : "该域名所在的解析服务商不支持按线路解析，填了也会被上游静默忽略"
+        : "该域名的根域 NS 不在「解析线路支持名单」内（即其 DNS 托管商不提供线路解析），填了也会被上游静默忽略"
     }
     className={`${className} disabled:opacity-50 disabled:cursor-not-allowed`}
   >
@@ -631,20 +646,43 @@ export default function App() {
   // 新增保留前缀的输入框
   const [newReservedInput, setNewReservedInput] = useState("");
 
-  // 支持按线路解析的解析服务商账号名单（可增删，持久化于浏览器本地）。
-  // 判定依据是域名的 provider_account_id —— 上游没有「是否支持线路」的字段。
-  const [lineProviders, setLineProviders] = useState<string[]>(() => {
+  // 支持按线路解析的 NS 后缀名单（可增删，持久化于浏览器本地）。
+  // 判定依据是根域的 NS 记录落在谁家 DNS 上 —— 上游没有「是否支持线路」的字段。
+  const [lineNsSuffixes, setLineNsSuffixes] = useState<string[]>(() => {
     try {
-      const raw = localStorage.getItem("DNSHE_LINE_PROVIDERS");
-      if (!raw) return DEFAULT_LINE_PROVIDERS;
+      const raw = localStorage.getItem("DNSHE_LINE_NS_SUFFIXES");
+      if (!raw) return DEFAULT_LINE_NS_SUFFIXES;
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.map((v) => String(v)) : DEFAULT_LINE_PROVIDERS;
+      return Array.isArray(parsed) ? parsed.map((v) => String(v)) : DEFAULT_LINE_NS_SUFFIXES;
     } catch {
-      return DEFAULT_LINE_PROVIDERS;
+      return DEFAULT_LINE_NS_SUFFIXES;
     }
   });
-  // 新增线路服务商 ID 的输入框
-  const [newLineProviderInput, setNewLineProviderInput] = useState("");
+  // 新增 NS 后缀的输入框
+  const [newLineNsInput, setNewLineNsInput] = useState("");
+
+  // 根域 -> NS 主机名列表的本地镜像（null 表示查过但没查到）。
+  // 后端已经把结论缓存在 D1，这份镜像只为让首屏判定不用等网络往返。
+  const [rootNs, setRootNs] = useState<Record<string, string[] | null>>(() => {
+    try {
+      const raw = localStorage.getItem("DNSHE_ROOT_NS");
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
+
+  // 实测确认支持线路的根域（从解析记录反推而来，优先级高于 NS 判定）
+  const [learnedLineRoots, setLearnedLineRoots] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("DNSHE_LINE_ROOTS");
+      const parsed = raw ? JSON.parse(raw) : null;
+      return Array.isArray(parsed) ? parsed.map((v) => String(v)) : [];
+    } catch {
+      return [];
+    }
+  });
 
   // ===== 可编辑词库状态 =====
   // 词库分组列表（首次从内置种子导入，之后持久化在 localStorage）
@@ -1280,7 +1318,17 @@ export default function App() {
       const res = await apiFetch(`/api/domains?${accParam}`);
       const data = await res.json();
       if (data.success) {
-        setDomains(data.domains || []);
+        const list: Domain[] = data.domains || [];
+        setDomains(list);
+        // 顺手补齐这批域名根域的 NS（缺哪个查哪个），供线路支持判定使用。
+        // 结论在后端 D1 缓存 30 天，命中时不产生任何出站请求。
+        const roots = Array.from(
+          new Set([
+            ...list.map((d) => String(d.rootdomain ?? "").trim().toLowerCase()),
+            ...allRootDomains.map((r) => String(r || "").trim().toLowerCase())
+          ])
+        ).filter(Boolean);
+        void fetchRootNs(roots);
       } else {
         showToast("error", data.message || "拉取域名列表失败");
       }
@@ -2200,8 +2248,8 @@ export default function App() {
       if (data.success) {
         const records: DnsRecord[] = data.records || [];
         setDnsRecords(records);
-        // 顺手自学习线路支持名单（数据本来就要读，零额外上游调用）
-        learnLineProviderFrom(domain, records);
+        // 顺手确认根域是否支持线路（数据本来就要读，零额外上游调用）
+        learnLineRootFrom(domain, records);
       } else {
         showToast("error", data.message || "加载 DNS 解析记录失败");
       }
@@ -3023,86 +3071,197 @@ export default function App() {
   };
 
   // ===== 线路解析支持名单 =====
-  const persistLineProviders = (next: string[]) => {
-    const cleaned = Array.from(new Set(next.map((v) => String(v).trim()).filter(Boolean)));
-    setLineProviders(cleaned);
-    localStorage.setItem("DNSHE_LINE_PROVIDERS", JSON.stringify(cleaned));
-  };
-
-  /** 该域名是否支持按线路（运营商/地域）解析 */
-  const domainSupportsLine = (dom: Domain | null | undefined): boolean => {
-    const pid = dom?.provider_account_id;
-    if (pid === undefined || pid === null || String(pid).trim() === "") return false;
-    return lineProviders.includes(String(pid).trim());
+  const persistLineNsSuffixes = (next: string[]) => {
+    const cleaned = Array.from(
+      new Set(
+        next
+          .map((v) => String(v).trim().toLowerCase().replace(/^\.+|\.+$/g, ""))
+          .filter(Boolean)
+      )
+    );
+    setLineNsSuffixes(cleaned);
+    localStorage.setItem("DNSHE_LINE_NS_SUFFIXES", JSON.stringify(cleaned));
   };
 
   /**
-   * 从解析记录反推「该服务商支持线路」并自动补进名单
+   * NS 主机名是否落在后缀名单内
+   *
+   * NOTE: 必须按标签边界比对（相等或 `.` + 后缀结尾），裸 endsWith 会让
+   * evilalidns.com 这种域名混进名单。
+   */
+  const nsHostMatchesSuffix = (host: string): boolean => {
+    const h = host.trim().toLowerCase().replace(/\.$/, "");
+    if (!h) return false;
+    return lineNsSuffixes.some((sfx) => h === sfx || h.endsWith(`.${sfx}`));
+  };
+
+  /**
+   * 该域名是否支持按线路（运营商/地域）解析
+   *
+   * 三级优先级：实测已确认的根域 > 根域 NS 命中后缀名单 > provider_account_id 兜底。
+   * 兜底只在 NS 未知（首屏未加载完 / 后端 DoH 出站失败）时生效，见 DEFAULT_LINE_PROVIDERS。
+   */
+  const domainSupportsLine = (dom: Domain | null | undefined): boolean => {
+    const root = String(dom?.rootdomain ?? "").trim().toLowerCase();
+    if (root && learnedLineRoots.includes(root)) return true;
+
+    const ns = root ? rootNs[root] : undefined;
+    if (ns && ns.length > 0) return ns.some(nsHostMatchesSuffix);
+
+    const pid = dom?.provider_account_id;
+    if (pid === undefined || pid === null || String(pid).trim() === "") return false;
+    return DEFAULT_LINE_PROVIDERS.includes(String(pid).trim());
+  };
+
+  /** 根域 NS 单次查询上限，与后端 /api/dns/ns 的 NS_MAX_ROOTS 保持一致 */
+  const NS_LOOKUP_BATCH = 20;
+
+  /**
+   * 批量查询根域 NS 并写入本地镜像
+   *
+   * @param roots 待查根域；非 force 时只查镜像里还没有有效结论的（含上次查失败的 null），
+   *              命中缓存的根域不会产生任何请求，查询失败的下次调用会自动重试
+   * @param force 强制回源（设置页「重新查询 NS」用），会带上 refresh=1 让后端跳过 D1 缓存
+   * @returns 本次真正拿到的结论（键为根域，值为 NS 列表或 null 表示查不到）；
+   *          调用方据此判断成败，全 null 说明后端 DoH 出站失败或该域名确实没有 NS
+   */
+  const fetchRootNs = async (roots: string[], force = false): Promise<Record<string, string[] | null>> => {
+    const normalized = Array.from(
+      new Set(roots.map((r) => String(r || "").trim().toLowerCase()).filter(Boolean))
+    );
+    // NOTE: 判据是「有没有有效结论」而不是「键在不在」—— 上次查失败留下的 null 必须能
+    //       重试，否则一次网络抖动会把该根域永久钉死在「未知」上（镜像进了 localStorage）。
+    const pending = force
+      ? normalized
+      : normalized.filter((r) => {
+          const cur = rootNs[r];
+          return !(Array.isArray(cur) && cur.length > 0);
+        });
+    if (pending.length === 0) return {};
+
+    const merged: Record<string, string[] | null> = {};
+    for (let i = 0; i < pending.length; i += NS_LOOKUP_BATCH) {
+      const batch = pending.slice(i, i + NS_LOOKUP_BATCH);
+      try {
+        const res = await apiFetch(
+          `/api/dns/ns?roots=${encodeURIComponent(batch.join(","))}${force ? "&refresh=1" : ""}`
+        );
+        const data = await res.json();
+        if (data.success && data.ns && typeof data.ns === "object") {
+          Object.assign(merged, data.ns as Record<string, string[] | null>);
+        }
+      } catch (e) {
+        // 查不到就让判定走 provider_account_id 兜底，不打扰用户
+      }
+    }
+    if (Object.keys(merged).length === 0) return {};
+
+    // NOTE: 函数式更新 —— 域名列表刷新与设置页手动重查可能并发，闭包里的 rootNs 会过期
+    setRootNs((prev) => {
+      const next = { ...prev, ...merged };
+      localStorage.setItem("DNSHE_ROOT_NS", JSON.stringify(next));
+      return next;
+    });
+    return merged;
+  };
+
+  /**
+   * 从解析记录反推「该根域支持线路」并记住
    *
    * NOTE: 只加不减。支持线路的域名如果所有记录都留在默认线路，line 全是空值，
-   * 据此判「不支持」会误杀 —— 所以这里是单向补充。好处是即便 DNSHE 以后另开一个
-   * 支持线路的服务商，只要有人在上面成功设过线路就会被学到，不用等改代码。
+   * 据此判「不支持」会误杀 —— 所以这里是单向补充。这是唯一的实测信号（用户确实在
+   * 上面设成了非默认线路且上游收下了），比 NS 推断更硬，因此判定时优先级最高。
    * 数据来自本来就要读的解析记录，零额外上游调用。
    */
-  const learnLineProviderFrom = (dom: Domain, records: DnsRecord[]) => {
-    const pid = String(dom.provider_account_id ?? "").trim();
-    if (!pid || lineProviders.includes(pid)) return;
+  const learnLineRootFrom = (dom: Domain, records: DnsRecord[]) => {
+    const root = String(dom.rootdomain ?? "").trim().toLowerCase();
+    if (!root || learnedLineRoots.includes(root)) return;
     const usesLine = records.some((r) => {
       const v = String(r.line || "").trim().toLowerCase();
       return v !== "" && v !== "default";
     });
     if (!usesLine) return;
 
-    // NOTE: 走函数式更新而不是 persistLineProviders([...lineProviders, pid]) ——
-    // 闭包里的 lineProviders 可能已过期（连续打开两个域名时后一次会覆盖前一次的补充）。
-    setLineProviders((prev) => {
-      if (prev.includes(pid)) return prev;
-      const next = [...prev, pid];
-      localStorage.setItem("DNSHE_LINE_PROVIDERS", JSON.stringify(next));
+    // NOTE: 走函数式更新而不是 persist([...learnedLineRoots, root]) ——
+    // 闭包里的 learnedLineRoots 可能已过期（连续打开两个域名时后一次会覆盖前一次的补充）。
+    setLearnedLineRoots((prev) => {
+      if (prev.includes(root)) return prev;
+      const next = [...prev, root];
+      localStorage.setItem("DNSHE_LINE_ROOTS", JSON.stringify(next));
       return next;
     });
-    showToast("info", `检测到 ${dom.full_domain} 使用了线路解析，已将服务商 ${pid} 加入线路支持名单`);
+    showToast("info", `检测到 ${dom.full_domain} 使用了线路解析，已确认根域 ${root} 支持线路`);
   };
 
-  // 添加线路服务商 ID（支持一次粘贴多个）
-  const handleAddLineProvider = (e?: React.FormEvent) => {
+  // 添加 NS 后缀（支持一次粘贴多个）
+  const handleAddLineNsSuffix = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const incoming = parseWords(newLineProviderInput);
+    const incoming = parseWords(newLineNsInput).map((w) => w.toLowerCase());
     if (incoming.length === 0) return;
-    const merged = Array.from(new Set([...lineProviders, ...incoming]));
-    const added = merged.length - lineProviders.length;
-    persistLineProviders(merged);
-    setNewLineProviderInput("");
-    showToast(added > 0 ? "success" : "info", added > 0 ? `已添加 ${added} 个服务商 ID` : "输入的 ID 都已在名单中");
+    const merged = Array.from(new Set([...lineNsSuffixes, ...incoming]));
+    const added = merged.length - lineNsSuffixes.length;
+    persistLineNsSuffixes(merged);
+    setNewLineNsInput("");
+    showToast(added > 0 ? "success" : "info", added > 0 ? `已添加 ${added} 个 NS 后缀` : "输入的后缀都已在名单中");
   };
 
-  const handleRemoveLineProvider = (pid: string) => {
-    persistLineProviders(lineProviders.filter((p) => p !== pid));
+  const handleRemoveLineNsSuffix = (sfx: string) => {
+    persistLineNsSuffixes(lineNsSuffixes.filter((s) => s !== sfx));
   };
 
-  const handleRestoreLineProviders = () => {
-    persistLineProviders(DEFAULT_LINE_PROVIDERS);
-    showToast("success", "已恢复默认线路支持名单");
+  const handleRestoreLineNsSuffixes = () => {
+    persistLineNsSuffixes(DEFAULT_LINE_NS_SUFFIXES);
+    showToast("success", "已恢复默认 NS 后缀名单");
+  };
+
+  // 清空「实测已确认」的根域（判定优先级最高，误判时需要能撤掉）
+  const handleClearLearnedLineRoots = () => {
+    setLearnedLineRoots([]);
+    localStorage.removeItem("DNSHE_LINE_ROOTS");
+    showToast("info", "已清空实测确认的根域");
+  };
+
+  // 设置页「重新查询 NS」：所有已知根域强制回源
+  const handleRefreshRootNs = async () => {
+    setActionLoading("ns-lookup");
+    try {
+      const result = await fetchRootNs(knownRootDomains, true);
+      const total = Object.keys(result).length;
+      const resolved = Object.values(result).filter((v) => Array.isArray(v) && v.length > 0).length;
+      // 一条都没查到通常是后端 DoH 出站被拦（运行日志里会有一条 warning），
+      // 报成功会让用户对着满屏「NS 未知」怀疑面板坏了
+      if (total === 0) {
+        showToast("error", "NS 查询没有返回任何结果，请检查后端连通性");
+      } else if (resolved === 0) {
+        showToast("error", `${total} 个根域全部查询失败，判定已回退到服务商 ID（详见运行日志）`);
+      } else if (resolved < total) {
+        showToast("info", `已查到 ${resolved}/${total} 个根域的 NS，其余保持「未知」`);
+      } else {
+        showToast("success", `${resolved} 个根域的 NS 已刷新`);
+      }
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   /**
-   * 已缓存域名按解析服务商 ID 归并
+   * 所有已知根域名：已缓存域名用到的 ∪ 注册页的根域列表
    *
-   * NOTE: 给设置页做参照用 —— 服务商 ID 是个裸数字，光让用户填很难猜。把「哪个 ID
-   * 底下挂着哪些根域名」摊出来，对着官网标注支持线路的后缀就能判断该加哪个。
+   * NOTE: 给设置页对照表和 NS 批量查询共用。取并集是为了让用户在还没同步任何域名时
+   * 也能先看到判定结论，同时覆盖 allRootDomains 里手工添加的新根域。
    */
-  const providerRootMap = useMemo(() => {
-    const map = new Map<string, Set<string>>();
+  const knownRootDomains = useMemo(() => {
+    const set = new Set<string>();
     for (const d of domains) {
-      const pid = String(d.provider_account_id ?? "").trim();
-      if (!pid) continue;
-      if (!map.has(pid)) map.set(pid, new Set<string>());
-      map.get(pid)!.add(d.rootdomain);
+      const root = String(d.rootdomain ?? "").trim().toLowerCase();
+      if (root) set.add(root);
     }
-    return Array.from(map.entries())
-      .map(([pid, roots]) => ({ pid, roots: Array.from(roots).sort() }))
-      .sort((a, b) => a.pid.localeCompare(b.pid, undefined, { numeric: true }));
-  }, [domains]);
+    for (const root of allRootDomains) {
+      const r = String(root || "").trim().toLowerCase();
+      if (r) set.add(r);
+    }
+    return Array.from(set).sort();
+  }, [domains, allRootDomains]);
 
   // ===== 保留前缀名单增删 =====
   const persistReserved = (next: string[]) => {
@@ -6011,28 +6170,28 @@ export default function App() {
                     <Server className="w-4 h-4 text-sky-600 dark:text-sky-400" /> 解析线路支持名单
                   </h3>
                   <p className="text-xs text-content-muted leading-relaxed">
-                    上游 API 没有「域名是否支持按线路解析」的字段，本面板按域名所属的
-                    <span className="font-mono text-indigo-600 dark:text-indigo-400"> 解析服务商 ID </span>
-                    判断：名单内服务商的域名可以选择电信 / 联通 / 移动 / 海外 / 教育网，其余只能保持默认。
-                    上游对不支持的域名会<b>静默忽略</b>线路参数而不报错，所以这里主动拦住，
-                    避免出现「设了线路却没生效」。读取解析记录时若发现某域名实际用了非默认线路，
-                    会自动把它的服务商补进名单。
+                    上游 API 没有「域名是否支持按线路解析」的字段，本面板按根域名的
+                    <span className="font-mono text-indigo-600 dark:text-indigo-400"> NS 记录 </span>
+                    判断：NS 落在下列后缀内（即该根域托管在提供线路解析的 DNS 商），其下域名就可以选择
+                    电信 / 联通 / 移动 / 海外 / 教育网，其余只能保持默认。上游对不支持的域名会
+                    <b>静默忽略</b>线路参数而不报错，所以这里主动拦住，避免出现「设了线路却没生效」。
+                    NS 由后端查询并缓存 30 天。
                   </p>
 
                   <div className="flex flex-wrap gap-2">
-                    {lineProviders.length === 0 ? (
+                    {lineNsSuffixes.length === 0 ? (
                       <span className="text-xs text-content-muted">名单为空，所有域名都会按「不支持线路」处理</span>
                     ) : (
-                      lineProviders.map((pid) => (
+                      lineNsSuffixes.map((sfx) => (
                         <span
-                          key={pid}
+                          key={sfx}
                           className="group flex items-center bg-sky-50 border border-sky-200 text-sky-700 dark:bg-sky-950/30 dark:border-sky-500/30 dark:text-sky-300 text-xs rounded-lg overflow-hidden"
                         >
-                          <span className="px-2.5 py-1 font-mono">服务商 {pid}</span>
+                          <span className="px-2.5 py-1 font-mono">*.{sfx}</span>
                           <button
-                            onClick={() => handleRemoveLineProvider(pid)}
+                            onClick={() => handleRemoveLineNsSuffix(sfx)}
                             className="px-1.5 py-1 text-sky-500/70 hover:text-sky-800 hover:bg-sky-100 border-l border-sky-200 dark:text-sky-400/60 dark:hover:text-sky-300 dark:hover:bg-sky-900/40 dark:border-sky-500/30 transition-all"
-                            title={`从名单移除服务商 ${pid}`}
+                            title={`从名单移除 ${sfx}`}
                           >
                             <X className="w-3 h-3" />
                           </button>
@@ -6041,14 +6200,14 @@ export default function App() {
                     )}
                   </div>
 
-                  <form onSubmit={handleAddLineProvider} className="flex flex-wrap items-center gap-2">
+                  <form onSubmit={handleAddLineNsSuffix} className="flex flex-wrap items-center gap-2">
                     <input
                       type="text"
-                      name="dnshe-line-provider"
+                      name="dnshe-line-ns-suffix"
                       autoComplete="off"
-                      value={newLineProviderInput}
-                      onChange={(e) => setNewLineProviderInput(e.target.value)}
-                      placeholder="服务商 ID，可一次填多个（逗号 / 空格分隔）"
+                      value={newLineNsInput}
+                      onChange={(e) => setNewLineNsInput(e.target.value)}
+                      placeholder="NS 后缀，如 alidns.com，可一次填多个（逗号 / 空格分隔）"
                       className="form-input flex-1 min-w-[12rem] px-3 py-2 rounded-lg text-sm font-mono text-content-primary placeholder:text-content-muted"
                     />
                     <button
@@ -6059,26 +6218,54 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      onClick={handleRestoreLineProviders}
+                      onClick={handleRestoreLineNsSuffixes}
                       className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-xs font-semibold flex-shrink-0"
                     >
                       恢复默认
                     </button>
                   </form>
 
-                  {providerRootMap.length > 0 && (
-                    <div className="pt-3 border-t border-border-soft space-y-1.5">
-                      <div className="text-xs font-semibold text-content-secondary">已缓存域名的服务商分布（对照官网标注即可判断该加哪个）</div>
-                      {providerRootMap.map(({ pid, roots }) => {
-                        const on = lineProviders.includes(pid);
+                  {knownRootDomains.length > 0 && (
+                    <div className="pt-3 border-t border-border-soft space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs font-semibold text-content-secondary">各根域名的 NS 与判定结果</div>
+                        <div className="flex items-center gap-2">
+                          {learnedLineRoots.length > 0 && (
+                            <button
+                              onClick={handleClearLearnedLineRoots}
+                              className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-2.5 py-1 rounded-lg text-[11px] font-semibold flex-shrink-0"
+                              title="清空「实测已确认」标记，让判定完全回到 NS 名单"
+                            >
+                              清空实测标记
+                            </button>
+                          )}
+                          <button
+                            onClick={handleRefreshRootNs}
+                            disabled={actionLoading === "ns-lookup"}
+                            className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1.5 flex-shrink-0 disabled:opacity-50"
+                          >
+                            <RefreshCw className={`w-3 h-3 ${actionLoading === "ns-lookup" ? "animate-spin" : ""}`} />
+                            重新查询 NS
+                          </button>
+                        </div>
+                      </div>
+                      {knownRootDomains.map((root) => {
+                        const ns = rootNs[root];
+                        const learned = learnedLineRoots.includes(root);
+                        const on = learned || (!!ns && ns.length > 0 && ns.some(nsHostMatchesSuffix));
+                        // NS 尚未查到时判定实际走 provider_account_id 兜底，标注出来免得用户以为面板失灵
+                        const unknown = !ns || ns.length === 0;
                         return (
-                          <div key={pid} className="text-[11px] font-mono flex flex-wrap items-baseline gap-x-2">
+                          <div key={root} className="text-[11px] font-mono flex flex-wrap items-baseline gap-x-2">
                             <span className={on ? "text-sky-700 dark:text-sky-300 font-bold" : "text-content-muted"}>
-                              服务商 {pid}
+                              {root}
                             </span>
                             <span className="text-content-muted">→</span>
-                            <span className="text-content-secondary break-all">{roots.join("、")}</span>
+                            <span className="text-content-secondary break-all">
+                              {unknown ? "NS 未知（判定回退到服务商 ID）" : ns!.join("、")}
+                            </span>
                             {on && <span className="text-[10px] text-sky-700 dark:text-sky-300">（支持线路）</span>}
+                            {learned && <span className="text-[10px] text-emerald-700 dark:text-emerald-300">（实测已确认）</span>}
                           </div>
                         );
                       })}
@@ -6103,7 +6290,7 @@ export default function App() {
                       placeholder={settingsConfigured.tg_token ? "已配置（留空不修改）" : "Bot Token"}
                       className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                     />
-                    <div className="flex gap-2">
+                    <div className="flex flex-col sm:flex-row gap-2">
                       <input
                         value={settings.tg_chat_id}
                         onChange={(e) => setSettings((s) => ({ ...s, tg_chat_id: e.target.value }))}
@@ -6113,7 +6300,7 @@ export default function App() {
                       <button
                         onClick={handleTestTelegram}
                         disabled={actionLoading === "test-tg"}
-                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50 flex-shrink-0"
                       >
                         <Send className="w-4 h-4" /> 测试推送
                       </button>

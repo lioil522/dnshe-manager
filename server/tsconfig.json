@@ -1,0 +1,18 @@
+{
+  "// 说明": "自建 Node 版的类型检查配置。与根 tsconfig.json 分开，是因为这一侧需要 @types/node，而根配置只装 @cloudflare/workers-types —— 根配置的 include 只覆盖 src/**，不会碰到 server/。",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["node", "@cloudflare/workers-types"],
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["**/*.ts", "../src/**/*.ts"]
+}

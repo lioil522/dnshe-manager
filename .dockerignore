@@ -1,0 +1,33 @@
+# 构建上下文里不需要、或会污染镜像内 npm ci 结果的东西
+node_modules
+frontend/node_modules
+
+# 构建产物（镜像内会重新构建）
+dist-node
+frontend/dist
+public
+dist
+
+# 运行期数据 —— 绝不能进镜像
+data
+.wrangler
+
+# 仓库与工具目录
+.git
+.gitignore
+.github
+.claude
+.idea
+.vscode
+
+# 本机机密与日志
+.env
+.env.local
+.env.development.local
+.env.production.local
+*.log
+
+# 文档与脚本（运行时用不到）
+README.md
+clean-local.cmd
+scripts

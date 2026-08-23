@@ -1,0 +1,49 @@
+# DNSHE-Manager 自建部署
+#
+#   cp .env.example .env     # 按需填写，全部留空也能跑
+#   docker compose up -d --build
+#   浏览器打开 http://<服务器IP>:8787 ，首次进入自行设置管理员用户名与密码
+#
+# 前后端同源（同一个端口），因此不需要配 CORS、也不用烘焙后端域名。
+
+services:
+  dnshe-manager:
+    build: .
+    image: dnshe-manager:local
+    container_name: dnshe-manager
+    restart: unless-stopped
+
+    ports:
+      # 想只在本机监听、前面再挂 Nginx/Caddy 的话改成 "127.0.0.1:8787:8787"
+      - "8787:8787"
+
+    volumes:
+      # 数据库与自动生成的加密密钥都在这里，务必连同 aes.key 一起备份
+      - dnshe-data:/data
+      #
+      # 换成宿主目录挂载（如 ./data:/data）时，容器内以 node 用户（uid 1000）运行，
+      # 需要先把宿主目录的属主改成 1000：sudo chown -R 1000:1000 ./data
+
+    environment:
+      # 只影响容器内日志的时间显示；面板里的北京时间由代码自行按 UTC+8 计算，与此无关
+      TZ: ${TZ:-Asia/Shanghai}
+
+      # 以下全部可选，留空即为不启用（详见 .env.example）
+      AES_KEY: ${AES_KEY:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_TYPE: ${WEBHOOK_TYPE:-}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
+      DEFAULT_API_KEY: ${DEFAULT_API_KEY:-}
+      DEFAULT_API_SECRET: ${DEFAULT_API_SECRET:-}
+      DEFAULT_API_ALIAS: ${DEFAULT_API_ALIAS:-}
+
+      # 定时任务（域名同步 + 到期自动续期）的触发时刻，UTC。
+      # 默认 02:00 UTC = 北京时间 10:00，与 wrangler.toml 的 crons 一致。
+      CRON_UTC_HOUR: ${CRON_UTC_HOUR:-2}
+      CRON_UTC_MINUTE: ${CRON_UTC_MINUTE:-0}
+      # 设为 1 可完全关闭定时任务（只手动同步）
+      DISABLE_CRON: ${DISABLE_CRON:-}
+
+volumes:
+  dnshe-data:

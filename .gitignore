@@ -8,6 +8,13 @@ yarn-error.log*
 dist/
 build/
 .wrangler/
+dist-node/
+
+# 自建（Docker / 裸机 Node）版的本地目录
+# data/   运行期数据：SQLite 数据库与自动生成的 aes.key
+# public/ 可选的前端产物拷贝（容器内为 /app/public）
+data/
+public/
 
 # IDE & OS files
 .DS_Store

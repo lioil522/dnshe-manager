@@ -54,7 +54,7 @@ jobs:
       - name: 拉取代码
         uses: actions/checkout@v7
 
-      - name: 准备平台标识（linux/amd64 → linux-amd64，用于缓存与产物命名）
+      - name: 准备平台标识（把斜杠换成短横，用于缓存 scope 与产物命名）
         env:
           PLATFORM: ${{ matrix.platform }}
         run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"

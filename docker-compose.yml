@@ -1,15 +1,28 @@
 # DNSHE-Manager 自建部署
 #
 #   cp .env.example .env     # 按需填写，全部留空也能跑
-#   docker compose up -d --build
+#   docker compose up -d
 #   浏览器打开 http://<服务器IP>:8787 ，首次进入自行设置管理员用户名与密码
+#
+# 用的是 GitHub Actions 构建好的多架构镜像（amd64 / arm64 由 Docker 自动匹配），
+# 不需要本地构建、也不需要克隆整个仓库 —— 有这个文件和 .env 就够了。
+#
+#   docker compose pull && docker compose up -d      # 更新到最新版
 #
 # 前后端同源（同一个端口），因此不需要配 CORS、也不用烘焙后端域名。
 
 services:
   dnshe-manager:
-    build: .
-    image: dnshe-manager:local
+    # 镜像地址与版本都可以在 .env 里覆盖：
+    #   IMAGE_TAG   留空即 latest（跟随 main 的最新构建）；想钉住某个发布版本就填 1.2.3
+    #   IMAGE_REPO  留空即官方的 GHCR 地址。ghcr.io 在部分网络（尤其大陆）拉不动，
+    #               可以换成镜像站，例如 IMAGE_REPO=ghcr.nju.edu.cn/lioil522/dnshe-manager
+    #               fork 之后想用自己那份 CI 的产物，也是改这里
+    image: ${IMAGE_REPO:-ghcr.io/lioil522/dnshe-manager}:${IMAGE_TAG:-latest}
+    #
+    # 改了代码想自己构建：取消下面这行注释，然后 docker compose up -d --build
+    # （构建产物会占用上面那个镜像名，之后 docker compose pull 会把它换回官方构建）
+    # build: .
     container_name: dnshe-manager
     restart: unless-stopped
 

@@ -171,18 +171,21 @@ npx wrangler pages deploy dist --project-name=dnshe-manager-frontend --branch=ma
 
 不用 Cloudflare 账号，一个容器跑完前端 + 后端 + 数据库，数据全在自己手里。只需要装了 Docker 的机器（无需 Node，镜像内也没有任何需要编译的原生模块）。
 
-```bash
-git clone https://github.com/your-username/dnshe-manager.git
-cd dnshe-manager
+镜像由 GitHub Actions 构建并发布到 GHCR，**amd64 / arm64 双架构**，拉取时自动匹配。所以既不用克隆仓库、也不用在本机构建 —— 两个文件就够：
 
-cp .env.example .env      # 全部留空也能跑，按需填
-docker compose up -d --build
+```bash
+mkdir dnshe-manager && cd dnshe-manager
+curl -O https://raw.githubusercontent.com/lioil522/dnshe-manager/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/lioil522/dnshe-manager/main/.env.example
+
+docker compose up -d
 ```
 
 打开 `http://<服务器IP>:8787`，在登录页自行设置管理员用户名与密码即可开始使用。前端与 API 同源，**不需要配置后端地址、也不需要配 CORS**。
 
 | 项 | 值 |
 | :--- | :--- |
+| 镜像 | `ghcr.io/lioil522/dnshe-manager:latest`；地址与版本可用 `.env` 的 `IMAGE_REPO` / `IMAGE_TAG` 覆盖 |
 | 端口 | `8787`（改 `docker-compose.yml` 的 `ports`；只在本机监听写 `127.0.0.1:8787:8787`） |
 | 数据 | 命名卷 `dnshe-data` → 容器内 `/data`：`dnshe.db`（SQLite）与 `aes.key`（自动生成的加密密钥） |
 | 定时任务 | 进程内定时器，每日 `02:00 UTC`（= 北京时间 10:00），与 Cloudflare 版的 Cron 完全同一份代码 |
@@ -194,16 +197,20 @@ docker compose up -d --build
 ```bash
 docker compose logs -f            # 看日志（含下一次定时任务的时间）
 docker compose restart            # 重启
-docker compose up -d --build      # 拉取新代码后重新构建并滚动更新
+docker compose pull               # 拉取最新镜像
+docker compose up -d              # 滚动更新到刚拉下来的镜像（数据卷不动）
 docker run --rm -v dnshe-data:/data -v "$PWD":/backup alpine \
   tar czf /backup/dnshe-backup.tar.gz -C /data .      # 备份数据卷
 ```
+
+想改代码后跑自己的构建：克隆仓库，把 `docker-compose.yml` 里 `build: .` 那行的注释去掉，然后 `docker compose up -d --build`。
 
 > [!IMPORTANT]
 > **备份要连 `aes.key` 一起备。** 未配置 `AES_KEY` 时，首次启动会自动生成一份随机密钥写入 `/data/aes.key`。这个密钥丢了，库里已加密的 API Secret 与 2FA 密钥都解不开，只能重新绑定账号。想自己掌管密钥就在 `.env` 里填 `AES_KEY`。
 
 > [!NOTE]
 > **出站可达性与 Cloudflare 版不同。** 自建版从你自己的网络出站，不再享受 Cloudflare 边缘的畅通：
+> - **拉镜像**要能访问 `ghcr.io`。大陆网络下它基本拉不动：IPv6 会被重置，IPv4 实测只有几十 KB/s，而 Docker 的 `registry-mirrors` 只代理 Docker Hub、对 ghcr.io 无效。这时在 `.env` 里换镜像站即可（`IMAGE_REPO=ghcr.nju.edu.cn/lioil522/dnshe-manager`，实测同一个摘要、35 秒拉完）。
 > - **DNS 托管商识别**（域名三态里的「已委派」判定）走公共 DoH。解析器列表已追加国内可达的 `dns.alidns.com` 兜底，并给每次查询加了 5 秒超时，因此大陆网络下仍可用，只是首次查询会先白等前两家超时（结论缓存 30 天，只付一次）。
 > - **Telegram 推送**需要能访问 `api.telegram.org`，大陆网络通常不可达。国内环境请改用钉钉 / 飞书 / 企业微信 / Server酱，这些都能直连。
 > - **DNSHE 官方 API**（`api005.dnshe.com`）在国内可直连，不受影响。
@@ -260,7 +267,9 @@ npm run start:node     # http://127.0.0.1:8787 ，数据落 ./data
 
 ```text
 dnshe-manager/
-├── .github/workflows/deploy.yml   # GitHub Actions 自动部署工作流
+├── .github/workflows/
+│   ├── deploy.yml                 # 部署到 Cloudflare（Workers + Pages + D1）
+│   └── docker.yml                 # 构建自建镜像并发布到 GHCR（amd64 / arm64 双架构）
 ├── src/                           # 后端业务代码（Cloudflare Worker 与自建版共用）
 │   ├── index.ts                   # Hono 路由、鉴权中间件、表结构自举、缓存与查重池接口
 │   ├── dnshe.ts                   # DNSHE 官方 REST API V2.0 客户端（请求签名）

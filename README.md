@@ -27,27 +27,35 @@ DNSHE-Manager 是一个面向 [DNSHE](https://my.dnshe.com) 用户的**多账号
 
 ## 🏗️ 架构概览
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    DNSHE-Manager                        │
-│                                                         │
-│  ┌──────────────┐    ┌──────────────────────────────┐   │
-│  │   前端 (SPA)  │    │        后端 (Hono)            │   │
-│  │  React + TS   │───▶│  src/index.ts  (共享业务)     │   │
-│  │  Vite + TW    │    │  src/db.ts     (数据层)       │   │
-│  │  Lucide Icons │    │  src/cron.ts   (定时任务)     │   │
-│  └──────────────┘    │  src/dnshe.ts  (API 客户端)   │   │
-│                      └──────────┬───────────────────┘   │
-│                                 │                       │
-│              ┌──────────────────┼──────────────────┐    │
-│              ▼                  ▼                  ▼    │
-│  ┌────────────────┐  ┌────────────────┐                 │
-│  │ Cloudflare Workers │  │  Docker 自建   │                 │
-│  │  D1 Database    │  │  SQLite (内置)  │                 │
-│  │  Cron Trigger   │  │  定时器         │                 │
-│  │  Pages (可选)   │  │  同端口同源     │                 │
-│  └────────────────┘  └────────────────┘                 │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph DNSHE-Manager
+        subgraph 前端 SPA
+            A1["React + TypeScript"]
+            A2["Vite + Tailwind CSS"]
+            A3["Lucide Icons"]
+        end
+
+        subgraph 后端 Hono
+            B1["src/index.ts — 共享业务"]
+            B2["src/db.ts — 数据层"]
+            B3["src/cron.ts — 定时任务"]
+            B4["src/dnshe.ts — API 客户端"]
+        end
+
+        A1 -->|API 调用| B1
+    end
+
+    B1 --> C1
+    B1 --> C2
+
+    subgraph Cloudflare Workers
+        C1["D1 Database / Cron Trigger / Pages"]
+    end
+
+    subgraph Docker 自建
+        C2["SQLite 内置 / 进程内定时器 / 同端口同源"]
+    end
 ```
 
 ---
@@ -79,7 +87,7 @@ DNSHE-Manager 是一个面向 [DNSHE](https://my.dnshe.com) 用户的**多账号
 
 #### 3. 配置 GitHub Secrets
 
-进入 Fork 仓库的 `Settings` → `Secrets and variables` → `Actions`，添加以下 Secrets：
+进入 Fork 仓库的 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`，添加以下 Secrets：
 
 | Secret 名称 | 是否必填 | 说明 |
 |-------------|---------|------|

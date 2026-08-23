@@ -1,0 +1,222 @@
+name: 构建自建镜像
+
+# 自建（Docker）版镜像的构建与发布。
+#
+# amd64 与 arm64 各自在原生 runner 上构建（公开仓库两种 runner 都免费），
+# 不用 QEMU 模拟 —— 前端 vite 构建在模拟下会慢十几倍。
+#
+# 每个架构先构建到本机 daemon 跑一遍冒烟测试，通过后再「按摘要」推送；
+# 最后由 merge 作业把两个摘要合成一份多架构清单，打上 tag。
+#
+# 镜像地址：ghcr.io/<owner>/<repo>
+# ⚠️ 首次发布后 GHCR 上的包默认是私有的，要让别人能匿名 docker pull，
+#    需要去 GitHub 的 Packages 设置里把它改成 Public（只需一次）。
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一个 ref 上连续推送时，取消还在跑的旧构建
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    # 本仓库的分支推送本身就会触发一次，因此 pull_request 事件只用来验证来自 fork 的 PR，
+    # 否则同一次改动会跑两遍。
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+
+    name: 构建 ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v7
+
+      - name: 准备平台标识（linux/amd64 → linux-amd64，用于缓存与产物命名）
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # 这一步会跑 Dockerfile 阶段 2 里的 tsc 与 17 项 D1→SQLite 适配层自检，
+      # 任何一项不过都会让构建直接失败（这是刻意设计的闸门）。
+      - name: 构建镜像（含类型检查与适配层自检）
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: dnshe-manager:ci
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: 冒烟测试（起容器打接口）
+        run: |
+          set -euo pipefail
+          BASE=http://127.0.0.1:8787
+
+          fail() { echo "::error::$1"; docker logs dnshe-ci 2>&1 | tail -40; exit 1; }
+          trap 'docker rm -f dnshe-ci >/dev/null 2>&1 || true' EXIT
+
+          docker run -d --name dnshe-ci -p 8787:8787 dnshe-manager:ci
+
+          # 等镜像自带的 HEALTHCHECK 变绿 —— 顺带验证探针本身可用
+          for i in $(seq 1 60); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' dnshe-ci)" = healthy ] && break
+            sleep 1
+          done
+          [ "$(docker inspect -f '{{.State.Health.Status}}' dnshe-ci)" = healthy ] \
+            || fail "容器 60 秒内没有变成 healthy"
+
+          # 1. 探活接口会顺手读一次数据库，能区分「进程活着」与「库可读」
+          curl -fsS "$BASE/healthz" | grep -q '"ok":true' \
+            || fail "/healthz 没有返回 ok"
+
+          # 2. 全新数据卷 → 应报未初始化，引导前端走首次设置
+          curl -fsS "$BASE/api/auth/status" | grep -q '"initialized":false' \
+            || fail "全新库的 initialized 不是 false"
+
+          # 3. 受保护接口不带凭据必须 401
+          [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/accounts")" = 401 ] \
+            || fail "无鉴权访问 /api/accounts 没有返回 401"
+
+          # 4. 首次初始化 → 用签发的 Session 访问受保护接口
+          #    这条会走通 SQLite 适配层的建表、PBKDF2 哈希写入与 settings UPSERT
+          TOKEN=$(curl -fsS -X POST "$BASE/api/auth/setup" \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"ciuser","password":"ci-smoke-password"}' \
+            | sed -n 's/.*"session_token":"\([^"]*\)".*/\1/p')
+          [ -n "$TOKEN" ] || fail "setup 没有签发 session_token"
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/api/accounts")" = 200 ] \
+            || fail "带 Session 访问 /api/accounts 没有返回 200"
+
+          # 5. 前端由同一个端口发出（同源，免 CORS），/assets/* 走 immutable 长缓存
+          curl -fsS "$BASE/" | grep -q 'id="root"' \
+            || fail "/ 没有返回前端 index.html"
+          ASSET=$(curl -fsS "$BASE/" | grep -o '/assets/[A-Za-z0-9._-]*\.js' | head -1 || true)
+          [ -n "$ASSET" ] || fail "index.html 里找不到打包后的 js 资源"
+          curl -fsS -D - -o /dev/null "$BASE$ASSET" \
+            | grep -qi 'cache-control: public, max-age=31536000, immutable' \
+            || fail "$ASSET 的 Cache-Control 不是 immutable 长缓存"
+
+          # 6. 进程内定时器（替代 Cron Trigger）确实排上了下一次触发
+          docker logs dnshe-ci 2>&1 | grep -q '下一次域名同步与自动续期' \
+            || fail "启动日志里没有定时任务的排程行"
+
+          # 7. 运行时镜像不该带 node_modules（后端已被 esbuild 打成单文件），且不以 root 运行
+          docker run --rm --entrypoint sh dnshe-manager:ci -c '[ ! -d /app/node_modules ]' \
+            || fail "运行时镜像里出现了 node_modules"
+          [ "$(docker run --rm --entrypoint id dnshe-manager:ci -u)" = 1000 ] \
+            || fail "容器不是以 uid 1000（node）运行"
+
+          echo "✅ ${{ matrix.platform }} 冒烟测试全部通过"
+
+      - name: 登录 GHCR
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 按摘要推送、不打 tag：tag 统一由 merge 作业挂到多架构清单上。
+      # 关掉 provenance / sbom，让每个摘要都是一份干净的单架构 manifest，
+      # imagetools create 合并时不会带出游离的 attestation 清单。
+      - name: 按摘要推送镜像
+        id: push
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: 把摘要写成文件
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: 上传摘要
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: 合成多架构清单
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 下载各架构的摘要
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 计算镜像 tag
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 把两个架构的摘要合成一份清单
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: 核对清单里的架构
+        run: |
+          docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"

@@ -3,12 +3,13 @@
 [![Cloudflare Workers](https://img.shields.io/badge/Backend-Cloudflare_Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 [![Cloudflare Pages](https://img.shields.io/badge/Frontend-Cloudflare_Pages-F38020?logo=cloudflare&logoColor=white)](https://pages.cloudflare.com/)
 [![Database](https://img.shields.io/badge/Database-Cloudflare_D1_SQL-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/d1/)
+[![Docker](https://img.shields.io/badge/Self--host-Docker-2496ED?logo=docker&logoColor=white)](#方式三docker-自建部署)
 [![TypeScript](https://img.shields.io/badge/Language-TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 专为 **DNSHE 免费域名用户** 打造的跨账号集中托管控制面板：一处绑定多个账号，统一管理域名资产、DNS 解析记录与 NS 委派，并无人值守自动续期。
 
-基于 Cloudflare Serverless 全家桶（**Workers + Pages + D1**）构建，无需采购服务器，可零成本免费托管。
+基于 Cloudflare Serverless 全家桶（**Workers + Pages + D1**）构建，无需采购服务器，可零成本免费托管；也可以用 **Docker 自建**，同一套业务代码把 D1 换成本地 SQLite、Cron Trigger 换成进程内定时器，前后端同源跑在一个容器里（见[方式三](#方式三docker-自建部署)）。
 
 ---
 
@@ -56,6 +57,22 @@
 └──────────────┘       └────────────────┘     └───────────────┘
 ```
 
+自建（Docker）版共用 `src/` 下的同一套业务代码，只把运行时依赖换掉 —— 前端由后端同端口发出，因此前后端同源、不需要 CORS：
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│            单个容器 :8787（前后端同源，无需配置 CORS）            │
+│   静态文件处理器（发前端产物） + Hono.js 路由（/api/* 与鉴权）      │
+└──────┬───────────────────────┬──────────────────────┬───────┘
+       │                       │                      │
+┌──────▼───────┐       ┌───────▼────────┐     ┌───────▼───────┐
+│  SQLite 文件  │       │  进程内定时器   │     │ DNSHE Official│
+│  /data 数据卷 │       │ 每日 02:00 UTC │     │ REST API V2.0 │
+└──────────────┘       └────────────────┘     └───────────────┘
+```
+
+替换只发生在 `server/` 下的三个文件里，`src/` 一行未改：`d1-sqlite.ts` 用 `node:sqlite` 实现 D1 的接口（含 `batch()` 的事务原子性与外键级联），`index.ts` 组装 env 绑定、`waitUntil` 替身与每日定时器，`static.ts` 负责发前端产物。
+
 ---
 
 ## 🔑 环境变量与密钥
@@ -96,7 +113,21 @@
 
 | 变量名 | 必要性 | 说明 |
 | :--- | :---: | :--- |
-| `VITE_API_BASE_URL` | 可选 🟢 | 后端 Worker API 基准 URL。Actions 部署会自动检测并注入，无需手配 |
+| `VITE_API_BASE_URL` | 可选 🟢 | 后端 Worker API 基准 URL。Actions 部署会自动检测并注入，无需手配。自建版由 `frontend/.env.selfhost` 固定为 `/`（同源相对路径），也无需手配 |
+
+### 5. 自建（Docker）版环境变量
+
+上面 2、3 两节的变量在自建版里同名同义，改由容器环境变量传入（见 `.env.example` 与 `docker-compose.yml`）。差异只有这几处：
+
+| 变量名 | 默认值 | 与 Cloudflare 版的差异 |
+| :--- | :--- | :--- |
+| `AES_KEY` | 自动生成 | 留空则首次启动生成随机密钥写入 `/data/aes.key`（**必须随数据库一起备份**） |
+| `ALLOWED_ORIGIN` | 无需配置 | 前后端同源，不涉及跨域；仅在把前端单独部署到别的域名时才需要 |
+| `DB` | 无 | 不存在。数据库是 `/data/dnshe.db`，路径可用 `DATA_DIR` / `DB_PATH` 覆盖 |
+| `PORT` / `HOST` | `8787` / `0.0.0.0` | 仅自建版有 |
+| `STATIC_DIR` | `/app/public` | 前端产物目录；本地未设时自动探测 `./public` 与 `./frontend/dist` |
+| `CRON_UTC_HOUR` / `CRON_UTC_MINUTE` | `2` / `0` | 定时任务时刻（UTC），等价于 `wrangler.toml` 的 `crons` |
+| `DISABLE_CRON` | 无 | 设为 `1` 彻底关闭每日同步与自动续期 |
 
 ---
 
@@ -136,6 +167,57 @@ cd frontend && npm install && npm run build
 npx wrangler pages deploy dist --project-name=dnshe-manager-frontend --branch=main
 ```
 
+### 方式三：Docker 自建部署
+
+不用 Cloudflare 账号，一个容器跑完前端 + 后端 + 数据库，数据全在自己手里。只需要装了 Docker 的机器（无需 Node，镜像内也没有任何需要编译的原生模块）。
+
+```bash
+git clone https://github.com/your-username/dnshe-manager.git
+cd dnshe-manager
+
+cp .env.example .env      # 全部留空也能跑，按需填
+docker compose up -d --build
+```
+
+打开 `http://<服务器IP>:8787`，在登录页自行设置管理员用户名与密码即可开始使用。前端与 API 同源，**不需要配置后端地址、也不需要配 CORS**。
+
+| 项 | 值 |
+| :--- | :--- |
+| 端口 | `8787`（改 `docker-compose.yml` 的 `ports`；只在本机监听写 `127.0.0.1:8787:8787`） |
+| 数据 | 命名卷 `dnshe-data` → 容器内 `/data`：`dnshe.db`（SQLite）与 `aes.key`（自动生成的加密密钥） |
+| 定时任务 | 进程内定时器，每日 `02:00 UTC`（= 北京时间 10:00），与 Cloudflare 版的 Cron 完全同一份代码 |
+| 环境变量 | 见 `.env.example`，与 Cloudflare 版的 Worker 变量同名同义 |
+| 健康检查 | `GET /healthz`（会真读一次数据库），已配进镜像的 `HEALTHCHECK` |
+
+常用运维：
+
+```bash
+docker compose logs -f            # 看日志（含下一次定时任务的时间）
+docker compose restart            # 重启
+docker compose up -d --build      # 拉取新代码后重新构建并滚动更新
+docker run --rm -v dnshe-data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/dnshe-backup.tar.gz -C /data .      # 备份数据卷
+```
+
+> [!IMPORTANT]
+> **备份要连 `aes.key` 一起备。** 未配置 `AES_KEY` 时，首次启动会自动生成一份随机密钥写入 `/data/aes.key`。这个密钥丢了，库里已加密的 API Secret 与 2FA 密钥都解不开，只能重新绑定账号。想自己掌管密钥就在 `.env` 里填 `AES_KEY`。
+
+> [!NOTE]
+> **出站可达性与 Cloudflare 版不同。** 自建版从你自己的网络出站，不再享受 Cloudflare 边缘的畅通：
+> - **DNS 托管商识别**（域名三态里的「已委派」判定）走公共 DoH。解析器列表已追加国内可达的 `dns.alidns.com` 兜底，并给每次查询加了 5 秒超时，因此大陆网络下仍可用，只是首次查询会先白等前两家超时（结论缓存 30 天，只付一次）。
+> - **Telegram 推送**需要能访问 `api.telegram.org`，大陆网络通常不可达。国内环境请改用钉钉 / 飞书 / 企业微信 / Server酱，这些都能直连。
+> - **DNSHE 官方 API**（`api005.dnshe.com`）在国内可直连，不受影响。
+
+裸机 Node 运行（不用 Docker，需 Node ≥ 22.5）：
+
+```bash
+npm install && npm run build:node                     # 打包后端（单文件，含依赖）
+cd frontend && npm install && npm run build:selfhost && cd ..   # 构建前端（同源模式）
+npm run start:node                                    # 默认 :8787，数据落 ./data
+```
+
+这条路径上的配置要自己导出到环境里（`export AES_KEY=...`，PowerShell 用 `$env:AES_KEY="..."`）——`.env` 只被 docker compose 读取，不会被 `npm run start:node` 自动加载。
+
 ---
 
 ## 💻 本地开发
@@ -157,6 +239,21 @@ npx wrangler d1 execute dnshe-manager-db --local --file=./schema.sql
 > [!WARNING]
 > 本地 D1 数据永久删除且不备份。脚本对目标路径做项目目录边界校验，**不会连接或删除远程 Cloudflare D1**。运行前请先停掉 Worker / Vite 服务。
 
+改动 `server/` 或 `src/db.ts` 后建议跑一遍这三条（镜像构建时也会跑前两条，跑不过就构建失败）：
+
+```bash
+npm run verify:node    # 自建侧类型检查（tsc -p server，含 src/）
+npm run test:node      # D1 → SQLite 适配层自检（batch 原子性、meta.changes、外键级联等 17 项）
+npx tsc --noEmit       # Cloudflare Worker 侧类型检查
+```
+
+也可以不用 wrangler、直接以自建形态联调（一个端口，前后端同源）：
+
+```bash
+npm run build:node && cd frontend && npm run build:selfhost && cd ..
+npm run start:node     # http://127.0.0.1:8787 ，数据落 ./data
+```
+
 ---
 
 ## 📁 目录结构
@@ -164,13 +261,19 @@ npx wrangler d1 execute dnshe-manager-db --local --file=./schema.sql
 ```text
 dnshe-manager/
 ├── .github/workflows/deploy.yml   # GitHub Actions 自动部署工作流
-├── src/                           # 后端 Cloudflare Worker
+├── src/                           # 后端业务代码（Cloudflare Worker 与自建版共用）
 │   ├── index.ts                   # Hono 路由、鉴权中间件、表结构自举、缓存与查重池接口
 │   ├── dnshe.ts                   # DNSHE 官方 REST API V2.0 客户端（请求签名）
 │   ├── dns-provider.ts            # 按 NS 记录识别 DNS 托管商
 │   ├── punycode.ts                # RFC 3492 Punycode 编解码器
 │   ├── db.ts                      # D1 操作、AES-GCM 加解密、会话、缓存 / 查重池、日志
 │   └── cron.ts                    # 每日巡检：自动续期、清理过期缓存与会话、推送通知
+├── server/                        # 仅自建（Docker / 裸机 Node）版需要，src/ 不依赖它
+│   ├── index.ts                   # Node 入口：env 绑定、waitUntil 替身、每日定时器、优雅退出
+│   ├── d1-sqlite.ts               # 用 node:sqlite 实现 D1 接口（batch 事务、meta.changes、外键级联）
+│   ├── d1-sqlite.test.ts          # 适配层自检（npm run test:node），镜像构建时会跑
+│   ├── static.ts                  # 静态资源处理器：缓存头、ETag/304、SPA 兜底、目录穿越防护
+│   └── tsconfig.json              # 自建侧类型检查（需 @types/node，与根配置分开）
 ├── frontend/                      # 前端 React 18 + Vite
 │   ├── src/
 │   │   ├── App.tsx                # 主界面（域名 / DNS 管理 / 安全设置 / 查重引擎）
@@ -184,10 +287,14 @@ dnshe-manager/
 │   │   ├── punycode.ts            # 与后端同源的编解码器
 │   │   └── index.css              # Tailwind 与主题变量
 │   ├── public/_headers            # Pages 响应头：/assets/* 长缓存 immutable
+│   ├── .env.selfhost              # 自建版构建变量：把 API 基准地址烘焙成同源相对路径
 │   └── tailwind.config.js         # 主题与字体栈扩展
 ├── scripts/clean-local.ps1        # 本地缓存 / Wrangler 状态 / 本地 D1 安全清理
 ├── clean-local.cmd                # Windows 双击式清理入口
-├── schema.sql                     # D1 初始化表结构
+├── Dockerfile                     # 自建镜像：三阶段构建，运行时无 node_modules、无原生模块
+├── docker-compose.yml             # 一条命令起服务（端口 / 数据卷 / 环境变量）
+├── .env.example                   # 自建版环境变量样例（全部可选）
+├── schema.sql                     # 初始化表结构（D1 与本地 SQLite 共用）
 └── wrangler.toml                  # Worker 配置（D1 绑定与 Cron 触发器）
 ```
 
@@ -223,6 +330,25 @@ Session 有效期 7 天，到期后接口返回 403、前端清理凭据回登�
 优选只能优化「客户端 ↔ Cloudflare 边缘」这一段，而主要耗时发生在边缘**之后**——Worker 到 D1 主库的串行往返。三个常见误区：Pages 自定义域名是 CNAME 到 `*.pages.dev`，客户端只拿到 Cloudflare 自己的 anycast 地址，优选不生效；给后端配优选可能更慢，因为流量被导向离 D1 更远的边缘节点；域名指向会绕回 Cloudflare 的中转 IP 会触发 `Error 1000`，边缘直接 403、Worker 根本不执行。
 
 排查服务端开销：`curl -s -o /dev/null -w "%{time_starttransfer}\n" https://<后端域名>/api/auth/status`，再对比一个不查库的路径（如任意 404），差值即 D1 部分耗时。
+
+**Docker 自建版和 Cloudflare 版有功能差别吗？**
+业务代码是同一份，功能完全一致，只有两处环境差异：一是自建版从你自己的网络出站，DNS 托管商识别与 Telegram 推送受本地网络可达性影响（见方式三的说明）；二是自建版本地读库是微秒级，没有 Worker 到 D1 主库那 300–450ms 的往返，页面明显更快。
+
+**已经在 Cloudflare 上跑了，怎么把数据搬到自建版？**
+D1 就是 SQLite，导出再导入即可（表结构两边共用 `schema.sql`）：
+
+```bash
+npx wrangler d1 export dnshe-manager-db --remote --output=d1-dump.sql
+docker compose up -d                                    # 先让容器建好数据卷
+docker compose stop                                     # 导入期间停服，避免写冲突
+docker run --rm -i -v dnshe-data:/data alpine sh -c \
+  "rm -f /data/dnshe.db*"                               # 清掉空库（保留 aes.key）
+docker run --rm -i -v dnshe-data:/data -v "$PWD":/in alpine \
+  sh -c "apk add -q sqlite && sqlite3 /data/dnshe.db < /in/d1-dump.sql"
+docker compose start
+```
+
+搬完后 API Secret 与 2FA 密钥仍是密文，必须把 Cloudflare 上那份 `AES_KEY` 填进自建版的 `.env`（`docker compose up -d` 生效），否则这些字段解不开。管理员密码是 PBKDF2 哈希，不受密钥影响，照旧可登录。
 
 ---
 

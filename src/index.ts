@@ -1957,11 +1957,26 @@ app.get("/api/whois/pool", async (c) => {
  * 走 Worker，结果落 D1 缓存」的既有模型一致。
  */
 
-/** 公共 DoH 解析器（JSON API），按顺序尝试；两家返回同一 JSON 形状 */
+/**
+ * 公共 DoH 解析器（JSON API），按顺序尝试；三家返回同一 JSON 形状
+ *
+ * NOTE: 前两家在 Cloudflare 上必通，但自建（Docker）版跑在用户自己的网络里，
+ * 大陆环境下 cloudflare-dns.com 与 dns.google 基本不可用，因此补一个国内可达的
+ * 兜底解析器。顺序不变 —— Worker 上第一家就命中，第三家永远不会被访问到。
+ */
 const DOH_ENDPOINTS = [
   "https://cloudflare-dns.com/dns-query",
-  "https://dns.google/resolve"
+  "https://dns.google/resolve",
+  "https://dns.alidns.com/resolve"
 ];
+
+/**
+ * 单次 DoH 查询超时
+ *
+ * NOTE: 被墙的解析器多数表现为「连上不回包」而不是立刻拒绝，没有超时的话
+ * 请求会一直挂着、根本走不到下一家。结论会缓存 30 天，这点等待只付一次。
+ */
+const DOH_TIMEOUT_MS = 5000;
 
 /** NS 结论缓存 30 天 —— NS 极少变动，但仍给一个到期时间以便厂商换 DNS 后能自愈 */
 const NS_CACHE_TTL = 30 * 24 * 3600;
@@ -1986,7 +2001,8 @@ async function resolveNsViaDoh(name: string): Promise<string[] | null> {
   for (const endpoint of DOH_ENDPOINTS) {
     try {
       const res = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=NS`, {
-        headers: { accept: "application/dns-json" }
+        headers: { accept: "application/dns-json" },
+        signal: AbortSignal.timeout(DOH_TIMEOUT_MS)
       });
       if (!res.ok) continue;
 
@@ -2005,8 +2021,11 @@ async function resolveNsViaDoh(name: string): Promise<string[] | null> {
       }
       // 该解析器答成功但没给 NS（NXDOMAIN 等），换下一家没有意义
       if (data.Status === 0 || data.Status === 3) return null;
-    } catch (e) {
-      console.error(`DoH NS 查询失败 [${endpoint}] [${name}]:`, e);
+    } catch (e: unknown) {
+      // NOTE: 自建版在大陆网络下前两家必然失败（重置或超时），是预期路径而非故障。
+      // 这里只记一行原因，不打整个堆栈，否则 docker compose logs 会被刷得没法看。
+      const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      console.error(`DoH NS 查询失败 [${endpoint}] [${name}]: ${reason}`);
     }
   }
   return null;

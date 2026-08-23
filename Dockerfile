@@ -7,8 +7,6 @@
 # SQLite 用的是 Node 内置的 node:sqlite，没有任何需要编译的原生模块。
 #
 #   docker compose up -d --build
-#
-# syntax=docker/dockerfile:1
 
 # ---------- 阶段 1：构建前端 ----------
 FROM node:24-bookworm-slim AS frontend

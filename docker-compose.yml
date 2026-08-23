@@ -1,62 +1,27 @@
-# DNSHE-Manager 自建部署
-#
-#   cp .env.example .env     # 按需填写，全部留空也能跑
-#   docker compose up -d
-#   浏览器打开 http://<服务器IP>:8787 ，首次进入自行设置管理员用户名与密码
-#
-# 用的是 GitHub Actions 构建好的多架构镜像（amd64 / arm64 由 Docker 自动匹配），
-# 不需要本地构建、也不需要克隆整个仓库 —— 有这个文件和 .env 就够了。
-#
-#   docker compose pull && docker compose up -d      # 更新到最新版
-#
-# 前后端同源（同一个端口），因此不需要配 CORS、也不用烘焙后端域名。
-
 services:
   dnshe-manager:
-    # 镜像地址与版本都可以在 .env 里覆盖：
-    #   IMAGE_TAG   留空即 latest（跟随 main 的最新构建）；想钉住某个发布版本就填 1.2.3
-    #   IMAGE_REPO  留空即官方的 GHCR 地址。ghcr.io 在部分网络（尤其大陆）拉不动，
-    #               可以换成镜像站，例如 IMAGE_REPO=ghcr.nju.edu.cn/lioil522/dnshe-manager
-    #               fork 之后想用自己那份 CI 的产物，也是改这里
-    image: ${IMAGE_REPO:-ghcr.io/lioil522/dnshe-manager}:${IMAGE_TAG:-latest}
-    #
-    # 改了代码想自己构建：取消下面这行注释，然后 docker compose up -d --build
-    # （构建产物会占用上面那个镜像名，之后 docker compose pull 会把它换回官方构建）
-    # build: .
-    container_name: dnshe-manager
-    restart: unless-stopped
-
+    image: ghcr.io/lioil522/dnshe-manager:latest # 镜像地址，大陆可换 ghcr.nju.edu.cn/lioil522/dnshe-manager
+    container_name: dnshe-manager # 容器名称
+    restart: unless-stopped # 异常退出自动重启
     ports:
-      # 想只在本机监听、前面再挂 Nginx/Caddy 的话改成 "127.0.0.1:8787:8787"
-      - "8787:8787"
-
+      - "8787:8787" # 面板端口，反代可改为 "127.0.0.1:8787:8787"
     volumes:
-      # 数据库与自动生成的加密密钥都在这里，务必连同 aes.key 一起备份
-      - dnshe-data:/data
-      #
-      # 换成宿主目录挂载（如 ./data:/data）时，容器内以 node 用户（uid 1000）运行，
-      # 需要先把宿主目录的属主改成 1000：sudo chown -R 1000:1000 ./data
-
+      - dnshe-data:/data # 数据库与加密密钥，务必备份
     environment:
-      # 只影响容器内日志的时间显示；面板里的北京时间由代码自行按 UTC+8 计算，与此无关
-      TZ: ${TZ:-Asia/Shanghai}
+      TZ: ${TZ:-Asia/Shanghai} # 容器日志时区
 
       # 以下全部可选，留空即为不启用（详见 .env.example）
-      AES_KEY: ${AES_KEY:-}
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
-      WEBHOOK_URL: ${WEBHOOK_URL:-}
-      WEBHOOK_TYPE: ${WEBHOOK_TYPE:-}
-      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
-      DEFAULT_API_KEY: ${DEFAULT_API_KEY:-}
-      DEFAULT_API_SECRET: ${DEFAULT_API_SECRET:-}
-      DEFAULT_API_ALIAS: ${DEFAULT_API_ALIAS:-}
-
-      # 定时任务（域名同步 + 到期自动续期）的触发时刻，UTC。
-      # 默认 02:00 UTC = 北京时间 10:00，与 wrangler.toml 的 crons 一致。
-      CRON_UTC_HOUR: ${CRON_UTC_HOUR:-2}
-      CRON_UTC_MINUTE: ${CRON_UTC_MINUTE:-0}
-      # 设为 1 可完全关闭定时任务（只手动同步）
-      DISABLE_CRON: ${DISABLE_CRON:-}
+      AES_KEY: ${AES_KEY:-} # AES-GCM 加密密钥，留空自动生成并保存到 /data/aes.key
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-} # 应急后门令牌，忘记密码时兜底登录
+      WEBHOOK_URL: ${WEBHOOK_URL:-} # 通知推送地址
+      WEBHOOK_TYPE: ${WEBHOOK_TYPE:-} # 通知类型：dingtalk / feishu / wecom / serverchan / custom
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-} # CORS 来源，自建同源无需配置
+      DEFAULT_API_KEY: ${DEFAULT_API_KEY:-} # 首次启动自动绑定的 DNSHE API Key
+      DEFAULT_API_SECRET: ${DEFAULT_API_SECRET:-} # 首次启动自动绑定的 DNSHE API Secret
+      DEFAULT_API_ALIAS: ${DEFAULT_API_ALIAS:-} # 默认账号别名
+      CRON_UTC_HOUR: ${CRON_UTC_HOUR:-2} # 定时任务执行时刻（UTC 时），默认 2 = 北京 10 点
+      CRON_UTC_MINUTE: ${CRON_UTC_MINUTE:-0} # 定时任务执行时刻（UTC 分）
+      DISABLE_CRON: ${DISABLE_CRON:-} # 设为 1 关闭每日自动同步与续期
 
 volumes:
-  dnshe-data:
+  dnshe-data: # 持久化数据卷

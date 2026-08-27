@@ -169,6 +169,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          ALLOWED_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
         run: |
           if [ -n "$ADMIN_TOKEN" ]; then
             echo "🔑 正在同步更新 ADMIN_TOKEN 口令到 Cloudflare Worker..."
@@ -178,8 +179,16 @@ jobs:
             echo "🔔 正在同步更新 WEBHOOK_URL 推送地址到 Cloudflare Worker..."
             echo "$WEBHOOK_URL" | npx wrangler secret put WEBHOOK_URL || true
           fi
+          # 前端托管在 Cloudflare Pages 之外（如 EdgeOne Pages）时必须配置：
+          # 否则跨域请求会被 CORS 拦掉，表现为登录页一句 Failed to fetch。
+          # 支持逗号分隔多个来源，pages.dev 与新前端域名可以并存。
+          if [ -n "$ALLOWED_ORIGIN" ]; then
+            echo "🌐 正在同步更新 ALLOWED_ORIGIN 跨域白名单到 Cloudflare Worker..."
+            echo "$ALLOWED_ORIGIN" | npx wrangler secret put ALLOWED_ORIGIN || true
+          fi
 
       - name: Build Frontend
+        if: vars.SKIP_CLOUDFLARE_PAGES != '1'
         env:
           VITE_API_BASE_URL: ${{ env.VITE_API_BASE_URL }}
         run: |
@@ -187,6 +196,7 @@ jobs:
           npm run build
 
       - name: Deploy Pages Frontend
+        if: vars.SKIP_CLOUDFLARE_PAGES != '1'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -195,3 +205,26 @@ jobs:
           npx wrangler pages project create dnshe-manager-frontend --production-branch=main || true
           echo "🚀 部署前端编译文件到 Cloudflare Pages..."
           npx wrangler pages deploy frontend/dist --project-name=dnshe-manager-frontend --branch=main
+
+      # 前端托管在别处（EdgeOne Pages 等）时，那边的构建需要知道后端地址。
+      # 这一步把上面自动检测出的 Worker 地址写进工作流摘要，省去翻日志。
+      - name: Summarize Backend Address for External Frontend
+        env:
+          VITE_API_BASE_URL: ${{ env.VITE_API_BASE_URL }}
+          SKIP_CLOUDFLARE_PAGES: ${{ vars.SKIP_CLOUDFLARE_PAGES }}
+        run: |
+          {
+            echo "### 后端地址"
+            echo
+            if [ -n "$VITE_API_BASE_URL" ]; then
+              echo "\`${VITE_API_BASE_URL}\`"
+              echo
+              echo "把它填进外部前端平台的构建环境变量 \`VITE_API_BASE_URL\`。"
+            else
+              echo "⚠️ 未能检测到 Worker 地址（既无自定义域名，也未取到 workers.dev 子域）。"
+            fi
+            if [ "$SKIP_CLOUDFLARE_PAGES" = "1" ]; then
+              echo
+              echo "Cloudflare Pages 部署已由仓库变量 \`SKIP_CLOUDFLARE_PAGES=1\` 关闭。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

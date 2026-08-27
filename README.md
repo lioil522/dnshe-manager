@@ -97,6 +97,7 @@ graph TD
 | `AES_KEY` | 可选 | 加密密钥，留空则首次部署自动生成 |
 | `ADMIN_TOKEN` | 可选 | 应急后门令牌 |
 | `WEBHOOK_URL` | 可选 | 通知推送地址 |
+| `ALLOWED_ORIGIN` | 可选 | CORS 白名单，逗号分隔。前端托管在 Cloudflare Pages 之外时必填 |
 
 #### 4. 触发部署
 
@@ -117,6 +118,84 @@ graph TD
 6. ✅ 构建前端并部署到 Cloudflare Pages（`dnshe-manager-frontend`）
 
 > **💡 首次部署后**，浏览器打开 Pages 分配的域名（如 `dnshe-manager-frontend.pages.dev`），在登录页自行设置管理员用户名与密码。
+
+---
+
+### 方式一 · 变体：前端换到 EdgeOne Pages（大陆加速）
+
+Cloudflare 免费套餐不使用中国大陆网络，大陆访客由 BGP 路由决定落到哪个 PoP。运气差时会被送到欧洲或美西节点（实测有电信线路落 `AMS` 阿姆斯特丹，单程 RTT 250ms+），首屏因此很慢，**且免费套餐没有任何开关能改变这个路由**。
+
+先确认自己是否踩中：浏览器打开 `https://<你的前端域名>/cdn-cgi/trace`，看 `colo=` 那一行。
+
+| `colo` | 含义 |
+|--------|------|
+| `HKG` / `NRT` / `KIX` / `SIN` | 亚洲节点，正常，不必折腾 |
+| `LAX` / `SJC` | 美西，偏慢但可用 |
+| `AMS` / `FRA` 等欧洲节点 | 路由异常，首屏会明显卡 |
+
+这个变体把**前端静态资源**换到 EdgeOne Pages（腾讯），后端 Worker 与 D1 原地不动。首屏那几百 KB 的 JS/CSS 走更近的节点，API 请求单次只有几 KB、仍走 Cloudflare。
+
+#### 1. 先完成方式一
+
+Worker 与 D1 必须已经存在——这个变体只替换前端。
+
+#### 2. 拿到后端地址
+
+部署工作流跑完后，在 `Actions` → 对应那次运行的**摘要页**顶部有「后端地址」一节，直接复制。
+
+#### 3. 在 EdgeOne Pages 导入仓库
+
+构建配置由仓库根目录的 `edgeone.json` 提供，控制台里**不需要手动改**构建命令或输出目录：
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| `installCommand` | `npm --prefix frontend ci` | 前端在子目录，用 `--prefix` 而非 `cd` |
+| `buildCommand` | `npm --prefix frontend run build` | |
+| `outputDirectory` | `frontend/dist` | |
+| `rewrites` | `/*` → `/index.html` | SPA 路由回退。EdgeOne 把这条精确规则当兜底处理，只在其他路由都不匹配时才返回 `index.html`，不会影响静态资源 |
+| `headers` | `/assets/*` 长缓存 + `index.html` 每次校验 | 与 `frontend/public/_headers`（Cloudflare Pages 用）等价 |
+
+> 若控制台自动识别 Vite 后填了别的构建配置，`edgeone.json` 的值优先。
+
+#### 4. 配置前端环境变量
+
+在 EdgeOne Pages 项目的环境变量里加：
+
+```
+VITE_API_BASE_URL = https://<第 2 步拿到的后端地址>
+```
+
+这个值在构建期烘焙进产物，改了要重新部署才生效。
+
+#### 5. 放通 CORS
+
+前端换域名后就不再与 Worker 同源，必须把新域名加进白名单。在 GitHub Secrets 添加：
+
+```
+ALLOWED_ORIGIN = https://<EdgeOne 分配的前端域名>
+```
+
+想让旧的 Pages 域名继续可用就一起写上，逗号分隔：
+
+```
+ALLOWED_ORIGIN = https://xxx.pages.dev,https://xxx.edgeone.app
+```
+
+然后重跑一次 `Deploy to Cloudflare` 工作流同步到 Worker。漏了这步的表现是登录页一句 `Failed to fetch`。
+
+#### 6.（可选）停掉 Cloudflare Pages 部署
+
+确认 EdgeOne 那边正常后，加一个**仓库变量**（`Settings` → `Secrets and variables` → `Actions` → `Variables`）：
+
+```
+SKIP_CLOUDFLARE_PAGES = 1
+```
+
+之后工作流只部署 Worker，跳过前端构建与 Pages 发布。留空或删掉即恢复。
+
+> **⚠️ 备案：** EdgeOne 分配的默认域名免备案，走海外/港澳节点，对大陆已远好于欧洲 PoP。想把自有域名挂到**中国大陆节点**则需要 ICP 备案——这是国内 CDN 的硬性要求，与本项目无关。
+>
+> **这个变体只解决静态资源的距离问题**，API 请求仍然走 Cloudflare。如果连交互延迟也无法接受，就得把后端也搬走（后端不依赖 Workers 专属 API，`server/` 下已有完整的 Node 运行时适配，见[方式二](#方式二docker-自建)或直接 `npm run build:node` 裸机部署）。
 
 ---
 
@@ -231,6 +310,7 @@ DNSHE-Manager/
 ├── Dockerfile                  # 三阶段构建（前端 → 后端 → 运行时）
 ├── docker-compose.yml          # Docker Compose 编排
 ├── wrangler.toml               # Cloudflare Workers 配置
+├── edgeone.json                # EdgeOne Pages 构建与路由配置（前端外部托管时使用）
 ├── .env.example                # 环境变量示例
 └── package.json                # 后端依赖与脚本
 ```
@@ -304,6 +384,12 @@ npm run start:node
 | 前端发布 | Cloudflare Pages | 同端口同源发出 |
 | CORS | 需要配置 `ALLOWED_ORIGIN` | 同源，无需配置 |
 | 运维 | Cloudflare 托管 | 自行运维 |
+
+### 大陆访问 Cloudflare 版很慢怎么办？
+
+先定位是不是被路由到了远端节点：打开 `https://<你的前端域名>/cdn-cgi/trace`，看 `colo=`。落在 `AMS`/`FRA` 这类欧洲节点就是路由异常，免费套餐无法调整。解决办法见[前端换到 EdgeOne Pages](#方式一--变体前端换到-edgeone-pages大陆加速)。
+
+注意 `cf-ray` / `colo` 反映的是**发起请求那台机器**落到哪个 PoP。开着代理测、或从海外服务器上 `curl`，得到的结果与大陆访客无关。
 
 ### 如何从 Cloudflare 迁移到自建？
 

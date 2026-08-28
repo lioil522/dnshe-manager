@@ -170,6 +170,16 @@ type Variables = {
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
+// ==========================================
+// CF 优选 IP 专用验证接口
+// ==========================================
+app.get("/__cf_test", (c) => {
+  return c.text("CF_WORKER_TEST_OK", 200, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+  });
+});
+
 /**
  * CORS 中间件 — 默认仅允许同源访问，生产环境通过 ALLOWED_ORIGIN 环境变量配置
  *

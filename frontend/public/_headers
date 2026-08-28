@@ -1,6 +1,7 @@
-# Cloudflare Pages 响应头配置（Vite 会把 public/ 原样拷进 dist/）
+# 静态资源响应头配置（Vite 会把 public/ 原样拷进 dist/）
 #
-# Pages 默认给所有文件下发 Cache-Control: public, max-age=0, must-revalidate，
+# Cloudflare 的静态资源托管原生认这个文件（Workers assets 与 Pages 用的是同一套语义）。
+# 默认给所有文件下发 Cache-Control: public, max-age=0, must-revalidate，
 # 于是每次刷新页面，浏览器都要为每个资源发一次条件请求等 304 —— 即使文件名里
 # 已经带了内容哈希、内容根本不可能变。首屏三个资源就是三个白等的往返。
 #

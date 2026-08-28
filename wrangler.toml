@@ -1,6 +1,23 @@
+# NOTE: 名字沿用 dnshe-manager-backend（虽然现在前后端都在这一个 Worker 里）。
+#       改名等于新建一个 Worker，老部署的 secrets 与 D1 绑定都会留在旧脚本上，
+#       AES_KEY 一旦重新生成，库里已加密的 API Secret 就再也解不开了。
 name = "dnshe-manager-backend"
 main = "src/index.ts"
 compatibility_date = "2024-04-01"
+
+# 静态资源托管：前端产物与后端同源，同一个 Worker 发出，不再需要 Cloudflare Pages。
+#
+# Cloudflare 先按路径匹配静态资源，命中就直接发出（不进 Worker，也不计 Worker 请求数），
+# 没命中才执行脚本：
+#   run_worker_first     只有 /api/* 交给 Hono（src/index.ts 里所有路由都在这个前缀下）
+#   not_found_handling   其余未命中路径回 index.html，SPA 兜底
+#
+# ⚠️ directory 必须在 wrangler deploy / wrangler dev 之前就存在，否则报目录不存在。
+#    本地首次开发前先构建一次前端：npm --prefix frontend run build
+[assets]
+directory = "./frontend/dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
 
 # 绑定 D1 数据库
 [[d1_databases]]
@@ -27,10 +44,10 @@ crons = ["0 2 * * *"]
 #                 直接登录/访问 API 作为兜底找回手段；不配置则完全禁用该通道，仅认用户名密码 + 2FA。
 #
 # 以下为可选配置项：
-# ALLOWED_ORIGIN = "https://your-pages-domain.pages.dev"  # 限制 CORS 允许的前端域名；
-#                                                         # 支持逗号分隔多个来源，前端若同时挂 pages.dev
-#                                                         # 与自定义域名，两个都要写，例如：
-#                                                         # "https://xxx.pages.dev,https://dnshe.example.com"
+# ALLOWED_ORIGIN = "https://another-frontend.example.com"  # CORS 白名单，支持逗号分隔多个来源。
+#                                                         # 前后端现在同源（前端由本 Worker 直接发出），
+#                                                         # 正常部署不需要配；只有把前端另行托管到别的
+#                                                         # 域名时才需要在这里列出那个来源。
 # WEBHOOK_URL    = "https://your-webhook-notification-url" # Webhook 推送地址
 # WEBHOOK_TYPE   = "dingtalk"                              # Webhook 类型: dingtalk / feishu / wecom / custom
 #

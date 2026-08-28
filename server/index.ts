@@ -11,7 +11,6 @@
  * 前端由同一个端口以静态文件形式发出（同源），因此不需要配置 CORS。
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { serve } from "@hono/node-server";
@@ -82,7 +81,13 @@ function resolveAesKey(): { key: string; source: "env" | "file" | "generated" } 
     if (stored) return { key: stored, source: "file" };
   }
 
-  const generated = randomBytes(32).toString("hex");
+  // 与 src/db.ts 的十六进制生成保持同一套写法：Workers 与 Node 都有全局
+  // crypto.getRandomValues。顺带避开 @cloudflare/workers-types v5 与 @types/node 的
+  // Buffer 全局声明冲突 —— 撞车后 randomBytes(32).toString("hex") 会被判成
+  // Uint8Array 的 0 参数 toString()，类型检查过不去。
+  const generated = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
   writeFileSync(keyFile, `${generated}\n`, { mode: 0o600 });
   return { key: generated, source: "generated" };
 }

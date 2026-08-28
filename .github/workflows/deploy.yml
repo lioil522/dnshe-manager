@@ -16,10 +16,11 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # wrangler 4 的 engines 要求 Node >= 22
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install Dependencies
@@ -64,6 +65,8 @@ jobs:
             echo "⚠️ 未能自动获取/创建 D1 数据库 ID，请检查 API Token 权限是否包含 [D1:编辑]"
           fi
 
+      # 前端已与后端同源（由同一个 Worker 的静态资源发出），构建期不需要知道后端地址。
+      # 这一步只剩两件事：绑了自定义域名就关掉 workers.dev / 预览 URL，以及把最终访问地址写进摘要。
       - name: Auto Detect Custom Domain & Configure Worker Routes
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -112,11 +115,10 @@ jobs:
             sed -i '/^preview_urls = /d' wrangler.toml
             # 在 compatibility_date 行之后插入
             sed -i '/^compatibility_date = /a workers_dev = false\npreview_urls = false' wrangler.toml
-            echo "VITE_API_BASE_URL=https://${CUSTOM_DOMAIN}" >> $GITHUB_ENV
-            echo "✅ 前端将使用自定义域名: https://${CUSTOM_DOMAIN}"
+            echo "APP_URL=https://${CUSTOM_DOMAIN}" >> $GITHUB_ENV
           else
             echo "⚠️ 未检测到自定义域名，保持 workers.dev 和预览 URL 默认开启"
-            # 查询默认 workers.dev 子域名
+            # 查询默认 workers.dev 子域名，仅用于在摘要里给出访问地址
             SUBDOMAIN_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" || echo "{}")
@@ -124,20 +126,29 @@ jobs:
             WORKERS_SUBDOMAIN=$(echo "$SUBDOMAIN_JSON" | jq -r '.result.subdomain // empty' 2>/dev/null || echo "")
 
             if [ -n "$WORKERS_SUBDOMAIN" ]; then
-              API_BASE_URL="https://dnshe-manager-backend.${WORKERS_SUBDOMAIN}.workers.dev"
-              echo "VITE_API_BASE_URL=${API_BASE_URL}" >> $GITHUB_ENV
-              echo "✅ 前端将使用 workers.dev 域名: ${API_BASE_URL}"
-            else
-              echo "⚠️ 未能获取 workers.dev 子域名，前端将使用自适应降级"
+              echo "APP_URL=https://dnshe-manager-backend.${WORKERS_SUBDOMAIN}.workers.dev" >> $GITHUB_ENV
             fi
           fi
 
-      - name: Deploy Worker Backend
-        uses: cloudflare/wrangler-action@v3
+      # 必须在 wrangler deploy 之前：wrangler.toml 的 assets.directory 指向 frontend/dist，
+      # 目录不存在部署会直接失败。
+      #
+      # VITE_API_BASE_URL 设成 "/"：前端与 Worker 同源，App.tsx 里会把末尾斜杠削掉，
+      # 请求最终是 /api/xxx 这样的相对路径，既不用配 CORS，也不用把域名烘焙进产物。
+      - name: Build Frontend
+        env:
+          VITE_API_BASE_URL: /
+        run: |
+          cd frontend
+          npm run build
+
+      # 一次 deploy 同时上传 Worker 脚本与 frontend/dist 里的静态资源
+      - name: Deploy Worker (API + Frontend Assets)
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: '3.91.0'
+          wranglerVersion: '4.127.0'
 
       - name: Auto-Configure & Sync AES_KEY Secret
         env:
@@ -179,52 +190,26 @@ jobs:
             echo "🔔 正在同步更新 WEBHOOK_URL 推送地址到 Cloudflare Worker..."
             echo "$WEBHOOK_URL" | npx wrangler secret put WEBHOOK_URL || true
           fi
-          # 前端托管在 Cloudflare Pages 之外（如 EdgeOne Pages）时必须配置：
-          # 否则跨域请求会被 CORS 拦掉，表现为登录页一句 Failed to fetch。
-          # 支持逗号分隔多个来源，pages.dev 与新前端域名可以并存。
+          # 前后端同源后，正常部署不需要这一项；只有把前端另行托管到别的域名时才要配，
+          # 漏配的表现是登录页一句 Failed to fetch。
           if [ -n "$ALLOWED_ORIGIN" ]; then
             echo "🌐 正在同步更新 ALLOWED_ORIGIN 跨域白名单到 Cloudflare Worker..."
             echo "$ALLOWED_ORIGIN" | npx wrangler secret put ALLOWED_ORIGIN || true
           fi
 
-      - name: Build Frontend
-        if: vars.SKIP_CLOUDFLARE_PAGES != '1'
+      - name: Summarize Access URL
         env:
-          VITE_API_BASE_URL: ${{ env.VITE_API_BASE_URL }}
-        run: |
-          cd frontend
-          npm run build
-
-      - name: Deploy Pages Frontend
-        if: vars.SKIP_CLOUDFLARE_PAGES != '1'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          echo "⚡ 检查/创建 Pages 项目 [dnshe-manager-frontend]..."
-          npx wrangler pages project create dnshe-manager-frontend --production-branch=main || true
-          echo "🚀 部署前端编译文件到 Cloudflare Pages..."
-          npx wrangler pages deploy frontend/dist --project-name=dnshe-manager-frontend --branch=main
-
-      # 前端托管在别处（EdgeOne Pages 等）时，那边的构建需要知道后端地址。
-      # 这一步把上面自动检测出的 Worker 地址写进工作流摘要，省去翻日志。
-      - name: Summarize Backend Address for External Frontend
-        env:
-          VITE_API_BASE_URL: ${{ env.VITE_API_BASE_URL }}
-          SKIP_CLOUDFLARE_PAGES: ${{ vars.SKIP_CLOUDFLARE_PAGES }}
+          APP_URL: ${{ env.APP_URL }}
         run: |
           {
-            echo "### 后端地址"
+            echo "### 访问地址"
             echo
-            if [ -n "$VITE_API_BASE_URL" ]; then
-              echo "\`${VITE_API_BASE_URL}\`"
+            if [ -n "$APP_URL" ]; then
+              echo "\`${APP_URL}\`"
               echo
-              echo "把它填进外部前端平台的构建环境变量 \`VITE_API_BASE_URL\`。"
+              echo "前端与 API 都在这个地址上（同一个 Worker）。首次进入请在登录页自行设置管理员用户名与密码。"
             else
-              echo "⚠️ 未能检测到 Worker 地址（既无自定义域名，也未取到 workers.dev 子域）。"
-            fi
-            if [ "$SKIP_CLOUDFLARE_PAGES" = "1" ]; then
-              echo
-              echo "Cloudflare Pages 部署已由仓库变量 \`SKIP_CLOUDFLARE_PAGES=1\` 关闭。"
+              echo "⚠️ 未能检测到访问地址（既无自定义域名，也未取到 workers.dev 子域）。"
+              echo "部署本身可能已成功，请到 Cloudflare Dashboard → Workers & Pages 查看。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -50,7 +50,7 @@ graph TD
     B1 --> C2
 
     subgraph Cloudflare Workers
-        C1["D1 Database / Cron Trigger / Pages"]
+        C1["D1 Database / Cron Trigger / 静态资源同源发出"]
     end
 
     subgraph Docker 自建
@@ -66,6 +66,8 @@ graph TD
 
 适合不想自建服务器、追求零运维的用户。Fork 仓库后配置 Secrets，推送到 `main` 即自动部署。
 
+前端与后端在**同一个 Worker** 里：静态资源由 Cloudflare 直接发出（不进 Worker，也不计 Worker 请求数），只有 `/api/*` 才执行脚本。因此没有 Pages 项目、没有第二个域名，也不需要配 CORS。
+
 #### 1. Fork 仓库
 
 在 GitHub 上 Fork 本仓库到自己的账号下。
@@ -79,9 +81,8 @@ graph TD
 
 | 权限 | 说明 |
 |------|------|
-| `Workers Scripts:编辑` | 部署 Worker 后端 |
+| `Workers Scripts:编辑` | 部署 Worker（后端脚本 + 前端静态资源） |
 | `D1:编辑` | 自动创建 / 绑定 D1 数据库 |
-| `Pages:编辑` | 部署前端到 Cloudflare Pages |
 | `Workers Routes:编辑` | 自动检测自定义域名 |
 | `Zone:读取` | 查询域名路由 |
 
@@ -97,7 +98,7 @@ graph TD
 | `AES_KEY` | 可选 | 加密密钥，留空则首次部署自动生成 |
 | `ADMIN_TOKEN` | 可选 | 应急后门令牌 |
 | `WEBHOOK_URL` | 可选 | 通知推送地址 |
-| `ALLOWED_ORIGIN` | 可选 | CORS 白名单，逗号分隔。前端托管在 Cloudflare Pages 之外时必填 |
+| `ALLOWED_ORIGIN` | 可选 | CORS 白名单，逗号分隔。前后端同源，正常部署**不需要**；只有把前端另行托管到别的域名时才填 |
 
 #### 4. 触发部署
 
@@ -111,91 +112,19 @@ graph TD
 部署工作流会自动处理以下所有步骤，无需手动干预：
 
 1. ✅ 查询或创建 D1 数据库（`dnshe-manager-db`）
-2. ✅ 自动检测 Worker 是否绑定了自定义域名，并配置前端 API 地址
-3. ✅ 部署 Worker 后端
-4. ✅ 生成或同步 AES_KEY 加密密钥
-5. ✅ 同步可选 Secrets（`ADMIN_TOKEN` / `WEBHOOK_URL`）到 Worker
-6. ✅ 构建前端并部署到 Cloudflare Pages（`dnshe-manager-frontend`）
+2. ✅ 自动检测 Worker 是否绑定自定义域名（绑了就关掉 workers.dev 与预览 URL）
+3. ✅ 构建前端产物到 `frontend/dist`
+4. ✅ 部署 Worker —— 后端脚本与前端静态资源在同一次 `wrangler deploy` 里上传
+5. ✅ 生成或同步 AES_KEY 加密密钥
+6. ✅ 同步可选 Secrets（`ADMIN_TOKEN` / `WEBHOOK_URL`）到 Worker
 
-> **💡 首次部署后**，浏览器打开 Pages 分配的域名（如 `dnshe-manager-frontend.pages.dev`），在登录页自行设置管理员用户名与密码。
-
----
-
-### 方式一 · 变体：前端换到 EdgeOne Pages（大陆加速）
-
-Cloudflare 免费套餐不使用中国大陆网络，大陆访客由 BGP 路由决定落到哪个 PoP。运气差时会被送到欧洲或美西节点（实测有电信线路落 `AMS` 阿姆斯特丹，单程 RTT 250ms+），首屏因此很慢，**且免费套餐没有任何开关能改变这个路由**。
-
-先确认自己是否踩中：浏览器打开 `https://<你的前端域名>/cdn-cgi/trace`，看 `colo=` 那一行。
-
-| `colo` | 含义 |
-|--------|------|
-| `HKG` / `NRT` / `KIX` / `SIN` | 亚洲节点，正常，不必折腾 |
-| `LAX` / `SJC` | 美西，偏慢但可用 |
-| `AMS` / `FRA` 等欧洲节点 | 路由异常，首屏会明显卡 |
-
-这个变体把**前端静态资源**换到 EdgeOne Pages（腾讯），后端 Worker 与 D1 原地不动。首屏那几百 KB 的 JS/CSS 走更近的节点，API 请求单次只有几 KB、仍走 Cloudflare。
-
-#### 1. 先完成方式一
-
-Worker 与 D1 必须已经存在——这个变体只替换前端。
-
-#### 2. 拿到后端地址
-
-部署工作流跑完后，在 `Actions` → 对应那次运行的**摘要页**顶部有「后端地址」一节，直接复制。
-
-#### 3. 在 EdgeOne Pages 导入仓库
-
-构建配置由仓库根目录的 `edgeone.json` 提供，控制台里**不需要手动改**构建命令或输出目录：
-
-| 字段 | 值 | 说明 |
-|------|-----|------|
-| `installCommand` | `npm --prefix frontend ci` | 前端在子目录，用 `--prefix` 而非 `cd` |
-| `buildCommand` | `npm --prefix frontend run build` | |
-| `outputDirectory` | `frontend/dist` | |
-| `rewrites` | `/*` → `/index.html` | SPA 路由回退。EdgeOne 把这条精确规则当兜底处理，只在其他路由都不匹配时才返回 `index.html`，不会影响静态资源 |
-| `headers` | `/assets/*` 长缓存 + `index.html` 每次校验 | 与 `frontend/public/_headers`（Cloudflare Pages 用）等价 |
-
-> 若控制台自动识别 Vite 后填了别的构建配置，`edgeone.json` 的值优先。
-
-#### 4. 配置前端环境变量
-
-在 EdgeOne Pages 项目的环境变量里加：
-
-```
-VITE_API_BASE_URL = https://<第 2 步拿到的后端地址>
-```
-
-这个值在构建期烘焙进产物，改了要重新部署才生效。
-
-#### 5. 放通 CORS
-
-前端换域名后就不再与 Worker 同源，必须把新域名加进白名单。在 GitHub Secrets 添加：
-
-```
-ALLOWED_ORIGIN = https://<EdgeOne 分配的前端域名>
-```
-
-想让旧的 Pages 域名继续可用就一起写上，逗号分隔：
-
-```
-ALLOWED_ORIGIN = https://xxx.pages.dev,https://xxx.edgeone.app
-```
-
-然后重跑一次 `Deploy to Cloudflare` 工作流同步到 Worker。漏了这步的表现是登录页一句 `Failed to fetch`。
-
-#### 6.（可选）停掉 Cloudflare Pages 部署
-
-确认 EdgeOne 那边正常后，加一个**仓库变量**（`Settings` → `Secrets and variables` → `Actions` → `Variables`）：
-
-```
-SKIP_CLOUDFLARE_PAGES = 1
-```
-
-之后工作流只部署 Worker，跳过前端构建与 Pages 发布。留空或删掉即恢复。
-
-> **⚠️ 备案：** EdgeOne 分配的默认域名免备案，走海外/港澳节点，对大陆已远好于欧洲 PoP。想把自有域名挂到**中国大陆节点**则需要 ICP 备案——这是国内 CDN 的硬性要求，与本项目无关。
+> **💡 首次部署后**，访问地址写在 `Actions` → 那次运行的**摘要页**顶部（形如 `https://dnshe-manager-backend.<你的子域>.workers.dev`）。浏览器打开它，在登录页自行设置管理员用户名与密码。
 >
-> **这个变体只解决静态资源的距离问题**，API 请求仍然走 Cloudflare。如果连交互延迟也无法接受，就得把后端也搬走（后端不依赖 Workers 专属 API，`server/` 下已有完整的 Node 运行时适配，见[方式二](#方式二docker-自建)或直接 `npm run build:node` 裸机部署）。
+> **🔄 从旧版本升级：** 旧版把前端单独发到 Cloudflare Pages（`dnshe-manager-frontend`），现在不再需要。Worker 名字没变，D1 与 `AES_KEY` 原地保留，**数据不受影响**，升级后直接访问 Worker 地址即可。可以顺手清掉这些残留：
+>
+> - Pages 项目不会再更新 —— 在 Dashboard 删除，或 `npx wrangler pages project delete dnshe-manager-frontend`
+> - `ALLOWED_ORIGIN` Secret —— 前后端已同源，用不到了（若你把前端另托管在别处并想继续这么用，就留着）
+> - 仓库变量 `SKIP_CLOUDFLARE_PAGES` —— 工作流已不再读取它，删掉即可
 
 ---
 
@@ -298,19 +227,18 @@ DNSHE-Manager/
 │   │   ├── geodata.ts          #   地理数据（线路选择）
 │   │   ├── rulegen.ts          #   规则生成器
 │   │   └── ...
-│   ├── .env.selfhost           #   自建模式环境变量（API 基准地址 = /）
+│   ├── .env.selfhost           #   同源部署的前端环境变量（API 基准地址 = /）
 │   ├── vite.config.ts          #   Vite 配置（开发代理到 8787）
 │   └── tailwind.config.js      #   Tailwind CSS 配置
 │
 ├── .github/workflows/
 │   ├── docker.yml              #   自建镜像构建与发布（amd64 + arm64）
-│   └── deploy.yml              #   Cloudflare Workers 部署
+│   └── deploy.yml              #   Cloudflare Workers 部署（后端 + 前端静态资源）
 │
 ├── schema.sql                  # 数据库表结构
 ├── Dockerfile                  # 三阶段构建（前端 → 后端 → 运行时）
 ├── docker-compose.yml          # Docker Compose 编排
-├── wrangler.toml               # Cloudflare Workers 配置
-├── edgeone.json                # EdgeOne Pages 构建与路由配置（前端外部托管时使用）
+├── wrangler.toml               # Cloudflare Workers 配置（含静态资源托管 [assets]）
 ├── .env.example                # 环境变量示例
 └── package.json                # 后端依赖与脚本
 ```
@@ -321,23 +249,26 @@ DNSHE-Manager/
 
 ### 前置要求
 
-- **Node.js** ≥ 22.5（自建版需要内置的 `node:sqlite`）
+- **Node.js** ≥ 22.5（自建版需要内置的 `node:sqlite`，Wrangler 4 也要求 ≥ 22）
 - **npm**
-- **Wrangler**（仅 Cloudflare Workers 开发需要）
+- **Wrangler** ≥ 4（仅 Cloudflare Workers 开发需要，已在 devDependencies 里）
 
 ### Cloudflare Workers 模式
 
 ```bash
 # 安装依赖
 npm install
+npm --prefix frontend install
 
-# 启动后端（默认端口 8787）
+# ⚠️ 先构建一次前端：wrangler.toml 的 assets.directory 指向 frontend/dist，
+#    该目录不存在时 wrangler dev / deploy 会直接报错退出
+npm --prefix frontend run build
+
+# 启动后端（默认端口 8787，同时把 frontend/dist 当静态资源发出）
 npm run dev
 
-# 启动前端（默认端口 3000，自动代理 /api 到 8787）
-cd frontend
-npm install
-npm run dev
+# 改前端时另起 Vite 开发服务器（默认端口 3000，自动代理 /api 到 8787）
+npm --prefix frontend run dev
 ```
 
 ### 自建模式
@@ -381,13 +312,21 @@ npm run start:node
 |---|---|---|
 | 数据库 | D1 (SQLite) | Node 内置 `node:sqlite` |
 | 定时任务 | Cron Trigger | 进程内定时器 |
-| 前端发布 | Cloudflare Pages | 同端口同源发出 |
-| CORS | 需要配置 `ALLOWED_ORIGIN` | 同源，无需配置 |
+| 前端发布 | 同一个 Worker 的静态资源 | 同端口同源发出 |
+| CORS | 同源，无需配置 | 同源，无需配置 |
 | 运维 | Cloudflare 托管 | 自行运维 |
 
 ### 大陆访问 Cloudflare 版很慢怎么办？
 
-先定位是不是被路由到了远端节点：打开 `https://<你的前端域名>/cdn-cgi/trace`，看 `colo=`。落在 `AMS`/`FRA` 这类欧洲节点就是路由异常，免费套餐无法调整。解决办法见[前端换到 EdgeOne Pages](#方式一--变体前端换到-edgeone-pages大陆加速)。
+先定位是不是被路由到了远端节点：打开 `https://<你的域名>/cdn-cgi/trace`，看 `colo=`。
+
+| `colo` | 含义 |
+|--------|------|
+| `HKG` / `NRT` / `KIX` / `SIN` | 亚洲节点，正常，不必折腾 |
+| `LAX` / `SJC` | 美西，偏慢但可用 |
+| `AMS` / `FRA` 等欧洲节点 | 路由异常，首屏会明显卡 |
+
+落在欧洲节点就是路由异常，而免费套餐不使用中国大陆网络，**没有任何开关能改变这个路由**。这种情况只能把部署搬走：见[方式二](#方式二docker-自建)，或直接 `npm run build:node` 裸机部署（后端不依赖 Workers 专属 API，`server/` 下已有完整的 Node 运行时适配）。
 
 注意 `cf-ray` / `colo` 反映的是**发起请求那台机器**落到哪个 PoP。开着代理测、或从海外服务器上 `curl`，得到的结果与大陆访客无关。
 

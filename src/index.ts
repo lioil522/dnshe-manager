@@ -173,7 +173,7 @@ const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 // ==========================================
 // CF 优选 IP 专用验证接口
 // ==========================================
-app.get("/__cf_test", (c) => {
+app.get("/api/__cf_test", (c) => {
   return c.text("CF_WORKER_TEST_OK", 200, {
     "Content-Type": "text/plain; charset=utf-8",
     "Cache-Control": "no-store, no-cache, must-revalidate",

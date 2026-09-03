@@ -121,6 +121,17 @@ export function timingSafeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
+/**
+ * 计算 SHA-256 十六进制摘要
+ *
+ * NOTE: 会话 token 落库前先哈希再存 —— 即使 D1 被读出，
+ *       攻击者也拿不到可用于重放在线会话的原始 token。
+ */
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** 鉴权配置（读取后的解密/明文形态） */
 export interface AuthConfig {
   username: string;
@@ -550,38 +561,63 @@ export class DatabaseManager {
 
   // ===== 会话 (Session) 管理 =====
   //
-  // 会话以 settings 表中 key = `sess_<token>` 的行表示，value 存放到期时间的
-  // Unix 秒级时间戳（字符串形式）。
+  // 会话以 settings 表中 key = `sess_<digest>` 的行表示（digest 是 token 的 SHA-256），
+  // value 存放到期时间的 Unix 秒级时间戳（字符串形式）。原始 token 服务端不落库，
+  // 因此拿到数据库文件也无法重放在线会话。
   //
-  // NOTE: 历史版本把 value 固定写成 "valid" 且从不删除，于是这张表随每次登录只进不出，
-  //       而鉴权中间件每个请求都要查它。现在会话带过期时间，并由 purgeExpiredSessions()
-  //       在每日 cron 中回收。为了不让这次升级把所有在线会话立刻踢下线，
-  //       validateSession() 仍然接受历史遗留的 "valid" 值；这些旧行会在
-  //       purgeExpiredSessions() 里按 updated_at 超过 TTL 后一并清掉，自然排空。
+  // NOTE: 历史版本把原始 token 直接当 key、value 固定写成 "valid" 且从不删除，于是
+  //       这张表随每次登录只进不出，而鉴权中间件每个请求都要查它。那些旧行在此
+  //       版本不再被 validateSession() 接受（键是原始 token，哈希后查不到），会在
+  //       purgeExpiredSessions() 里按 updated_at 超过 TTL 后一并清掉，自然排空；
+  //       升级部署后所有旧会话需要重新登录一次。
 
   /** 会话有效期：7 天 */
   static readonly SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
+  /** Session Token 前缀（鉴权中间件据此区分会话 token 与应急令牌） */
+  static readonly SESSION_PREFIX = "dnshe_sess_";
+
   /**
    * 签发一个新会话，返回 Session Token
+   *
+   * NOTE: 库里只保存 token 的 SHA-256 摘要（key = `sess_<digest>`），
+   * 原始 token 只在签发时返回给客户端一次，服务端无法反推。
    */
   async createSession(ttlSeconds = DatabaseManager.SESSION_TTL_SECONDS): Promise<string> {
-    const token = `dnshe_sess_${crypto.randomUUID()}`;
+    const token = `${DatabaseManager.SESSION_PREFIX}${crypto.randomUUID()}`;
+    const digest = await sha256Hex(token);
     const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
-    await this.setSetting(`sess_${token}`, String(expiresAt));
+    await this.setSetting(`sess_${digest}`, String(expiresAt));
     return token;
   }
 
   /**
    * 校验会话是否有效（存在且未过期）
+   *
+   * NOTE: 只认哈希后的键。历史版本以原始 token 直接做 settings key 且值写死
+   * "valid" 的行在此不再放行 —— 它们会在 cron 的 purgeExpiredSessions() 里被回收，
+   * 升级后所有旧会话需要重新登录一次。
    */
   async validateSession(token: string): Promise<boolean> {
-    const stored = await this.getSetting(`sess_${token}`);
+    if (!token.startsWith(DatabaseManager.SESSION_PREFIX)) return false;
+    const digest = await sha256Hex(token);
+    const stored = await this.getSetting(`sess_${digest}`);
     if (!stored) return false;
-    // 历史遗留格式：升级前签发的会话没有到期时间，先放行，交给 cron 按 updated_at 回收
-    if (stored === "valid") return true;
     const expiresAt = Number(stored);
     return Number.isFinite(expiresAt) && expiresAt > Math.floor(Date.now() / 1000);
+  }
+
+  /**
+   * 注销会话（登出时删除对应的哈希行，使已签发的 token 立即失效）
+   */
+  async revokeSession(token: string): Promise<void> {
+    if (!token || !token.startsWith(DatabaseManager.SESSION_PREFIX)) return;
+    try {
+      const digest = await sha256Hex(token);
+      await this.db.prepare("DELETE FROM settings WHERE key = ?").bind(`sess_${digest}`).run();
+    } catch (e) {
+      console.error("revokeSession error:", e);
+    }
   }
 
   /**
@@ -607,6 +643,56 @@ export class DatabaseManager {
     } catch (e) {
       console.error("purgeExpiredSessions error:", e);
       return 0;
+    }
+  }
+
+  // ===== 登录失败限流 =====
+  //
+  // NOTE: 用 cache 表存「失败计数」，带窗口过期时间，由 purgeExpiredCache() 统一回收。
+  // key 形如 login_fail:<scope>，scope 由调用方拼接（用户名 + 客户端 IP），
+  // 必须在调用前完成长度限制，防止攻击者用超长输入把 cache 表撑爆。
+
+  /** 读取指定 scope 当前的失败次数（已过期的计数返回 0） */
+  async countLoginFailures(scope: string): Promise<number> {
+    try {
+      const row = await this.db.prepare(
+        "SELECT value FROM cache WHERE key = ? AND expires_at > ?"
+      ).bind(`login_fail:${scope}`, Math.floor(Date.now() / 1000)).first<{ value: string }>();
+      if (!row) return 0;
+      const n = parseInt(String(row.value), 10);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (e) {
+      console.error("countLoginFailures error:", e);
+      return 0;
+    }
+  }
+
+  /**
+   * 记录一次登录失败（窗口内自增计数，窗口滑动到调用时刻 + windowSeconds）
+   *
+   * @returns 自增后的失败次数
+   */
+  async recordLoginFailure(scope: string, windowSeconds = 15 * 60): Promise<number> {
+    try {
+      const expiresAt = Math.floor(Date.now() / 1000) + windowSeconds;
+      await this.db.prepare(
+        `INSERT INTO cache (key, value, expires_at) VALUES (?, '1', ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+           expires_at = excluded.expires_at`
+      ).bind(`login_fail:${scope}`, expiresAt).run();
+    } catch (e) {
+      console.error("recordLoginFailure error:", e);
+    }
+    return this.countLoginFailures(scope);
+  }
+
+  /** 登录成功后清空该 scope 的失败计数 */
+  async clearLoginFailures(scope: string): Promise<void> {
+    try {
+      await this.db.prepare("DELETE FROM cache WHERE key = ?").bind(`login_fail:${scope}`).run();
+    } catch (e) {
+      console.error("clearLoginFailures error:", e);
     }
   }
 

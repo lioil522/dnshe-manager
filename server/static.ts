@@ -35,6 +35,30 @@ const MIME_TYPES: Record<string, string> = {
   ".xml": "application/xml; charset=utf-8",
 };
 
+/**
+ * 安全响应头（与 src/index.ts 的 SECURITY_HEADERS 保持一致，Cloudflare 侧见
+ * frontend/public/_headers —— 三处必须同步维护，改了 CSP 记得一起改）。
+ *
+ * NOTE: script-src 收紧为 'self'，因此前端必须把内联主题脚本外置到 theme-init.js，
+ * 不能再往 index.html 里写内联 <script>。
+ */
+const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy": [
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: https:",
+    "font-src 'self' data:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+  ].join("; "),
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+};
+
 function contentTypeFor(filePath: string): string {
   return MIME_TYPES[path.extname(filePath).toLowerCase()] || "application/octet-stream";
 }
@@ -43,7 +67,8 @@ function cacheControlFor(urlPath: string): string {
   if (urlPath.startsWith("/assets/")) {
     return "public, max-age=31536000, immutable";
   }
-  if (urlPath === "/" || urlPath.endsWith(".html")) {
+  // theme-init.js 不带内容哈希，必须每次校验，否则发新版后浏览器仍拿旧脚本决定主题
+  if (urlPath === "/theme-init.js" || urlPath === "/" || urlPath.endsWith(".html")) {
     return "public, max-age=0, must-revalidate";
   }
   return "public, max-age=3600";
@@ -91,6 +116,7 @@ export function createStaticHandler(rootDir: string) {
       ETag: etag,
       "Last-Modified": new Date(file.mtimeMs).toUTCString(),
       "X-Content-Type-Options": "nosniff",
+      ...SECURITY_HEADERS,
     };
 
     if (req.headers.get("if-none-match") === etag) {

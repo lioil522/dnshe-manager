@@ -168,6 +168,81 @@ type Variables = {
   db: DatabaseManager;
 };
 
+// ===== 登录失败限流常量 =====
+
+/** 同一「用户名@IP」或「IP」维度在窗口期内允许的连续失败次数，超限即锁定 */
+const LOGIN_MAX_FAILURES = 5;
+
+/** 限流窗口 / 锁定持续时长：15 分钟 */
+const LOGIN_LOCK_WINDOW_SECONDS = 15 * 60;
+
+const LOGIN_LOCKED_MESSAGE = "登录失败次数过多，账号已临时锁定，请 15 分钟后再试";
+
+// ===== 安全响应头 =====
+
+/**
+ * 统一的 Content-Security-Policy
+ *
+ * NOTE: 刻意不设 default-src —— 以免把 connect-src 收紧到 'self' 后，
+ * 设置页「后端地址覆盖」指向跨域 Worker 的功能失效。这里只收紧真正的注入面：
+ * 脚本只允许本站（内联脚本一律禁止，主题初始化因此移到外部 theme-init.js）、
+ * frame 一律禁嵌套（防点击劫持）、object/base 收紧。
+ */
+const CSP_VALUE = [
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https:",
+  "font-src 'self' data:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+].join("; ");
+
+const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy": CSP_VALUE,
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+};
+
+/** 给任意 Response 追加安全响应头（不修改原有 body / 状态） */
+function withSecurityHeaders(res: Response): Response {
+  const headers = new Headers(res.headers);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    headers.set(name, value);
+  }
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+/**
+ * 提取客户端 IP（供登录限流分维度计数）
+ *
+ * Cloudflare 上优先取 cf-connecting-ip（由 CF 注入、不可伪造）；
+ * 自建版 / 反代场景回退到 x-real-ip / x-forwarded-for 的首个值。
+ */
+function getClientIp(c: Context<{ Bindings: Bindings; Variables: Variables }>): string {
+  const ip = (
+    c.req.header("cf-connecting-ip") ||
+    c.req.header("x-real-ip") ||
+    (c.req.header("x-forwarded-for") || "").split(",")[0] ||
+    "unknown"
+  ).trim();
+  return ip.slice(0, 64) || "unknown";
+}
+
+/**
+ * 把用户可控字符串截断到固定上限
+ *
+ * NOTE: 登录接口的 username 来自请求体、无长度约束，写日志与拼限流 key 前
+ * 必须截断，否则攻击者可用超长用户名刷爆 logs 表或撑大 cache 表。
+ */
+function capText(s: unknown, max = 64): string {
+  const v = String(s ?? "");
+  return v.length > max ? v.slice(0, max) : v;
+}
+
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 /**
@@ -460,9 +535,30 @@ app.post("/api/auth/login", async (c) => {
     const password = String(body.password || "");
     const totpToken = String(body.token || "").trim();
 
+    // 登录失败限流：按「用户名@IP」与「纯 IP」两个维度计数，任一超限即整体锁定，
+    // 防止对密码与 6 位 TOTP 的在线爆破（IP 维度顺带拦住轮换用户名/应急令牌的情况）。
+    const clientIp = getClientIp(c);
+    const userScope = `u:${capText(username)}@${clientIp}`;
+    const ipScope = `ip:${clientIp}`;
+    const isLocked = async (): Promise<boolean> =>
+      (await dbManager.countLoginFailures(userScope)) >= LOGIN_MAX_FAILURES ||
+      (await dbManager.countLoginFailures(ipScope)) >= LOGIN_MAX_FAILURES;
+    const noteFailure = async (): Promise<void> => {
+      await dbManager.recordLoginFailure(userScope, LOGIN_LOCK_WINDOW_SECONDS);
+      await dbManager.recordLoginFailure(ipScope, LOGIN_LOCK_WINDOW_SECONDS);
+    };
+    const noteSuccess = async (): Promise<void> => {
+      await dbManager.clearLoginFailures(userScope);
+      await dbManager.clearLoginFailures(ipScope);
+    };
+
     // 尚未初始化：引导前端走首次设置流程
     if (!cfg.initialized) {
       return c.json(errorRes("系统尚未初始化，请先设置管理员账户与密码", "not_initialized"), 409);
+    }
+
+    if (await isLocked()) {
+      return c.json(errorRes(LOGIN_LOCKED_MESSAGE, "too_many_attempts"), 429);
     }
 
     // 应急令牌通道：单独用 ADMIN_TOKEN（静态或其 TOTP）直接登录，用于忘记密码时找回
@@ -477,6 +573,8 @@ app.post("/api/auth/login", async (c) => {
           message: "已通过应急令牌登录，建议尽快在设置中重置密码",
         }));
       }
+      // 应急令牌校验失败同样计入限流，避免对静态令牌 / 其 TOTP 的在线爆破
+      await noteFailure();
     }
 
     if (!username || !password) {
@@ -487,7 +585,8 @@ app.post("/api/auth/login", async (c) => {
     const userMatch = timingSafeEqual(username, cfg.username);
     const passMatch = await dbManager.verifyPassword(password);
     if (!userMatch || !passMatch) {
-      await dbManager.writeLog("warning", "auth", `管理员登录失败：用户名或密码错误 (输入用户名: ${username})`);
+      await dbManager.writeLog("warning", "auth", `管理员登录失败：用户名或密码错误 (输入用户名: ${capText(username)})`);
+      await noteFailure();
       return c.json(errorRes("用户名或密码错误", "invalid_credentials"), 401);
     }
 
@@ -500,13 +599,15 @@ app.post("/api/auth/login", async (c) => {
       const totpValid = await verifyTOTP(totpToken, cfg.twoFaSecret);
       if (!totpValid) {
         await dbManager.writeLog("warning", "auth", "管理员登录失败：2FA 动态验证码错误或已过期");
+        await noteFailure();
         return c.json(errorRes("2FA 动态验证码错误或已过期", "invalid_2fa"), 401);
       }
     }
 
     // 3. 全部通过，签发 Session Token（有效期见 DatabaseManager.SESSION_TTL_SECONDS）
     const sessionToken = await dbManager.createSession();
-    await dbManager.writeLog("success", "auth", `管理员 [${username}] 登录成功${cfg.twoFaEnabled ? "（含 2FA 校验）" : ""}`);
+    await noteSuccess();
+    await dbManager.writeLog("success", "auth", `管理员 [${capText(username)}] 登录成功${cfg.twoFaEnabled ? "（含 2FA 校验）" : ""}`);
 
     return c.json(successRes({
       session_token: sessionToken,
@@ -515,6 +616,25 @@ app.post("/api/auth/login", async (c) => {
   } catch (e: any) {
     console.error("Login process error:", e);
     return c.json(errorRes(`登录鉴权失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+/**
+ * 0-d. 登出接口 — 服务端立即使当前 Bearer 会话失效（需已登录，走鉴权中间件）
+ */
+app.post("/api/auth/logout", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const authHeader = c.req.header("Authorization") || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : "";
+    if (token) {
+      await dbManager.revokeSession(token);
+      await dbManager.writeLog("info", "auth", "管理员注销了当前登录会话");
+    }
+    return c.json(successRes({ message: "已退出登录" }));
+  } catch (e: any) {
+    console.error("Logout error:", e);
+    return c.json(errorRes(`注销失败: ${e?.message || "服务端内部错误"}`), 500);
   }
 });
 
@@ -540,7 +660,7 @@ app.use("/api/*", async (c, next) => {
   const emergencyToken = c.env.ADMIN_TOKEN || "";
 
   // 1. 校验登录成功后签发的 Session Token（不存在或已过期均视为失效）
-  if (token.startsWith("dnshe_sess_")) {
+  if (token.startsWith(DatabaseManager.SESSION_PREFIX)) {
     try {
       if (await dbManager.validateSession(token)) {
         return next();
@@ -553,6 +673,17 @@ app.use("/api/*", async (c, next) => {
     if (timingSafeEqual(token, emergencyToken) || await verifyTOTP(token, emergencyToken)) {
       return next();
     }
+  }
+
+  // 3. 全部失效。若请求带的是「非会话形状」的凭据（扫描器乱填 / 针对 ADMIN_TOKEN
+  //    的静态值或 TOTP 爆破），按 IP 计数并限流，避免应急通道成为无限尝试的旁路。
+  //    正常登录拿到的会话 token 都带 dnshe_sess_ 前缀，不受此维度影响。
+  if (!token.startsWith(DatabaseManager.SESSION_PREFIX)) {
+    const ipScope = `ip:${getClientIp(c)}`;
+    if ((await dbManager.countLoginFailures(ipScope)) >= LOGIN_MAX_FAILURES) {
+      return c.json(errorRes(LOGIN_LOCKED_MESSAGE, "too_many_attempts"), 429);
+    }
+    await dbManager.recordLoginFailure(ipScope, LOGIN_LOCK_WINDOW_SECONDS);
   }
 
   return c.json(errorRes("认证失败：会话凭据已失效，请重新登录", "forbidden"), 403);
@@ -2154,10 +2285,17 @@ app.post("/api/domains/register", async (c) => {
 
 /**
  * 导出 Worker 入口
+ *
+ * NOTE: fetch 出口统一包一层 withSecurityHeaders —— API 响应由这里补安全头；
+ * 静态资源（HTML/JS/CSS）在 Cloudflare 侧由 assets 的 _headers 下发
+ * （见 frontend/public/_headers），在自建版侧由 server/static.ts 下发。
  */
 export default {
-  fetch: app.fetch,
-  
+  async fetch(request: Request, env: Bindings, ctx: ExecutionContext): Promise<Response> {
+    const res = await app.fetch(request, env, ctx);
+    return withSecurityHeaders(res);
+  },
+
   // 处理 scheduled 定时任务 (Cron Trigger)
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     const dbManager = new DatabaseManager(env.DB, env.AES_KEY);

@@ -918,7 +918,20 @@ export default function App() {
   };
 
   // 退出登录
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    // 先让服务端把当前 Bearer 会话作废（token 落库的是哈希，拿到旧 token 也无法重放）
+    try {
+      const token = sessionStorage.getItem("DNSHE_SESSION") || localStorage.getItem("DNSHE_SESSION");
+      if (token) {
+        await apiFetch("/api/auth/logout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    } catch (err) {
+      // 网络异常不影响本地登出，静默降级为仅清本地凭据
+      console.warn("Logout revoke failed:", err);
+    }
     sessionStorage.removeItem("DNSHE_SESSION");
     localStorage.removeItem("DNSHE_SESSION");
     setSessionToken(null);

@@ -16,3 +16,19 @@
 
 /index.html
   Cache-Control: public, max-age=0, must-revalidate
+
+# theme-init.js 不带内容哈希，每次校验，避免发新版后浏览器拿旧脚本决定主题。
+
+/theme-init.js
+  Cache-Control: public, max-age=0, must-revalidate
+
+# 全站安全响应头（与 src/index.ts 的 SECURITY_HEADERS、server/static.ts 同步维护）。
+# CSP 收紧 script-src 为 'self'，前端主题初始化脚本必须外置（见 /theme-init.js），
+# 不可再往 index.html 写内联 <script>。
+
+/*
+  Content-Security-Policy: script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  X-Content-Type-Options: nosniff
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()

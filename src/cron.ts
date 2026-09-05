@@ -1,5 +1,7 @@
 import { DatabaseManager } from "./db";
 import type { SubdomainInfo } from "./dnshe";
+import { DNSHEClient } from "./dnshe";
+import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
 import { computeDnsState } from "./dns-provider";
 
 /**
@@ -252,7 +254,23 @@ export async function runDailySyncAndRenewal(
   for (const acc of accounts) {
     try {
       // 1. 获取解密后的 API 客户端
-      const { client, alias } = await dbManager.getClientForAccount(acc.id);
+      const { client, alias, provider } = await dbManager.getClientForAccount(acc.id);
+
+      // 1.5 Cloudflare 账号：只同步 zone 列表。zone 的有效期由注册商管理，
+      //     不存在 DNSHE 式续期，直接跳过续期扫描。
+      if (provider === "cloudflare") {
+        if (!(client instanceof CloudflareClient)) {
+          throw new Error("Cloudflare 账号客户端异常");
+        }
+        const zones = await client.listZones();
+        await dbManager.syncAccountDomains(acc.id, zones.map(mapZoneToUpstream));
+        totalSynced += zones.length;
+        continue;
+      }
+
+      if (!(client instanceof DNSHEClient)) {
+        throw new Error("未知的账号提供商");
+      }
 
       // 2. 分页拉取该账户在 DNSHE 系统的全部域名
       const subdomains = await fetchAllSubdomainsFromClient(client);

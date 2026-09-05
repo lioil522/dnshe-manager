@@ -36,7 +36,9 @@ import {
   ChevronsDownUp,
   ChevronsUpDown,
   Eye,
-  EyeOff
+  EyeOff,
+  Cloud,
+  ExternalLink
 } from "lucide-react";
 import { toASCII, hasNonASCII, toUnicode } from "./punycode";
 import {
@@ -90,6 +92,10 @@ interface Domain {
   dns_provider?: string | null;
   provider_account_id?: string | number | null;
   disable_ns_management?: boolean;
+  /** 上游对象 ID：Cloudflare 行存 zone id；DNSHE 行为空 */
+  remote_id?: string | null;
+  /** 所属账号的提供商（后端 JOIN accounts 返回） */
+  account_provider?: string | null;
 }
 
 // 账号接口
@@ -97,6 +103,7 @@ interface Account {
   id: number;
   alias: string;
   api_key: string;
+  provider?: "dnshe" | "cloudflare";
   created_at: string;
 }
 
@@ -112,9 +119,9 @@ interface Quota {
   error?: string;
 }
 
-// DNS 解析记录接口
+// DNS 解析记录接口（DNSHE 与 Cloudflare 共用：CF 的 id 是字符串、TTL 1 表示自动）
 interface DnsRecord {
-  id: number;
+  id: number | string;
   record_id?: string;
   name: string;
   type: string;
@@ -273,8 +280,8 @@ const DnsLineSelect: React.FC<{
  */
 export default function App() {
   // 当前处于的选项卡（通过 URL hash 持久化，刷新/前进后退保持所在页面）
-  type TabKey = "dashboard" | "domains" | "accounts" | "register" | "quota" | "logs" | "settings";
-  const TAB_KEYS: TabKey[] = ["dashboard", "domains", "accounts", "register", "quota", "logs", "settings"];
+  type TabKey = "dashboard" | "domains" | "cloudflare" | "accounts" | "register" | "quota" | "logs" | "settings";
+  const TAB_KEYS: TabKey[] = ["dashboard", "domains", "cloudflare", "accounts", "register", "quota", "logs", "settings"];
   const tabFromHash = (): TabKey => {
     const h = window.location.hash.replace(/^#\/?/, "") as TabKey;
     return TAB_KEYS.includes(h) ? h : "dashboard";
@@ -523,7 +530,9 @@ export default function App() {
     content: false,
     ttl: true,
     line: false,
-    priority: false
+    priority: false,
+    // DNSHE 记录没有代理开关，该字段只为满足共享的 buildDnsEditTargets 签名，恒为 false
+    proxied: false
   });
   const [batchEditType, setBatchEditType] = useState("A");
   const [batchEditName, setBatchEditName] = useState("@");
@@ -533,6 +542,66 @@ export default function App() {
   // 记录值逐条给值（键为 record_id）：勾选「记录值」后每行都能单独改，留空即保持原值
   const [batchEditContents, setBatchEditContents] = useState<Record<string, string>>({});
   const [dnsEditResults, setDnsEditResults] = useState<Array<{ label: string; success: boolean; message: string }> | null>(null);
+
+  // ===== Cloudflare 标签页状态（与 DNSHE 的状态相互独立，复用同一套后端路由） =====
+  // zones 列表与账号筛选
+  const [cfZones, setCfZones] = useState<Domain[]>([]);
+  const [loadingCfZones, setLoadingCfZones] = useState(false);
+  const [cfAccountFilter, setCfAccountFilter] = useState<string>("all");
+  // zones 分组的收起状态（独立于 DNSHE 域名页的 collapsedAccounts）
+  const [cfCollapsedAccounts, setCfCollapsedAccounts] = useState<Set<number>>(new Set());
+  // 绑定 Cloudflare 账号弹窗（仅支持 API Token）
+  const [cfBindModal, setCfBindModal] = useState(false);
+  const [cfNewAlias, setCfNewAlias] = useState("");
+  const [cfNewToken, setCfNewToken] = useState("");
+  // 编辑 Cloudflare 账号（换 Token / 改别名）
+  const [cfEditingAccount, setCfEditingAccount] = useState<Account | null>(null);
+  const [cfEditAlias, setCfEditAlias] = useState("");
+  const [cfEditToken, setCfEditToken] = useState("");
+  // CF DNS 记录面板（模态框结构同 DNSHE 的 DNS 面板，但没有「解析线路」概念、多了「代理」开关）
+  const [cfDnsModalOpen, setCfDnsModalOpen] = useState(false);
+  const [cfSelectedZone, setCfSelectedZone] = useState<Domain | null>(null);
+  const [cfRecords, setCfRecords] = useState<DnsRecord[]>([]);
+  const [loadingCfRecords, setLoadingCfRecords] = useState(false);
+  // CF 新建记录表单（TTL 取值 1 表示 Cloudflare 的「自动」）
+  const [cfFormOpen, setCfFormOpen] = useState(false);
+  const [cfNewType, setCfNewType] = useState("A");
+  const [cfNewName, setCfNewName] = useState("");
+  const [cfNewContent, setCfNewContent] = useState("");
+  const [cfNewTtl, setCfNewTtl] = useState(1);
+  const [cfNewPriority, setCfNewPriority] = useState<number>(10);
+  const [cfNewProxied, setCfNewProxied] = useState(false);
+  // CF 行内修改
+  const [cfEditingKey, setCfEditingKey] = useState<string | null>(null);
+  const [cfEditType, setCfEditType] = useState("A");
+  const [cfEditName, setCfEditName] = useState("");
+  const [cfEditContent, setCfEditContent] = useState("");
+  const [cfEditTtl, setCfEditTtl] = useState(1);
+  const [cfEditPriority, setCfEditPriority] = useState<number>(10);
+  const [cfEditProxied, setCfEditProxied] = useState(false);
+  // CF 批量添加
+  const [cfBatchOpen, setCfBatchOpen] = useState(false);
+  const [cfBatchInput, setCfBatchInput] = useState("");
+  const [cfBatchType, setCfBatchType] = useState("A");
+  const [cfBatchName, setCfBatchName] = useState("@");
+  const [cfBatchTtl, setCfBatchTtl] = useState(1);
+  const [cfBatchPriority, setCfBatchPriority] = useState<number>(10);
+  const [cfBatchProxied, setCfBatchProxied] = useState(false);
+  const [cfBatchResults, setCfBatchResults] = useState<Array<{ label: string; success: boolean; message: string }> | null>(null);
+  // CF 批量添加输入框引用（自绘拖拽调整高度用）
+  const cfBatchTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // CF 批量修改面板（字段：记录值 / TTL / 代理）
+  const [cfSelectedKeys, setCfSelectedKeys] = useState<Set<string>>(new Set());
+  const [cfEditPanelOpen, setCfEditPanelOpen] = useState(false);
+  const [cfEditFields, setCfEditFields] = useState({
+    content: false,
+    ttl: true,
+    proxied: false
+  });
+  const [cfBatchEditTtl, setCfBatchEditTtl] = useState(1);
+  const [cfBatchEditProxied, setCfBatchEditProxied] = useState(false);
+  const [cfBatchEditContents, setCfBatchEditContents] = useState<Record<string, string>>({});
+  const [cfEditResults, setCfEditResults] = useState<Array<{ label: string; success: boolean; message: string }> | null>(null);
 
   // DNSHE 系统根域名 (支持动态添加)
   const DEFAULT_ROOT_DOMAINS = [
@@ -1249,6 +1318,18 @@ export default function App() {
         )}
       </div>
 
+      {/* 交叉提示：委派到 Cloudflare 且同名 zone 已在绑定的 CF 账号中同步过，
+          引导用户去 Cloudflare 标签页管理解析记录（纯展示层匹配，不改数据） */}
+      {!checkHasDns(dom) && cfZoneFullDomainSet.has(toASCII(dom.full_domain).toLowerCase()) && (
+        <button
+          onClick={() => setActiveTab("cloudflare")}
+          className="w-full mt-3 text-xs font-medium text-sky-600 dark:text-sky-400 bg-sky-50 dark:bg-sky-950/60 border border-sky-200 dark:border-sky-900/60 rounded-lg px-3 py-2 flex items-center justify-center gap-1.5 hover:bg-sky-100 dark:hover:bg-sky-950 transition-colors"
+        >
+          <Cloud className="w-3.5 h-3.5" />
+          已绑定 Cloudflare 账号，前往 Cloudflare 页管理解析
+        </button>
+      )}
+
       {/* 分隔线 */}
       <div className="border-t border-border-base my-3.5" />
 
@@ -1368,14 +1449,37 @@ export default function App() {
     }
   };
 
+  // 2.4 获取 Cloudflare 账号的 zone 列表（后端默认排除这些行，需显式传 provider）
+  const fetchCfZones = async (accountIdFilter?: string) => {
+    setLoadingCfZones(true);
+    try {
+      const targetAcc = accountIdFilter ?? cfAccountFilter;
+      const accParam = targetAcc && targetAcc !== "all" ? `&account_id=${targetAcc}` : "";
+      const res = await apiFetch(`/api/domains?provider=cloudflare${accParam}`);
+      const data = await res.json();
+      if (data.success) {
+        setCfZones(data.domains || []);
+      } else {
+        showToast("error", data.message || "拉取 Cloudflare zones 失败");
+      }
+    } catch (e) {
+      showToast("error", "网络连接异常，无法获取 Cloudflare zones");
+    } finally {
+      setLoadingCfZones(false);
+    }
+  };
+
   // 2.5 读取某账号域名缓存的「指纹」：域名条数 + 最新的 updated_at
   //
   // NOTE: 后端每个账号的域名是在一次 db.batch 里整批写入的，所以指纹一变
   //       就说明该账号这一轮后台同步已经落库。新绑定账号从「0 条」变为有域名，
   //       换 Key 重新同步则是 updated_at 被刷新，两种场景都能用同一个信号判断。
-  const readAccountDomainFingerprint = async (accountId: number): Promise<string | null> => {
+  const readAccountDomainFingerprint = async (accountId: number, provider?: string): Promise<string | null> => {
     try {
-      const res = await apiFetch(`/api/domains?account_id=${accountId}`);
+      // Cloudflare 账号的 zone 默认被 /api/domains 排除（它们在独立标签页展示），
+      // 指纹查询必须显式带上 provider，否则永远返回「0 条」，同步等待逻辑会失效
+      const providerParam = provider === "cloudflare" ? "&provider=cloudflare" : "";
+      const res = await apiFetch(`/api/domains?account_id=${accountId}${providerParam}`);
       const data = await res.json();
       if (!data.success) return null;
       const list: Array<Record<string, unknown>> = data.domains || [];
@@ -1397,7 +1501,8 @@ export default function App() {
   const waitForAccountDomainSync = async (
     accountIds: number[],
     label: string,
-    baseline?: Map<number, string>
+    baseline?: Map<number, string>,
+    providerLookup?: (id: number) => string | undefined
   ) => {
     const pending = new Set(accountIds.filter((id) => Number.isFinite(id) && id > 0));
     if (pending.size === 0) {
@@ -1418,7 +1523,7 @@ export default function App() {
 
       // 逐个账号单独查询，不受域名页当前账号筛选影响
       for (const id of [...pending]) {
-        const fingerprint = await readAccountDomainFingerprint(id);
+        const fingerprint = await readAccountDomainFingerprint(id, providerLookup?.(id));
         // 查询失败（null）不终止等待，下一轮继续
         if (fingerprint !== null && fingerprint !== (baseline?.get(id) ?? "0:")) {
           pending.delete(id);
@@ -1428,6 +1533,7 @@ export default function App() {
 
     // 无论是否等齐都刷新一次列表，让已完成的账号立即可见
     fetchDomains();
+    fetchCfZones();
     // 后端在同步域名之前已经刷过这些账号的配额缓存，这里顺带把配额也拉新
     invalidateQuotaTabCache();
     fetchQuotas();
@@ -1661,6 +1767,9 @@ export default function App() {
     tabDataFetchedAtRef.current = {};
     fetchAccounts();
     fetchDomains();
+    // CF zones 也随会话拉一次：Cloudflare 标签页要用，域名页的「已在 Cloudflare 管理」
+    // 交叉提示也依赖这份列表，不能等用户切到该页才加载
+    fetchCfZones();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionToken]);
 
@@ -1706,15 +1815,22 @@ export default function App() {
     return map;
   }, [domains]);
 
+  // DNSHE 账号列表（Cloudflare 账号在独立标签页展示，DNSHE 的账号选择/注册/查重等
+  // 场景都应排除它们）
+  const dnsheAccounts = useMemo(
+    () => accounts.filter((a) => a.provider !== "cloudflare"),
+    [accounts]
+  );
+
   // 账号序号：以 accounts 列表的顺序为准，而不是分组数组的下标。
   //
   // 分组数组会被搜索/账号筛选裁剪，用它的下标当序号会导致「只看某个账号时永远显示账号 1」。
   // 锚定到 accounts 后，序号在任何筛选下都保持不变，删除账号后又会自然重排。
   const accountSeqMap = useMemo(() => {
     const map = new Map<number, number>();
-    accounts.forEach((a, i) => map.set(a.id, i + 1));
+    dnsheAccounts.forEach((a, i) => map.set(a.id, i + 1));
     return map;
-  }, [accounts]);
+  }, [dnsheAccounts]);
 
   // 按账号分组处理域名列表
   const groupedDomains = useMemo(() => {
@@ -2300,7 +2416,7 @@ export default function App() {
 
     // 初始化批量修改面板
     setDnsEditPanelOpen(false);
-    setDnsEditFields({ type: false, name: false, content: false, ttl: true, line: false, priority: false });
+    setDnsEditFields({ type: false, name: false, content: false, ttl: true, line: false, priority: false, proxied: false });
     setDnsEditResults(null);
 
     await reloadDnsRecords(domain, forceRefresh);
@@ -2613,7 +2729,8 @@ export default function App() {
           content: "",
           ttl: batchEditTtl,
           line: batchEditLine,
-          priority: batchEditPriority
+          priority: batchEditPriority,
+          proxied: false
         },
         selectedDomain?.full_domain || "",
         batchEditContents
@@ -2765,6 +2882,660 @@ export default function App() {
     }
   };
 
+  // ===== Cloudflare：数据派生与处理函数 =====
+  //
+  // NOTE: 与 DNSHE 的 DNS 面板保持同样的交互形态（单条添加 / 行内修改 / 批量添加 /
+  //       批量修改 / 批量删除），复用同一批后端路由与 dnsrecords.ts 纯逻辑；
+  //       差异点只有两个 —— 没有解析线路，多了橙色云代理开关，TTL 1 表示「自动」。
+
+  // Cloudflare 账号列表（从账号列表中过滤，绑定/解绑后随 accounts 一起刷新）
+  const cfAccountList = useMemo(
+    () => accounts.filter((a) => a.provider === "cloudflare"),
+    [accounts]
+  );
+
+  // CF zones 按账号分组（保留 0 个 zone 的账号分组，提示用户去同步）
+  const groupedCfZones = useMemo(() => {
+    const groups: Array<{ accountId: number; alias: string; zones: Domain[] }> = [];
+    const byId = new Map<number, { accountId: number; alias: string; zones: Domain[] }>();
+    cfAccountList.forEach((acc) => {
+      const group = { accountId: acc.id, alias: acc.alias, zones: [] as Domain[] };
+      byId.set(acc.id, group);
+      groups.push(group);
+    });
+    cfZones.forEach((z) => {
+      const group = byId.get(z.account_id);
+      if (group) group.zones.push(z);
+    });
+    return groups;
+  }, [cfAccountList, cfZones]);
+
+  // 已同步 zone 的完整域名集合（punycode 归一化），供 DNSHE 域名页做「已在 Cloudflare 管理」交叉提示
+  const cfZoneFullDomainSet = useMemo(
+    () => new Set(cfZones.map((z) => toASCII(String(z.full_domain || "")).toLowerCase())),
+    [cfZones]
+  );
+
+  // DNSHE 注册域名集合（punycode 归一化），供 CF zone 卡片显示「DNSHE 注册」标识
+  const dnsheFullDomainSet = useMemo(
+    () => new Set(domains.map((d) => toASCII(String(d.full_domain || "")).toLowerCase())),
+    [domains]
+  );
+
+  const cfToggleAccountCollapse = (accountId: number) => {
+    const next = new Set(cfCollapsedAccounts);
+    if (next.has(accountId)) next.delete(accountId);
+    else next.add(accountId);
+    setCfCollapsedAccounts(next);
+  };
+
+  // 绑定 Cloudflare 账号（后端会先调 /user/tokens/verify 校验 Token）
+  const handleCfAddAccount = async () => {
+    if (!cfNewToken.trim()) {
+      showToast("error", "请填写 Cloudflare API Token");
+      return;
+    }
+    setActionLoading("cf-add-account");
+    try {
+      const res = await apiFetch("/api/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "cloudflare", alias: cfNewAlias.trim(), api_token: cfNewToken.trim() })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCfBindModal(false);
+        setCfNewAlias("");
+        setCfNewToken("");
+        await fetchAccounts();
+        // 后台同步 zones 落库后再刷新（fetchCfZones 在等待函数末尾统一调用）
+        if (data.account?.id) {
+          await waitForAccountDomainSync([data.account.id], "Cloudflare 账号绑定成功", undefined, () => "cloudflare");
+        } else {
+          await fetchCfZones();
+        }
+      } else {
+        showToast("error", data.message || "绑定 Cloudflare 账号失败");
+      }
+    } catch (e) {
+      showToast("error", "绑定 Cloudflare 账号请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 修改 Cloudflare 账号（改别名 / 换 Token）
+  const handleCfUpdateAccount = async () => {
+    if (!cfEditingAccount) return;
+    setActionLoading(`cf-update-account-${cfEditingAccount.id}`);
+    try {
+      const body: Record<string, string> = { alias: cfEditAlias.trim() };
+      if (cfEditToken.trim()) body.api_token = cfEditToken.trim();
+      const res = await apiFetch(`/api/accounts/${cfEditingAccount.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCfEditingAccount(null);
+        setCfEditAlias("");
+        setCfEditToken("");
+        await fetchAccounts();
+        if (cfEditToken.trim() && data.account?.id) {
+          // 换 Token 后重新同步该账号的 zones
+          await waitForAccountDomainSync([data.account.id], "Token 已更新", undefined, () => "cloudflare");
+        } else {
+          await fetchCfZones();
+        }
+      } else {
+        showToast("error", data.message || "更新账号失败");
+      }
+    } catch (e) {
+      showToast("error", "更新账号请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 解绑 Cloudflare 账号（后端级联清理该账号的 zones 缓存）
+  const handleCfDeleteAccount = async (acc: Account) => {
+    if (!confirm(`确定要解绑 Cloudflare 账号 [${acc.alias}] 吗？\n其名下的 zones 缓存会被一并清理（不影响 Cloudflare 上的实际数据）。`)) {
+      return;
+    }
+    setActionLoading(`cf-delete-account-${acc.id}`);
+    try {
+      const res = await apiFetch(`/api/accounts/${acc.id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", "账号已解绑");
+        await fetchAccounts();
+        await fetchCfZones();
+      } else {
+        showToast("error", data.message || "解绑失败");
+      }
+    } catch (e) {
+      showToast("error", "解绑请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 手动触发全量同步（复用后端 /api/domains/sync，它会同步包括 Cloudflare 在内的所有账号）
+  const handleCfSyncZones = async () => {
+    setActionLoading("cf-sync");
+    try {
+      const res = await apiFetch("/api/domains/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      if (!data.success) {
+        showToast("error", data.message || "同步任务启动失败");
+        return;
+      }
+
+      showToast("info", "同步任务已启动，zones 落库后自动刷新…");
+
+      // 以当前各账号的 zones 指纹为基线，落库后自动刷新（与 DNSHE 域名页的等待逻辑同构）
+      const accStats = new Map<number, { count: number; newest: string }>();
+      cfZones.forEach((z) => {
+        const cur = accStats.get(z.account_id) || { count: 0, newest: "" };
+        cur.count += 1;
+        const updated = String((z as unknown as { updated_at?: string }).updated_at || "");
+        if (updated > cur.newest) cur.newest = updated;
+        accStats.set(z.account_id, cur);
+      });
+      const baseline = new Map<number, string>();
+      accStats.forEach((v, k) => baseline.set(k, `${v.count}:${v.newest}`));
+      const accountIds = (cfAccountList.length > 0
+        ? cfAccountList.map((a) => a.id)
+        : Array.from(baseline.keys()));
+      const deadline = Date.now() + 10_000 + accountIds.length * 5_000;
+      const pending = new Set(accountIds);
+
+      while (pending.size > 0 && Date.now() < deadline) {
+        await sleep(1500);
+        for (const id of [...pending]) {
+          const fingerprint = await readAccountDomainFingerprint(id, "cloudflare");
+          if (fingerprint !== null && fingerprint !== (baseline.get(id) ?? "0:")) {
+            pending.delete(id);
+          }
+        }
+      }
+
+      await fetchCfZones();
+      showToast("success", pending.size === 0 ? "zones 同步完成" : "同步仍在后台进行，稍后可再次点击刷新");
+    } catch (e) {
+      showToast("error", "同步请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 打开 CF 解析记录面板并加载记录
+  const reloadCfRecords = async (zone: Domain, forceRefresh = false) => {
+    setLoadingCfRecords(true);
+    try {
+      const res = await apiFetch(`/api/domains/${zone.id}/dns${forceRefresh ? "?refresh=1" : ""}`);
+      const data = await res.json();
+      if (data.success) {
+        setCfRecords(data.records || []);
+      } else {
+        showToast("error", data.message || "获取解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "网络连接异常，无法获取解析记录");
+    } finally {
+      setLoadingCfRecords(false);
+    }
+  };
+
+  const handleCfOpenDnsModal = (zone: Domain) => {
+    setCfSelectedZone(zone);
+    setCfDnsModalOpen(true);
+    setCfRecords([]);
+    setCfSelectedKeys(new Set());
+    setCfEditingKey(null);
+    setCfFormOpen(false);
+    setCfBatchOpen(false);
+    setCfEditPanelOpen(false);
+    setCfBatchResults(null);
+    setCfEditResults(null);
+    setCfNewType("A");
+    setCfNewName("");
+    setCfNewContent("");
+    setCfNewTtl(1);
+    setCfNewPriority(10);
+    setCfNewProxied(false);
+    void reloadCfRecords(zone);
+  };
+
+  // 新建 CF 解析记录
+  const handleCfCreateRecord = async () => {
+    if (!cfSelectedZone) return;
+    if (!cfNewContent.trim()) {
+      showToast("error", "记录值不能为空");
+      return;
+    }
+    setActionLoading("cf-create-dns");
+    try {
+      const res = await apiFetch(`/api/domains/${cfSelectedZone.id}/dns`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: cfNewType,
+          name: cfNewName.trim() || "@",
+          content: cfNewContent.trim(),
+          // 开启代理时 Cloudflare 只接受自动 TTL
+          ttl: cfNewProxied ? 1 : cfNewTtl,
+          priority: needsDnsPriority(cfNewType) ? cfNewPriority : undefined,
+          proxied: cfNewProxied
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", "创建解析记录成功");
+        setCfNewName("");
+        setCfNewContent("");
+        setCfNewProxied(false);
+        void reloadCfRecords(cfSelectedZone, true);
+      } else {
+        showToast("error", data.message || "创建解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "创建解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 行内修改：进入编辑态
+  const handleCfStartEditRecord = (rec: DnsRecord) => {
+    setCfEditingKey(dnsRecordKey(rec));
+    setCfEditType(rec.type);
+    setCfEditName(toRelativeRecordName(rec.name, cfSelectedZone?.full_domain || ""));
+    setCfEditContent(rec.content);
+    setCfEditTtl(rec.ttl > 0 ? rec.ttl : 1);
+    setCfEditPriority(rec.priority !== null && rec.priority !== undefined ? rec.priority : 10);
+    setCfEditProxied(Boolean(rec.proxied));
+  };
+
+  // 行内修改：保存
+  const handleCfUpdateRecord = async () => {
+    if (!cfSelectedZone || !cfEditingKey) return;
+    const target = cfRecords.find((r) => dnsRecordKey(r) === cfEditingKey);
+    if (!target) return;
+    if (!cfEditContent.trim()) {
+      showToast("error", "记录值不能为空");
+      return;
+    }
+    setActionLoading(`cf-update-dns-${cfEditingKey}`);
+    try {
+      const res = await apiFetch(`/api/domains/${cfSelectedZone.id}/dns/${encodeURIComponent(cfEditingKey)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: cfEditType,
+          name: cfEditName.trim() || "@",
+          content: cfEditContent.trim(),
+          ttl: cfEditProxied ? 1 : cfEditTtl,
+          priority: needsDnsPriority(cfEditType) ? cfEditPriority : undefined,
+          proxied: cfEditProxied
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", "解析记录已更新");
+        setCfEditingKey(null);
+        void reloadCfRecords(cfSelectedZone, true);
+      } else {
+        showToast("error", data.message || "更新解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "更新解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 删除单条 CF 解析记录
+  const handleCfDeleteRecord = async (rec: DnsRecord) => {
+    if (!cfSelectedZone) return;
+    if (!confirm(`确定要删除记录 ${rec.type} ${rec.name} → ${rec.content} 吗？这会立即影响该域名的解析！`)) {
+      return;
+    }
+    const key = dnsRecordKey(rec);
+    setActionLoading(`cf-delete-dns-${key}`);
+    try {
+      const res = await apiFetch(`/api/domains/${cfSelectedZone.id}/dns/${encodeURIComponent(key)}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", "解析记录已删除");
+        void reloadCfRecords(cfSelectedZone, true);
+      } else {
+        showToast("error", data.message || "删除解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "删除解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // CF 批量添加输入框的实时解析（主机记录提前转相对名，预览与提交一致）
+  const cfParsedBatchLines = useMemo(
+    () =>
+      parseDnsBatchInput(cfBatchInput, {
+        type: cfBatchType,
+        name: cfBatchName,
+        ttl: cfBatchProxied ? 1 : cfBatchTtl,
+        priority: cfBatchPriority
+      }).map((r) =>
+        r ? { ...r, name: toRelativeRecordName(r.name, cfSelectedZone?.full_domain || "") } : null
+      ),
+    [cfBatchInput, cfBatchType, cfBatchName, cfBatchTtl, cfBatchPriority, cfBatchProxied, cfSelectedZone]
+  );
+
+  const cfValidBatchLines = useMemo(
+    () => cfParsedBatchLines.filter((r): r is ParsedDnsLine => r !== null),
+    [cfParsedBatchLines]
+  );
+
+  // CF 批量添加（面板上的「代理」开关只对 A/AAAA/CNAME 行生效）
+  const handleCfBatchCreate = async () => {
+    if (!cfSelectedZone) return;
+    if (cfValidBatchLines.length === 0) {
+      showToast("error", "未能解析出任何有效的解析记录，请检查输入格式");
+      return;
+    }
+    if (cfValidBatchLines.length > 50) {
+      showToast("error", "单次最多批量添加 50 条解析记录");
+      return;
+    }
+
+    const records = cfValidBatchLines.map((r) => ({
+      ...r,
+      ttl: cfBatchProxied ? 1 : r.ttl,
+      proxied: cfBatchProxied && ["A", "AAAA", "CNAME"].includes(r.type) ? true : undefined
+    }));
+
+    setActionLoading("cf-batch-create-dns");
+    setCfBatchResults(null);
+    try {
+      const res = await apiFetch(`/api/domains/${cfSelectedZone.id}/dns/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ records })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCfBatchResults(data.results || []);
+        if (data.fail_count === 0) {
+          showToast("success", `已添加 ${data.success_count} 条解析记录`);
+          setCfBatchInput("");
+        } else {
+          showToast("warning", `批量添加完成：成功 ${data.success_count} 条，失败 ${data.fail_count} 条（详见下方明细）`);
+        }
+        void reloadCfRecords(cfSelectedZone, true);
+      } else {
+        showToast("error", data.message || "批量添加解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "批量添加解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // CF 勾选的记录（批量修改 / 批量删除共用）
+  const cfSelectedRecords = useMemo(
+    () => cfRecords.filter((rec) => cfSelectedKeys.has(dnsRecordKey(rec))),
+    [cfRecords, cfSelectedKeys]
+  );
+
+  const cfToggleAllSelection = () => {
+    if (cfSelectedKeys.size === cfRecords.length) {
+      setCfSelectedKeys(new Set());
+    } else {
+      setCfSelectedKeys(new Set(cfRecords.map(dnsRecordKey)));
+    }
+  };
+
+  // CF 批量修改目标（复用 buildDnsEditTargets：内容 / TTL / 代理 三个字段可覆盖）
+  const cfBatchEditTargets = useMemo(
+    () =>
+      buildDnsEditTargets(
+        cfSelectedRecords,
+        {
+          type: false,
+          name: false,
+          content: cfEditFields.content,
+          ttl: cfEditFields.ttl,
+          line: false,
+          priority: false,
+          proxied: cfEditFields.proxied
+        },
+        {
+          type: "A",
+          name: "@",
+          content: "",
+          ttl: cfBatchEditTtl,
+          line: "",
+          priority: 10,
+          proxied: cfBatchEditProxied
+        },
+        cfSelectedZone?.full_domain || "",
+        cfBatchEditContents
+      ),
+    [cfSelectedRecords, cfSelectedZone, cfEditFields, cfBatchEditTtl, cfBatchEditProxied, cfBatchEditContents]
+  );
+
+  const cfBatchEditChanged = useMemo(
+    () => cfBatchEditTargets.filter((t) => !t.unchanged),
+    [cfBatchEditTargets]
+  );
+
+  const handleCfOpenEditPanel = () => {
+    setCfBatchEditContents(
+      Object.fromEntries(cfSelectedRecords.map((rec) => [dnsRecordKey(rec), rec.content || ""]))
+    );
+    setCfEditResults(null);
+    setCfEditPanelOpen(true);
+  };
+
+  // CF 批量修改已勾选的解析记录
+  const handleCfBatchUpdateRecords = async () => {
+    if (!cfSelectedZone || cfBatchEditTargets.length === 0) return;
+    if (!cfEditFields.content && !cfEditFields.ttl && !cfEditFields.proxied) {
+      showToast("error", "请至少勾选一个要修改的字段");
+      return;
+    }
+    if (cfBatchEditChanged.length === 0) {
+      showToast("info", "选中的记录与当前值一致，没有需要提交的修改");
+      return;
+    }
+    if (cfBatchEditChanged.length > 50) {
+      showToast("error", "单次最多批量修改 50 条解析记录");
+      return;
+    }
+
+    if (!confirm(`确定要修改选中的 ${cfBatchEditChanged.length} 条解析记录吗？`)) {
+      return;
+    }
+
+    const records = cfBatchEditChanged.map((t) => ({
+      record_id: t.record_id,
+      label: t.label,
+      type: t.type,
+      name: t.name,
+      content: t.content,
+      ttl: cfEditFields.proxied && cfBatchEditProxied ? 1 : t.ttl,
+      proxied: cfEditFields.proxied ? cfBatchEditProxied : undefined
+    }));
+
+    setActionLoading("cf-batch-update-dns");
+    try {
+      const res = await apiFetch(`/api/domains/${cfSelectedZone.id}/dns/batch-update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ records })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCfEditResults(data.results || []);
+        const failed = (data.results || []).filter((r: { success: boolean }) => !r.success);
+        if (failed.length === 0) {
+          showToast("success", `已修改 ${data.success_count} 条解析记录`);
+        } else {
+          showToast("warning", `批量修改完成：成功 ${data.success_count} 条，失败 ${data.fail_count} 条（详见下方明细）`);
+        }
+        void reloadCfRecords(cfSelectedZone, true);
+      } else {
+        showToast("error", data.message || "批量修改解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "批量修改解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // CF 批量删除已勾选的解析记录
+  const handleCfBatchDeleteRecords = async () => {
+    if (!cfSelectedZone || cfSelectedKeys.size === 0) return;
+
+    const targets = cfSelectedRecords.map((rec) => ({
+      record_id: dnsRecordKey(rec),
+      label: `${rec.type} ${rec.name} → ${rec.content}`
+    }));
+
+    if (
+      !confirm(
+        `确定要删除选中的 ${targets.length} 条解析记录吗？这会立即影响该域名的解析！\n\n${targets
+          .map((t) => t.label)
+          .join("\n")}`
+      )
+    ) {
+      return;
+    }
+
+    setActionLoading("cf-batch-delete-dns");
+    try {
+      const res = await apiFetch(`/api/domains/${cfSelectedZone.id}/dns/batch-delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ records: targets })
+      });
+      const data = await res.json();
+      if (data.success) {
+        const failed = (data.results || []).filter((r: { success: boolean }) => !r.success);
+        if (failed.length === 0) {
+          showToast("success", `已删除 ${data.success_count} 条解析记录`);
+        } else {
+          showToast(
+            "error",
+            `${failed.length} 条删除失败：${failed
+              .map((f: { label: string; message: string }) => `${f.label}(${f.message})`)
+              .join("；")}`
+          );
+        }
+        setCfSelectedKeys(new Set());
+        void reloadCfRecords(cfSelectedZone, true);
+      } else {
+        showToast("error", data.message || "批量删除解析记录失败");
+      }
+    } catch (e) {
+      showToast("error", "批量删除解析记录请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 渲染单个 Cloudflare zone 卡片
+  const renderCfZoneCard = (zone: Domain) => {
+    const unicodeDomain = toUnicode(zone.full_domain);
+    const isActive = String(zone.status || "").toLowerCase() === "active";
+    const isDnsheRegistered = dnsheFullDomainSet.has(toASCII(String(zone.full_domain || "")).toLowerCase());
+
+    const handleCopyZone = () => {
+      navigator.clipboard.writeText(zone.full_domain).then(() => {
+        showToast("success", `已复制：${zone.full_domain}`);
+      }).catch(() => {
+        showToast("error", "复制失败，请手动选择");
+      });
+    };
+
+    return (
+      <div
+        key={zone.id}
+        className="bg-surface border border-border-base rounded-2xl p-5 flex flex-col justify-between transition-all duration-200 shadow-xl"
+      >
+        {/* 顶部：域名名称与状态 */}
+        <div className="flex items-center justify-between gap-2">
+          <button
+            onClick={handleCopyZone}
+            className="font-mono text-sm sm:text-base font-bold text-content-primary tracking-wide truncate min-w-0 hover:text-indigo-400 transition-colors cursor-pointer text-left"
+            title={`点击复制：${zone.full_domain}`}
+          >
+            {unicodeDomain}
+          </button>
+          {isActive ? (
+            <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60 flex-shrink-0">
+              已激活
+            </span>
+          ) : (
+            <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60 flex-shrink-0">
+              待激活
+            </span>
+          )}
+        </div>
+
+        {/* 中间：元信息 */}
+        <div className="mt-4 space-y-2 text-xs">
+          <div className="flex justify-between items-center">
+            <span className="text-content-muted font-medium">创建时间</span>
+            <span className="font-mono text-content-secondary">{formatDate(zone.created_at, false)}</span>
+          </div>
+          <div className="flex justify-between items-center">
+            <span className="text-content-muted font-medium">到期时间</span>
+            <span className="font-mono text-content-secondary">永久</span>
+          </div>
+          {isDnsheRegistered && (
+            <div className="flex justify-between items-center">
+              <span className="text-content-muted font-medium">注册来源</span>
+              <span className="bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60 text-xs font-medium px-2.5 py-0.5 rounded-md">
+                DNSHE 注册
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="border-t border-border-base my-3.5" />
+
+        {/* 底部：DNS 管理按钮与 Cloudflare 控制台外链 */}
+        <div className="flex items-center justify-end gap-2">
+          <a
+            href={`https://dash.cloudflare.com/${zone.remote_id || ""}`}
+            target="_blank"
+            rel="noreferrer"
+            className="text-xs font-semibold px-3 py-2 rounded-lg flex items-center gap-1.5 bg-elevated hover:bg-hovered text-content-secondary transition-all"
+            title="在 Cloudflare 控制台打开该 zone"
+          >
+            控制台 <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+          <button
+            onClick={() => handleCfOpenDnsModal(zone)}
+            className="text-xs font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 bg-elevated hover:bg-hovered text-content-secondary cursor-pointer transition-all shadow-inner"
+          >
+            <Settings className="w-3.5 h-3.5 text-content-muted" /> DNS
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   // 批量添加输入框的实时解析结果，供按钮显示「已识别 N 条」并复用于提交
   // NOTE: 主机记录在这里就转成相对名，让预览显示的与真正写进去的完全一致
   const parsedDnsBatchLines = useMemo(
@@ -2885,15 +3656,15 @@ export default function App() {
     try {
       const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(fullTargetDomain)}`);
       const data = await res.json();
-      if (data.success && data.whois) {
-        setWhoisResult({
-          searchedDomain: fullTargetDomain,
-          ...data.whois
-        });
-        if (accounts.length > 0 && !registerAccountId) {
-          setRegisterAccountId(accounts[0].id);
-        }
-      } else {
+        if (data.success && data.whois) {
+          setWhoisResult({
+            searchedDomain: fullTargetDomain,
+            ...data.whois
+          });
+          if (dnsheAccounts.length > 0 && !registerAccountId) {
+            setRegisterAccountId(dnsheAccounts[0].id);
+          }
+        } else {
         showToast("error", data.message || "WHOIS 查询失败");
       }
     } catch (err) {
@@ -2986,7 +3757,7 @@ export default function App() {
     const parsed = parseRule(batchRules, excludeChars, batchLength, resolveBank);
     const total = countCombos(parsed);
     const rootCount = Math.max(selectedRoots.length, 1);
-    const workerCount = Math.max(accounts.length, 1);
+    const workerCount = Math.max(dnsheAccounts.length, 1);
     // 每个候选前缀要对每个根域名各查一次，单账号 1.2s 限频，N 个账号 N 条流水线
     const scanned = Math.min(total, MAX_PREFIXES) * rootCount;
     // 规则本身有效但被排除字符清空 —— 与「还没输入规则」是两回事，提示语要能区分
@@ -3002,7 +3773,7 @@ export default function App() {
       isBraceSyntax: batchRules.includes("{"),
       estSeconds: (scanned * 1.2) / workerCount
     };
-  }, [batchRules, excludeChars, batchLength, resolveBank, selectedRoots.length, accounts.length]);
+  }, [batchRules, excludeChars, batchLength, resolveBank, selectedRoots.length, dnsheAccounts.length]);
 
   // 把秒数格式化为「3.2 小时 / 12 分钟 / 45 秒」
   const formatDuration = (sec: number): string => {
@@ -3567,7 +4338,7 @@ export default function App() {
     // 为每个 API 账号开一条独立的流水线（worker），各自绑定固定账号并遵守自身 1.2s (1200ms) 限频。
     // N 条流水线同时工作 => 整体吞吐量约为单账号的 N 倍（真并发，而非串行轮询）。
     const RATE_LIMIT_MS = 1200; // 单个 API 账号的独立限频底线
-    const workerAccounts = accounts.length > 0 ? accounts : [null];
+    const workerAccounts = dnsheAccounts.length > 0 ? dnsheAccounts : [null];
     const workerCount = workerAccounts.length;
 
     updateScanStatus("running");
@@ -3715,7 +4486,8 @@ export default function App() {
   const navItems: Array<{ key: TabKey; label: string; icon: React.ReactNode; badge?: number }> = [
     { key: "dashboard", label: "概览", icon: <LayoutDashboard className="w-5 h-5" /> },
     { key: "domains", label: "域名列表", icon: <Globe className="w-5 h-5" />, badge: domains.length },
-    { key: "accounts", label: "账号管理", icon: <Key className="w-5 h-5" />, badge: accounts.length },
+    { key: "cloudflare", label: "Cloudflare", icon: <Cloud className="w-5 h-5" />, badge: cfZones.length },
+    { key: "accounts", label: "账号管理", icon: <Key className="w-5 h-5" />, badge: dnsheAccounts.length },
     { key: "register", label: "注册 / 查重", icon: <Plus className="w-5 h-5" /> },
     { key: "quota", label: "账户配额", icon: <Database className="w-5 h-5" /> },
     { key: "logs", label: "运行日志", icon: <ScrollText className="w-5 h-5" /> },
@@ -3806,7 +4578,7 @@ export default function App() {
       total: domains.length,
       active,
       expired,
-      accounts: accounts.length,
+      accounts: dnsheAccounts.length,
       recent,
     };
   }, [domains, accounts]);
@@ -4361,10 +5133,10 @@ export default function App() {
                               onChange={(e) => setRegisterAccountId(Number(e.target.value))}
                               className="w-full bg-elevated border border-border-base focus:border-indigo-500 rounded-xl px-4 py-3 text-sm text-content-primary focus:outline-none"
                             >
-                              {accounts.length === 0 ? (
+                              {dnsheAccounts.length === 0 ? (
                                 <option value="">暂无可用的绑定账号</option>
                               ) : (
-                                accounts.map((acc) => (
+                                dnsheAccounts.map((acc) => (
                                   <option key={acc.id} value={acc.id}>
                                     {acc.alias} (ID: {acc.id})
                                   </option>
@@ -4376,7 +5148,7 @@ export default function App() {
                           <div>
                             <button
                               onClick={handleRegisterSubdomain}
-                              disabled={actionLoading === "register-subdomain" || accounts.length === 0}
+                              disabled={actionLoading === "register-subdomain" || dnsheAccounts.length === 0}
                               className="w-full bg-emerald-600 hover:bg-emerald-500 border border-transparent text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                               <Plus className="w-4 h-4" />
@@ -4510,7 +5282,7 @@ export default function App() {
                           )}
                           {selectedRoots.length > 0 && rulePreview.total > 5000 && (
                             <span>
-                              按当前 {accounts.length || 1} 个账号 × {selectedRoots.length} 个后缀估算，
+                              按当前 {dnsheAccounts.length || 1} 个账号 × {selectedRoots.length} 个后缀估算，
                               约需 {formatDuration(rulePreview.estSeconds)}，建议改用顺序模式配合断点续查
                             </span>
                           )}
@@ -5022,8 +5794,8 @@ export default function App() {
                                   setSearchSubdomain(sub);
                                   setSearchRootdomain(root);
                                   setRegMode("single");
-                                  if (accounts.length > 0 && !registerAccountId) {
-                                    setRegisterAccountId(accounts[0].id);
+                                  if (dnsheAccounts.length > 0 && !registerAccountId) {
+                                    setRegisterAccountId(dnsheAccounts[0].id);
                                   }
                                   // 瞬发呈现绿色【尚未注册】卡片，提升即时响应体验
                                   setWhoisResult({
@@ -5107,7 +5879,7 @@ export default function App() {
                     className="form-input px-3 py-2 rounded-lg text-sm text-content-secondary flex-1 min-w-0 md:flex-none md:min-w-[180px]"
                   >
                     <option value="all">全部账号 (按账号独立分组)</option>
-                    {accounts.map((acc) => (
+                    {dnsheAccounts.map((acc) => (
                       <option key={acc.id} value={String(acc.id)}>
                         账号: {acc.alias}
                       </option>
@@ -5148,7 +5920,7 @@ export default function App() {
                   </div>
                 )}
                 <div className="text-xs text-content-muted font-mono whitespace-nowrap">
-                  已绑定账户: <span className="text-indigo-400 font-bold">{accounts.length}</span> |
+                  已绑定账户: <span className="text-indigo-400 font-bold">{dnsheAccounts.length}</span> |
                   托管域名: <span className="text-emerald-400 font-bold">{domains.length}</span> 个
                 </div>
                 {domains.length > 0 && (
@@ -5272,6 +6044,922 @@ export default function App() {
           </div>
         )}
 
+        {/* Tab 1.5: Cloudflare 独立标签页 */}
+        {activeTab === "cloudflare" && (
+          <div className="space-y-8">
+            {/* 顶部：账号筛选与操作按钮 */}
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 md:gap-4 bg-surface border border-border-base p-3 sm:p-4 rounded-xl">
+              <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-3 sm:gap-4 w-full md:w-auto">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-sm font-semibold text-content-secondary flex items-center gap-1.5 whitespace-nowrap flex-shrink-0">
+                    <UserCheck className="w-4 h-4 text-indigo-400" /> 选择账号:
+                  </span>
+                  <select
+                    value={cfAccountFilter}
+                    onChange={(e) => {
+                      setCfAccountFilter(e.target.value);
+                      fetchCfZones(e.target.value);
+                    }}
+                    className="form-input px-3 py-2 rounded-lg text-sm text-content-secondary flex-1 min-w-0 md:flex-none md:min-w-[180px]"
+                  >
+                    <option value="all">全部 Cloudflare 账号</option>
+                    {cfAccountList.map((acc) => (
+                      <option key={acc.id} value={String(acc.id)}>
+                        账号: {acc.alias}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="text-xs text-content-muted font-mono whitespace-nowrap">
+                  已绑定账号: <span className="text-indigo-400 font-bold">{cfAccountList.length}</span> |
+                  托管 zones: <span className="text-emerald-400 font-bold">{cfZones.length}</span> 个
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:justify-end">
+                <button
+                  onClick={() => setCfBindModal(true)}
+                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-500 shadow-lg shadow-indigo-900/40 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  <Plus className="w-3.5 h-3.5" /> 绑定 Cloudflare 账号
+                </button>
+                <button
+                  onClick={handleCfSyncZones}
+                  disabled={cfAccountList.length === 0 || actionLoading === "cf-sync"}
+                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {actionLoading === "cf-sync" ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  )}
+                  同步 zones
+                </button>
+              </div>
+            </div>
+
+            {/* 已绑定的 Cloudflare 账号卡片 */}
+            {cfAccountList.length > 0 && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {cfAccountList.map((acc) => (
+                  <div key={acc.id} className="bg-surface border border-border-base rounded-xl p-4 flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-sm font-bold text-content-primary truncate flex items-center gap-1.5">
+                        <Cloud className="w-3.5 h-3.5 text-sky-400 flex-shrink-0" />
+                        <span className="truncate">{acc.alias}</span>
+                      </div>
+                      <div className="text-xs text-content-muted font-mono mt-0.5">
+                        Token cf:••••{acc.api_key.slice(-4)}
+                      </div>
+                      <div className="text-[11px] text-content-muted mt-0.5">绑定于 {formatDate(acc.created_at, false)}</div>
+                    </div>
+                    <div className="flex items-center gap-1 flex-shrink-0">
+                      <button
+                        onClick={() => {
+                          setCfEditingAccount(acc);
+                          setCfEditAlias(acc.alias);
+                          setCfEditToken("");
+                        }}
+                        className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-content-primary transition-colors"
+                        title="编辑账号"
+                      >
+                        <Pencil className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() => handleCfDeleteAccount(acc)}
+                        disabled={actionLoading === `cf-delete-account-${acc.id}`}
+                        className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-red-500 transition-colors disabled:opacity-50"
+                        title="解绑账号"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* zones 列表（按账号分组） */}
+            {loadingCfZones && cfZones.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-20 text-content-muted">
+                <RefreshCw className="w-8 h-8 animate-spin text-indigo-500 mb-2" />
+                <span>正在加载 Cloudflare zones...</span>
+              </div>
+            ) : cfAccountList.length === 0 ? (
+              <div className="text-center py-20 border border-dashed border-border-base rounded-xl bg-surface">
+                <Cloud className="w-12 h-12 text-content-muted mx-auto mb-3" />
+                <h3 className="text-lg font-bold text-content-secondary">尚未绑定 Cloudflare 账号</h3>
+                <p className="text-content-muted text-sm mt-1 max-w-md mx-auto">
+                  点击右上角「绑定 Cloudflare 账号」，使用 API Token（需 Zone.Read 与 Zone DNS Edit 权限）绑定后即可在这里管理 zones 与解析记录。
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-6">
+                {groupedCfZones.map((group) => {
+                  const isCollapsed = cfCollapsedAccounts.has(group.accountId);
+                  return (
+                    <div
+                      key={group.accountId}
+                      className={`bg-hovered p-3 sm:p-4 md:p-6 rounded-2xl border border-border-base ${
+                        isCollapsed ? "" : "space-y-4 md:space-y-6"
+                      }`}
+                    >
+                      <button
+                        onClick={() => cfToggleAccountCollapse(group.accountId)}
+                        className={`w-full flex items-center justify-between hover:opacity-80 transition-opacity text-left ${
+                          isCollapsed ? "" : "border-b border-border-base pb-4"
+                        }`}
+                      >
+                        <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
+                          {isCollapsed ? (
+                            <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
+                          ) : (
+                            <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
+                          )}
+                          <Cloud className="w-4 h-4 text-sky-400 shrink-0" />
+                          <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
+                          <span className="text-[11px] md:text-xs bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
+                            {group.zones.length} 个 zone
+                          </span>
+                        </h3>
+                      </button>
+
+                      {!isCollapsed && (
+                        group.zones.length === 0 ? (
+                          <div className="text-center py-8 text-content-muted text-sm">
+                            该账号下暂无 zone 数据，点击右上角「同步 zones」从 Cloudflare 拉取。
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 md:gap-6">
+                            {group.zones.map(renderCfZoneCard)}
+                          </div>
+                        )
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Cloudflare 绑定账号弹窗 */}
+        {cfBindModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-md max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  <Cloud className="w-5 h-5 text-sky-400" /> 绑定 Cloudflare 账号
+                </h3>
+                <button
+                  onClick={() => setCfBindModal(false)}
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名（可选，留空自动解析）</label>
+                  <input
+                    type="text"
+                    name="cf-bind-alias"
+                    autoComplete="off"
+                    value={cfNewAlias}
+                    onChange={(e) => setCfNewAlias(e.target.value)}
+                    placeholder="留空将使用 Cloudflare 账号名称"
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Token</label>
+                  <PasswordInput
+                    name="cf-bind-token"
+                    autoComplete="new-password"
+                    value={cfNewToken}
+                    onChange={setCfNewToken}
+                    placeholder="粘贴 Cloudflare API Token"
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
+                  />
+                </div>
+                <p className="text-[11px] text-content-muted leading-relaxed">
+                  在 Cloudflare 控制台「My Profile → API Tokens」创建 Token，权限需包含
+                  <span className="font-mono text-content-secondary"> Zone:Read </span>与
+                  <span className="font-mono text-content-secondary"> Zone DNS:Edit</span>
+                  。Token 仅用于调用 Cloudflare 官方 API，绑定后会加密存储并校验有效性。
+                </p>
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={() => setCfBindModal(false)}
+                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={handleCfAddAccount}
+                    disabled={actionLoading === "cf-add-account"}
+                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                  >
+                    {actionLoading === "cf-add-account" ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <>
+                        <Cloud className="w-4 h-4" /> 绑定
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Cloudflare 编辑账号弹窗 */}
+        {cfEditingAccount && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-md max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  <Pencil className="w-5 h-5 text-indigo-400" /> 编辑 Cloudflare 账号
+                </h3>
+                <button
+                  onClick={() => setCfEditingAccount(null)}
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名</label>
+                  <input
+                    type="text"
+                    name="cf-edit-alias"
+                    autoComplete="off"
+                    value={cfEditAlias}
+                    onChange={(e) => setCfEditAlias(e.target.value)}
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Token（留空保持不变）</label>
+                  <PasswordInput
+                    name="cf-edit-token"
+                    autoComplete="new-password"
+                    value={cfEditToken}
+                    onChange={setCfEditToken}
+                    placeholder="如需更换凭据则填写新的 API Token"
+                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
+                  />
+                </div>
+                <p className="text-[11px] text-content-muted leading-relaxed">
+                  仅修改别名时无需填写 Token；更换 Token 会校验新 Token 有效性，并自动重新同步该账号的 zones。
+                </p>
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={() => setCfEditingAccount(null)}
+                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={handleCfUpdateAccount}
+                    disabled={actionLoading === `cf-update-account-${cfEditingAccount.id}`}
+                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                  >
+                    {actionLoading === `cf-update-account-${cfEditingAccount.id}` ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <>
+                        <Save className="w-4 h-4" /> 保存修改
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Cloudflare DNS 解析记录面板 */}
+        {cfDnsModalOpen && cfSelectedZone && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-5xl max-h-[90dvh] rounded-xl flex flex-col shadow-2xl">
+              {/* 头部：域名与操作 */}
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0 gap-2">
+                <div className="min-w-0">
+                  <h3 className="text-base sm:text-lg font-bold text-content-primary font-mono truncate flex items-center gap-2">
+                    <Cloud className="w-4 h-4 text-sky-400 flex-shrink-0" />
+                    {toUnicode(cfSelectedZone.full_domain)}
+                  </h3>
+                  <p className="text-xs text-content-muted mt-0.5">
+                    Cloudflare 托管 zone · {String(cfSelectedZone.status || "").toLowerCase() === "active" ? "已激活" : "待激活"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <button
+                    onClick={() => reloadCfRecords(cfSelectedZone, true)}
+                    disabled={loadingCfRecords}
+                    title="强制刷新（忽略缓存，重新从 Cloudflare 拉取）"
+                    className="p-2 text-content-muted hover:text-content-primary hover:bg-hovered rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${loadingCfRecords ? "animate-spin" : ""}`} />
+                  </button>
+                  <button
+                    onClick={() => setCfDnsModalOpen(false)}
+                    className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
+                {/* 新建记录折叠面板 */}
+                <div className="bg-elevated border border-border-base rounded-xl overflow-hidden">
+                  <button
+                    onClick={() => { setCfFormOpen(!cfFormOpen); setCfBatchOpen(false); }}
+                    className="w-full px-4 py-3 flex items-center justify-between text-sm font-semibold text-content-secondary hover:text-content-primary transition-colors"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Plus className="w-4 h-4 text-emerald-400" /> 添加解析记录
+                    </span>
+                    {cfFormOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  </button>
+                  {cfFormOpen && (
+                    <div className="px-4 pb-4 space-y-3 border-t border-border-base pt-3">
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">记录类型</label>
+                          <select
+                            value={cfNewType}
+                            onChange={(e) => {
+                              setCfNewType(e.target.value);
+                              if (!["A", "AAAA", "CNAME"].includes(e.target.value)) setCfNewProxied(false);
+                            }}
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
+                          >
+                            {DNS_TYPE_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>{opt.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">主机记录</label>
+                          <input
+                            type="text"
+                            name="cf-new-name"
+                            autoComplete="off"
+                            value={cfNewName}
+                            onChange={(e) => setCfNewName(e.target.value)}
+                            placeholder="@ 或 www"
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary font-mono"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">TTL</label>
+                          <select
+                            value={cfNewProxied ? 1 : cfNewTtl}
+                            onChange={(e) => setCfNewTtl(Number(e.target.value))}
+                            disabled={cfNewProxied}
+                            title={cfNewProxied ? "开启代理时 Cloudflare 固定使用自动 TTL" : undefined}
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <option value={1}>自动</option>
+                            {[60, 300, 600, 1800, 3600, 7200, 18000, 43200, 86400].map((t) => (
+                              <option key={t} value={t}>{t} 秒</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">
+                            优先级 {needsDnsPriority(cfNewType) ? "" : "(无需)"}
+                          </label>
+                          <input
+                            type="number"
+                            name="cf-new-priority"
+                            autoComplete="off"
+                            value={cfNewPriority}
+                            onChange={(e) => setCfNewPriority(Number(e.target.value))}
+                            disabled={!needsDnsPriority(cfNewType)}
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-content-muted mb-1.5">记录值 Content</label>
+                        <input
+                          type="text"
+                          name="cf-new-content"
+                          autoComplete="off"
+                          value={cfNewContent}
+                          onChange={(e) => setCfNewContent(e.target.value)}
+                          placeholder="如 192.0.2.1 / example.com / v=spf1 ..."
+                          className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary font-mono"
+                        />
+                      </div>
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        {/* 代理开关仅对 Cloudflare 支持代理的记录类型开放 */}
+                        {["A", "AAAA", "CNAME"].includes(cfNewType) ? (
+                          <label className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={cfNewProxied}
+                              onChange={(e) => setCfNewProxied(e.target.checked)}
+                              className="w-4 h-4 accent-orange-500"
+                            />
+                            开启代理（橙色云，隐藏源站 IP，TTL 固定自动）
+                          </label>
+                        ) : (
+                          <span className="text-[11px] text-content-muted">该记录类型不支持 Cloudflare 代理</span>
+                        )}
+                        <button
+                          onClick={handleCfCreateRecord}
+                          disabled={actionLoading === "cf-create-dns"}
+                          className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
+                        >
+                          {actionLoading === "cf-create-dns" ? (
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Plus className="w-4 h-4" />
+                          )}
+                          创建记录
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* 批量添加折叠面板 */}
+                <div className="bg-elevated border border-border-base rounded-xl overflow-hidden">
+                  <button
+                    onClick={() => { setCfBatchOpen(!cfBatchOpen); setCfFormOpen(false); }}
+                    className="w-full px-4 py-3 flex items-center justify-between text-sm font-semibold text-content-secondary hover:text-content-primary transition-colors"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Download className="w-4 h-4 text-sky-400" /> 批量添加解析记录
+                    </span>
+                    {cfBatchOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                  </button>
+                  {cfBatchOpen && (
+                    <div className="px-4 pb-4 space-y-3 border-t border-border-base pt-3">
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">默认类型</label>
+                          <select
+                            value={cfBatchType}
+                            onChange={(e) => setCfBatchType(e.target.value)}
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
+                          >
+                            {DNS_TYPE_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>{opt.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">默认主机记录</label>
+                          <input
+                            type="text"
+                            name="cf-batch-name"
+                            autoComplete="off"
+                            value={cfBatchName}
+                            onChange={(e) => setCfBatchName(e.target.value)}
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary font-mono"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">默认 TTL</label>
+                          <select
+                            value={cfBatchProxied ? 1 : cfBatchTtl}
+                            onChange={(e) => setCfBatchTtl(Number(e.target.value))}
+                            disabled={cfBatchProxied}
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <option value={1}>自动</option>
+                            {[60, 300, 600, 1800, 3600, 7200, 18000, 43200, 86400].map((t) => (
+                              <option key={t} value={t}>{t} 秒</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-content-muted mb-1.5">
+                            默认优先级 {needsDnsPriority(cfBatchType) ? "" : "(无需)"}
+                          </label>
+                          <input
+                            type="number"
+                            name="cf-batch-priority"
+                            autoComplete="off"
+                            value={cfBatchPriority}
+                            onChange={(e) => setCfBatchPriority(Number(e.target.value))}
+                            disabled={!needsDnsPriority(cfBatchType)}
+                            className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                          />
+                        </div>
+                      </div>
+                      <textarea
+                        ref={cfBatchTextareaRef}
+                        value={cfBatchInput}
+                        onChange={(e) => setCfBatchInput(e.target.value)}
+                        placeholder={"每行一条，字段分隔符：竖线 | 逗号 , 或空格\n示例：\n192.0.2.1            仅记录值（默认类型/主机记录）\nwww 192.0.2.2        主机记录 + 记录值\nMX @ mail.example.com 600 10"}
+                        className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono min-h-[96px] resize-y"
+                      />
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        {["A", "AAAA", "CNAME"].includes(cfBatchType) ? (
+                          <label className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={cfBatchProxied}
+                              onChange={(e) => setCfBatchProxied(e.target.checked)}
+                              className="w-4 h-4 accent-orange-500"
+                            />
+                            默认开启代理（仅对 A/AAAA/CNAME 行生效）
+                          </label>
+                        ) : <span />}
+                        <button
+                          onClick={handleCfBatchCreate}
+                          disabled={actionLoading === "cf-batch-create-dns" || cfValidBatchLines.length === 0}
+                          className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
+                        >
+                          {actionLoading === "cf-batch-create-dns" ? (
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Plus className="w-4 h-4" />
+                          )}
+                          批量添加{cfValidBatchLines.length > 0 ? `（已识别 ${cfValidBatchLines.length} 条）` : ""}
+                        </button>
+                      </div>
+                      {cfBatchResults && (
+                        <div className="space-y-1 max-h-40 overflow-y-auto bg-surface border border-border-base rounded-lg p-3 text-xs">
+                          {cfBatchResults.map((r, i) => (
+                            <div key={i} className={`flex items-start gap-2 ${r.success ? "text-emerald-500" : "text-red-500"}`}>
+                              {r.success ? <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" /> : <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />}
+                              <span className="font-mono break-all">{r.label} — {r.message}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* 批量修改折叠面板 */}
+                {cfSelectedKeys.size > 0 && cfEditPanelOpen && (
+                  <div className="bg-elevated border border-indigo-500/40 rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-sm font-bold text-content-primary">
+                        批量修改 {cfSelectedKeys.size} 条记录
+                      </h4>
+                      <button onClick={() => setCfEditPanelOpen(false)} className="text-content-muted hover:text-content-primary">
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-4 text-xs text-content-secondary">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={cfEditFields.content}
+                          onChange={(e) => setCfEditFields({ ...cfEditFields, content: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500"
+                        />
+                        记录值（可逐条编辑）
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={cfEditFields.ttl}
+                          onChange={(e) => setCfEditFields({ ...cfEditFields, ttl: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500"
+                        />
+                        TTL
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={cfEditFields.proxied}
+                          onChange={(e) => setCfEditFields({ ...cfEditFields, proxied: e.target.checked })}
+                          className="w-4 h-4 accent-indigo-500"
+                        />
+                        代理开关
+                      </label>
+                    </div>
+                    {cfEditFields.ttl && (
+                      <div className="max-w-[200px]">
+                        <label className="block text-xs font-semibold text-content-muted mb-1.5">新 TTL</label>
+                        <select
+                          value={cfBatchEditProxied ? 1 : cfBatchEditTtl}
+                          onChange={(e) => setCfBatchEditTtl(Number(e.target.value))}
+                          disabled={cfEditFields.proxied && cfBatchEditProxied}
+                          className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <option value={1}>自动</option>
+                          {[60, 300, 600, 1800, 3600, 7200, 18000, 43200, 86400].map((t) => (
+                            <option key={t} value={t}>{t} 秒</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    {cfEditFields.proxied && (
+                      <label className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={cfBatchEditProxied}
+                          onChange={(e) => setCfBatchEditProxied(e.target.checked)}
+                          className="w-4 h-4 accent-orange-500"
+                        />
+                        将选中记录设为{cfBatchEditProxied ? "已代理（橙色云，TTL 固定自动）" : "仅 DNS（灰色云）"}
+                      </label>
+                    )}
+                    {cfEditFields.content && (
+                      <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                        {cfBatchEditTargets.map((t) => (
+                          <div key={t.record_id} className="flex items-center gap-2 text-xs">
+                            <span className="font-mono text-content-muted truncate max-w-[40%] flex-shrink-0" title={t.label}>{t.label}</span>
+                            <input
+                              type="text"
+                              value={cfBatchEditContents[t.record_id] ?? ""}
+                              onChange={(e) => setCfBatchEditContents({ ...cfBatchEditContents, [t.record_id]: e.target.value })}
+                              placeholder={t.origin_content || "保持原值"}
+                              className="flex-1 form-input px-2.5 py-1.5 rounded-lg text-xs text-content-secondary font-mono min-w-0"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-content-muted">
+                        将提交 {cfBatchEditChanged.length} 条修改（未变化的自动跳过）
+                      </span>
+                      <button
+                        onClick={handleCfBatchUpdateRecords}
+                        disabled={actionLoading === "cf-batch-update-dns" || cfBatchEditChanged.length === 0}
+                        className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
+                      >
+                        {actionLoading === "cf-batch-update-dns" ? (
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Save className="w-4 h-4" />
+                        )}
+                        提交修改
+                      </button>
+                    </div>
+                    {cfEditResults && (
+                      <div className="space-y-1 max-h-40 overflow-y-auto bg-surface border border-border-base rounded-lg p-3 text-xs">
+                        {cfEditResults.map((r, i) => (
+                          <div key={i} className={`flex items-start gap-2 ${r.success ? "text-emerald-500" : "text-red-500"}`}>
+                            {r.success ? <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" /> : <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />}
+                            <span className="font-mono break-all">{r.label} — {r.message}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 记录列表工具条 */}
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="text-xs text-content-muted">
+                    共 <span className="text-content-primary font-bold">{cfRecords.length}</span> 条解析记录
+                  </div>
+                  {cfRecords.length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={cfToggleAllSelection}
+                        className="px-3 py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all"
+                      >
+                        {cfSelectedKeys.size === cfRecords.length ? "取消全选" : "全选"}
+                      </button>
+                      {cfSelectedKeys.size > 0 && !cfEditPanelOpen && (
+                        <button
+                          onClick={handleCfOpenEditPanel}
+                          className="px-3 py-1.5 text-xs font-semibold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200 dark:border-indigo-900/60 rounded-lg transition-all"
+                        >
+                          批量修改
+                        </button>
+                      )}
+                      {cfSelectedKeys.size > 0 && (
+                        <button
+                          onClick={handleCfBatchDeleteRecords}
+                          disabled={actionLoading === "cf-batch-delete-dns"}
+                          className="px-3 py-1.5 text-xs font-semibold text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 rounded-lg transition-all disabled:opacity-50"
+                        >
+                          批量删除 ({cfSelectedKeys.size})
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* 记录表格（窄屏横向滚动） */}
+                {loadingCfRecords ? (
+                  <div className="flex flex-col items-center justify-center py-12 text-content-muted">
+                    <RefreshCw className="w-6 h-6 animate-spin text-indigo-500 mb-2" />
+                    <span className="text-sm">正在加载解析记录...</span>
+                  </div>
+                ) : cfRecords.length === 0 ? (
+                  <div className="text-center py-12 border border-dashed border-border-base rounded-xl bg-surface">
+                    <Server className="w-10 h-10 text-content-muted mx-auto mb-2" />
+                    <p className="text-content-muted text-sm">该 zone 下暂无解析记录，可在上方添加。</p>
+                  </div>
+                ) : (
+                  <div className="border border-border-base rounded-xl overflow-x-auto bg-surface">
+                    <table className="w-full text-sm min-w-[760px]">
+                      <thead>
+                        <tr className="bg-elevated text-left text-xs text-content-muted">
+                          <th className="px-3 py-2.5 w-10">
+                            <input
+                              type="checkbox"
+                              checked={cfSelectedKeys.size === cfRecords.length && cfRecords.length > 0}
+                              onChange={cfToggleAllSelection}
+                              className="w-4 h-4 accent-indigo-500"
+                            />
+                          </th>
+                          <th className="px-3 py-2.5">类型</th>
+                          <th className="px-3 py-2.5">主机记录</th>
+                          <th className="px-3 py-2.5">记录值</th>
+                          <th className="px-3 py-2.5 w-16">代理</th>
+                          <th className="px-3 py-2.5 w-20">TTL</th>
+                          <th className="px-3 py-2.5 w-28 text-right">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {cfRecords.map((rec) => {
+                          const key = dnsRecordKey(rec);
+                          const isEditing = cfEditingKey === key;
+                          const relativeName = toRelativeRecordName(rec.name, cfSelectedZone.full_domain);
+                          const supportsProxied = ["A", "AAAA", "CNAME"].includes(rec.type);
+                          if (isEditing) {
+                            return (
+                              <tr key={key} className="border-t border-border-base bg-elevated">
+                                <td className="px-3 py-2.5">
+                                  <input type="checkbox" checked={cfSelectedKeys.has(key)} onChange={() => {
+                                    const next = new Set(cfSelectedKeys);
+                                    if (next.has(key)) next.delete(key); else next.add(key);
+                                    setCfSelectedKeys(next);
+                                  }} className="w-4 h-4 accent-indigo-500" />
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  <select
+                                    value={cfEditType}
+                                    onChange={(e) => {
+                                      setCfEditType(e.target.value);
+                                      if (!["A", "AAAA", "CNAME"].includes(e.target.value)) setCfEditProxied(false);
+                                    }}
+                                    className="form-input px-2 py-1.5 rounded-lg text-xs text-content-secondary w-24"
+                                  >
+                                    {DNS_TYPE_OPTIONS.map((opt) => (
+                                      <option key={opt.value} value={opt.value}>{opt.value}</option>
+                                    ))}
+                                  </select>
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  <input
+                                    type="text"
+                                    value={cfEditName}
+                                    onChange={(e) => setCfEditName(e.target.value)}
+                                    onKeyDown={(e) => { if (e.key === "Enter") handleCfUpdateRecord(); if (e.key === "Escape") setCfEditingKey(null); }}
+                                    className="form-input px-2 py-1.5 rounded-lg text-xs text-content-secondary font-mono w-28"
+                                  />
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  <input
+                                    type="text"
+                                    value={cfEditContent}
+                                    onChange={(e) => setCfEditContent(e.target.value)}
+                                    onKeyDown={(e) => { if (e.key === "Enter") handleCfUpdateRecord(); if (e.key === "Escape") setCfEditingKey(null); }}
+                                    className="form-input px-2 py-1.5 rounded-lg text-xs text-content-secondary font-mono w-full min-w-[180px]"
+                                  />
+                                  {needsDnsPriority(cfEditType) && (
+                                    <input
+                                      type="number"
+                                      value={cfEditPriority}
+                                      onChange={(e) => setCfEditPriority(Number(e.target.value))}
+                                      placeholder="优先级"
+                                      className="form-input px-2 py-1.5 rounded-lg text-xs text-content-secondary w-20 mt-1.5"
+                                    />
+                                  )}
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  {supportsProxied ? (
+                                    <input
+                                      type="checkbox"
+                                      checked={cfEditProxied}
+                                      onChange={(e) => setCfEditProxied(e.target.checked)}
+                                      title="橙色云代理"
+                                      className="w-4 h-4 accent-orange-500"
+                                    />
+                                  ) : (
+                                    <span className="text-content-muted text-xs">—</span>
+                                  )}
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  <select
+                                    value={cfEditProxied ? 1 : cfEditTtl}
+                                    onChange={(e) => setCfEditTtl(Number(e.target.value))}
+                                    disabled={cfEditProxied}
+                                    className="form-input px-2 py-1.5 rounded-lg text-xs text-content-secondary w-24 disabled:opacity-50"
+                                  >
+                                    <option value={1}>自动</option>
+                                    {[60, 300, 600, 1800, 3600, 7200, 18000, 43200, 86400].map((t) => (
+                                      <option key={t} value={t}>{t}</option>
+                                    ))}
+                                  </select>
+                                </td>
+                                <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                                  <button
+                                    onClick={handleCfUpdateRecord}
+                                    disabled={actionLoading === `cf-update-dns-${key}`}
+                                    className="text-emerald-500 hover:text-emerald-400 font-semibold text-xs px-2 disabled:opacity-50"
+                                  >
+                                    {actionLoading === `cf-update-dns-${key}` ? "保存中" : "保存"}
+                                  </button>
+                                  <button
+                                    onClick={() => setCfEditingKey(null)}
+                                    className="text-content-muted hover:text-content-primary font-semibold text-xs px-2"
+                                  >
+                                    取消
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          }
+                          return (
+                            <tr key={key} className="border-t border-border-base hover:bg-hovered/50 transition-colors">
+                              <td className="px-3 py-2.5">
+                                <input
+                                  type="checkbox"
+                                  checked={cfSelectedKeys.has(key)}
+                                  onChange={() => {
+                                    const next = new Set(cfSelectedKeys);
+                                    if (next.has(key)) next.delete(key); else next.add(key);
+                                    setCfSelectedKeys(next);
+                                  }}
+                                  className="w-4 h-4 accent-indigo-500"
+                                />
+                              </td>
+                              <td className="px-3 py-2.5">
+                                <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/60 px-2 py-0.5 rounded font-mono">
+                                  {rec.type}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2.5 font-mono text-content-primary text-xs">
+                                {relativeName === "@" ? (
+                                  <span className="text-content-muted">{cfSelectedZone.full_domain}</span>
+                                ) : (
+                                  `${relativeName}.${cfSelectedZone.full_domain}`
+                                )}
+                              </td>
+                              <td className="px-3 py-2.5 font-mono text-content-secondary text-xs break-all max-w-[280px]">
+                                {rec.content}
+                              </td>
+                              <td className="px-3 py-2.5">
+                                {rec.proxied ? (
+                                  <span className="inline-flex items-center gap-1 text-xs text-orange-500 font-semibold" title="已代理（橙色云）">
+                                    <Cloud className="w-3.5 h-3.5" /> 已代理
+                                  </span>
+                                ) : supportsProxied ? (
+                                  <span className="inline-flex items-center gap-1 text-xs text-content-muted" title="仅 DNS（灰色云）">
+                                    <Cloud className="w-3.5 h-3.5 opacity-40" /> 仅 DNS
+                                  </span>
+                                ) : (
+                                  <span className="text-content-muted text-xs">—</span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2.5 font-mono text-content-secondary text-xs">
+                                {Number(rec.ttl) === 1 ? "自动" : `${rec.ttl}s`}
+                              </td>
+                              <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                                <button
+                                  onClick={() => handleCfStartEditRecord(rec)}
+                                  className="text-indigo-500 hover:text-indigo-400 font-semibold text-xs px-2"
+                                  title="编辑"
+                                >
+                                  <Pencil className="w-3.5 h-3.5 inline" />
+                                </button>
+                                <button
+                                  onClick={() => handleCfDeleteRecord(rec)}
+                                  disabled={actionLoading === `cf-delete-dns-${key}`}
+                                  className="text-red-500 hover:text-red-400 font-semibold text-xs px-2 disabled:opacity-50"
+                                  title="删除"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5 inline" />
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Tab 2: 账号管理 */}
         {activeTab === "accounts" && (
           <div className="space-y-6">
@@ -5297,20 +6985,20 @@ export default function App() {
 
             {/* 已绑定的 API 账号 */}
             <div>
-              <h2 className="text-lg font-bold text-content-primary mb-4">已绑定的 API 账号 ({accounts.length})</h2>
+              <h2 className="text-lg font-bold text-content-primary mb-4">已绑定的 API 账号 ({dnsheAccounts.length})</h2>
 
               {loadingAccounts ? (
                 <div className="flex justify-center py-10">
                   <RefreshCw className="w-6 h-6 animate-spin text-indigo-500" />
                 </div>
-              ) : accounts.length === 0 ? (
+              ) : dnsheAccounts.length === 0 ? (
                 <div className="text-center py-12 border border-dashed border-border-base rounded-xl bg-surface">
                   <Key className="w-10 h-10 text-content-muted mx-auto mb-2" />
                   <p className="text-content-muted text-sm">尚未绑定任何 API 账户</p>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {accounts.map((acc) => (
+                  {dnsheAccounts.map((acc) => (
                     <div key={acc.id} className="glass-card rounded-xl p-5 border border-border-base flex justify-between items-start gap-4">
                       <div className="min-w-0">
                         <h3 className="font-bold text-content-primary text-base truncate">{acc.alias}</h3>

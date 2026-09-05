@@ -80,7 +80,8 @@ export interface ListDnsRecordsResponse extends BaseResponse {
 
 /** DNS 记录信息 */
 export interface DnsRecordInfo {
-  id: number;
+  // Cloudflare 的记录 id 是 32 位十六进制字符串，DNSHE 是数字，统一放宽为联合类型
+  id: number | string;
   record_id?: string;
   name: string;
   type: string;
@@ -281,8 +282,11 @@ export class DNSHEClient {
 
   /**
    * 列出子域名的 DNS 解析记录
+   *
+   * NOTE: 参数放宽为 number | string —— 路由层对 DNSHE / Cloudflare 客户端做联合分发时
+   * 传同一个 remote_id（DNSHE 行是数字主键，CF 行是 zone id 字符串），实际只走数字。
    */
-  async listDnsRecords(subdomainId: number): Promise<ListDnsRecordsResponse> {
+  async listDnsRecords(subdomainId: number | string): Promise<ListDnsRecordsResponse> {
     return this.request<ListDnsRecordsResponse>("dns_records", "list", "GET", {
       subdomain_id: subdomainId
     });
@@ -314,8 +318,10 @@ export class DNSHEClient {
 
   /**
    * 删除 DNS 解析记录
+   *
+   * NOTE: subdomainId 放宽为 number | string，理由同 listDnsRecords。
    */
-  async deleteDnsRecord(subdomainId: number, recordId: string | number): Promise<ActionResponse> {
+  async deleteDnsRecord(subdomainId: number | string, recordId: string | number): Promise<ActionResponse> {
     const params: Record<string, unknown> = {
       subdomain_id: subdomainId
     };

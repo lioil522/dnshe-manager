@@ -28,7 +28,8 @@ export const needsDnsPriority = (type: string): boolean => type === "MX" || type
 
 /** 批量修改需要读到的记录字段（与 App.tsx 的 DnsRecord 结构兼容） */
 export interface DnsRecordLike {
-  id?: number;
+  // DNSHE 的记录 id 是数字，Cloudflare 是 32 位十六进制字符串
+  id?: number | string;
   record_id?: string;
   type: string;
   name: string;
@@ -36,6 +37,7 @@ export interface DnsRecordLike {
   ttl: number;
   priority?: number | null;
   line?: string | null;
+  proxied?: boolean;
 }
 
 /** 单条解析记录在前端的唯一键（上游同时可能给出内部 id 与 record_id） */
@@ -148,6 +150,8 @@ export interface DnsEditFieldFlags {
   ttl: boolean;
   line: boolean;
   priority: boolean;
+  /** 橙色云代理开关（仅 Cloudflare 记录有意义，DNSHE 面板恒为 false 且不展示） */
+  proxied: boolean;
 }
 
 /** 批量修改面板里填的新值 */
@@ -158,6 +162,7 @@ export interface DnsEditOverrides {
   ttl: number;
   line: string;
   priority: number;
+  proxied: boolean;
 }
 
 /** 合并后送往后端的整条记录 */
@@ -175,6 +180,7 @@ export interface DnsEditTarget {
   ttl: number;
   line?: string;
   priority?: number;
+  proxied?: boolean;
 }
 
 /**
@@ -202,6 +208,7 @@ export function buildDnsEditTargets(
     const originPriority = needsDnsPriority(rec.type)
       ? rec.priority ?? undefined
       : undefined;
+    const originProxied = Boolean(rec.proxied);
 
     const type = flags.type ? overrides.type : rec.type;
     const name = flags.name ? toRelativeRecordName(overrides.name, fullDomain) : originName;
@@ -217,6 +224,7 @@ export function buildDnsEditTargets(
         ? overrides.priority
         : rec.priority ?? 10
       : undefined;
+    const proxied = flags.proxied ? overrides.proxied : originProxied;
 
     const normalizedTtl = ttl > 0 ? ttl : 600;
     const unchanged =
@@ -225,7 +233,8 @@ export function buildDnsEditTargets(
       content === rec.content &&
       normalizedTtl === rec.ttl &&
       line === originLine &&
-      priority === originPriority;
+      priority === originPriority &&
+      proxied === originProxied;
 
     return {
       record_id: key,
@@ -238,6 +247,7 @@ export function buildDnsEditTargets(
       ttl: normalizedTtl,
       line,
       priority,
+      proxied,
     };
   });
 }

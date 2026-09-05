@@ -1,4 +1,8 @@
 import { DNSHEClient } from "./dnshe";
+import { CloudflareClient } from "./cloudflare";
+
+/** 绑定账号的提供商 */
+export type AccountProvider = "dnshe" | "cloudflare";
 
 /**
  * 导入 Crypto 工具以处理 AES 加密
@@ -146,6 +150,7 @@ export interface DBAccount {
   id: number;
   alias: string;
   api_key: string;
+  provider: AccountProvider;
   created_at: string;
 }
 
@@ -164,6 +169,8 @@ export interface DBDomain {
   dns_provider?: string | null;
   /** 解析服务商账号 ID，用于判断该域名是否支持按线路解析（见 dnshe.ts 的字段注释） */
   provider_account_id?: string | null;
+  /** 上游对象 ID：Cloudflare 行存 zone id；DNSHE 行为空，主键 id 即 subdomain_id */
+  remote_id?: string | null;
   updated_at: string;
 }
 
@@ -197,6 +204,8 @@ export interface UpstreamSubdomain {
   ns2?: string;
   dns_provider?: string;
   provider_account_id?: number | string | null;
+  /** Cloudflare 行携带 zone id；DNSHE 行留空 */
+  remote_id?: string | null;
   dns_state_known?: boolean;
 }
 
@@ -238,6 +247,7 @@ export class DatabaseManager {
             alias TEXT NOT NULL,
             api_key TEXT NOT NULL UNIQUE,
             api_secret TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'dnshe',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           );
         `),
@@ -255,6 +265,7 @@ export class DatabaseManager {
             has_dns INTEGER DEFAULT 1,
             dns_provider TEXT,
             provider_account_id TEXT,
+            remote_id TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
           );
@@ -297,6 +308,14 @@ export class DatabaseManager {
       }
       if (!existingColumns.has("provider_account_id")) {
         migrations.push("ALTER TABLE domains_cache ADD COLUMN provider_account_id TEXT");
+      }
+      if (!existingColumns.has("remote_id")) {
+        migrations.push("ALTER TABLE domains_cache ADD COLUMN remote_id TEXT");
+      }
+      const accountColumns = await this.db.prepare("PRAGMA table_info(accounts)").all<{ name: string }>();
+      const accountColumnNames = new Set((accountColumns.results || []).map((column) => column.name));
+      if (!accountColumnNames.has("provider")) {
+        migrations.push("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'dnshe'");
       }
       if (migrations.length > 0) {
         await this.db.batch(migrations.map((sql) => this.db.prepare(sql)));
@@ -540,14 +559,23 @@ export class DatabaseManager {
     );
   }
 
-  /** 新绑定 / 换 Key：拉一次该账号的配额写回缓存，只影响这一个账号 */
-  async refreshAccountQuotaCache(accountId: number, alias: string): Promise<void> {
+  /** 新绑定 / 换 Key：拉一次该账号的配额写回缓存，只影响这一个账号（Cloudflare 账号无配额概念，直接清掉缓存条目） */
+  async refreshAccountQuotaCache(accountId: number, alias: string, provider: AccountProvider = "dnshe"): Promise<void> {
     const cached = await this.readQuotaCache();
     if (cached === null) return;
+
+    if (provider === "cloudflare") {
+      await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
+      return;
+    }
 
     let entry: QuotaEntry;
     try {
       const { client } = await this.getClientForAccount(accountId);
+      if (!(client instanceof DNSHEClient)) {
+        await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
+        return;
+      }
       const qRes = await client.getQuota();
       entry = qRes && qRes.success
         ? { account_id: accountId, alias, ...qRes.quota }
@@ -915,47 +943,82 @@ export class DatabaseManager {
    * 添加 API 账户
    * alias 可留空，留空时自动通过 keys/list 接口解析密钥名称 (key_name) 作为别名
    */
-  async addAccount(alias: string, apiKey: string, apiSecret: string): Promise<DBAccount> {
-    const client = new DNSHEClient(apiKey, apiSecret);
-
-    // 别名处理：为空时调用 keys/list 同时完成校验与别名解析（一次请求）
+  async addAccount(alias: string, apiKey: string, apiSecret: string, provider: AccountProvider = "dnshe"): Promise<DBAccount> {
+    let uniqueKey = apiKey;
+    let credential = apiSecret;
     let finalAlias = (alias || "").trim();
-    if (!finalAlias) {
-      const resolved = await this.resolveAliasFromKey(client, apiKey);
-      if (!resolved) {
-        throw new Error("API 密钥有效但未能自动获取密钥名称作为别名，请手动填写别名");
-      }
-      finalAlias = resolved;
-    } else {
-      // 显式提供别名时，仍需校验密钥是否可用
+
+    if (provider === "cloudflare") {
+      // Cloudflare 账号：apiSecret 即 API Token（apiKey 参数不使用）
+      const cfClient = new CloudflareClient(apiSecret);
+      let verify: { token_id: string; status: string };
       try {
-        await client.getQuota();
+        verify = await cfClient.verifyToken();
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证 API 密钥有效性: ${message}`);
+        throw new Error(`Cloudflare Token 校验失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      }
+      if (verify.status && verify.status.toLowerCase() !== "active") {
+        throw new Error(`Cloudflare Token 状态异常 (${verify.status})，请检查 Token 是否被禁用`);
+      }
+
+      // 别名留空时用 Token 可访问的账号名；缺 Account:Read 权限时退回 Token id
+      try {
+        const cfAccounts = await cfClient.listAccounts();
+        const first = cfAccounts[0];
+        if (first) {
+          if (!finalAlias) finalAlias = first.name || first.id;
+          uniqueKey = `cf:${first.id}`;
+        }
+      } catch {
+        // 忽略：唯一键退回 Token id，同样能防重复绑定
+      }
+      if (!finalAlias) finalAlias = `Cloudflare ${String(verify.token_id).slice(0, 8)}`;
+      if (uniqueKey === apiKey) uniqueKey = `cf:token:${verify.token_id}`;
+    } else {
+      const client = new DNSHEClient(apiKey, apiSecret);
+
+      // 别名处理：为空时调用 keys/list 同时完成校验与别名解析（一次请求）
+      if (!finalAlias) {
+        const resolved = await this.resolveAliasFromKey(client, apiKey);
+        if (!resolved) {
+          throw new Error("API 密钥有效但未能自动获取密钥名称作为别名，请手动填写别名");
+        }
+        finalAlias = resolved;
+      } else {
+        // 显式提供别名时，仍需校验密钥是否可用
+        try {
+          await client.getQuota();
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : "未知错误";
+          throw new Error(`无法验证 API 密钥有效性: ${message}`);
+        }
       }
     }
 
-    const encryptedSecret = await encryptText(apiSecret, this.aesKey);
+    const encryptedSecret = await encryptText(credential, this.aesKey);
 
     // NOTE: 先执行写库（api_key 有 UNIQUE 约束），只有真正入库成功后才写"绑定成功"日志，
     // 避免重复绑定等失败场景下 INSERT 抛异常、成功日志却已落库导致的"失败却显示成功"问题。
     try {
       await this.db.prepare(
-        "INSERT INTO accounts (alias, api_key, api_secret) VALUES (?, ?, ?)"
-      ).bind(finalAlias, apiKey, encryptedSecret).run();
+        "INSERT INTO accounts (alias, api_key, api_secret, provider) VALUES (?, ?, ?, ?)"
+      ).bind(finalAlias, uniqueKey, encryptedSecret, provider).run();
     } catch (e: unknown) {
       const raw = e instanceof Error ? e.message : String(e);
-      // 唯一约束冲突（重复绑定同一 api_key）翻译为友好中文提示
+      // 唯一约束冲突（重复绑定同一凭据）翻译为友好中文提示
       if (raw.includes("UNIQUE") || raw.toLowerCase().includes("unique constraint")) {
-        throw new Error(`该 API Key 已被绑定，请勿重复绑定（别名: ${finalAlias}）`);
+        throw new Error(
+          provider === "cloudflare"
+            ? "该 Cloudflare 账号已被绑定，请勿重复绑定（别名: " + finalAlias + "）"
+            : `该 API Key 已被绑定，请勿重复绑定（别名: ${finalAlias}）`
+        );
       }
       throw new Error(`账户入库失败: ${raw}`);
     }
 
     const result = await this.db.prepare(
-      "SELECT id, alias, api_key, created_at FROM accounts WHERE api_key = ?"
-    ).bind(apiKey).first<DBAccount>();
+      "SELECT id, alias, api_key, provider, created_at FROM accounts WHERE api_key = ?"
+    ).bind(uniqueKey).first<DBAccount>();
 
     // 入库成功后再记录日志：区分是否启用了 AES-GCM 加密
     if (!this.aesKey) {
@@ -970,45 +1033,67 @@ export class DatabaseManager {
   /**
    * 获取所有账户
    */
-  async getAccounts(): Promise<DBAccount[]> {
-    const { results } = await this.db.prepare(
-      "SELECT id, alias, api_key, created_at FROM accounts ORDER BY id ASC"
-    ).all<DBAccount>();
+  async getAccounts(provider?: AccountProvider): Promise<DBAccount[]> {
+    const query = provider
+      ? "SELECT id, alias, api_key, provider, created_at FROM accounts WHERE provider = ? ORDER BY id ASC"
+      : "SELECT id, alias, api_key, provider, created_at FROM accounts ORDER BY id ASC";
+    const statement = this.db.prepare(query);
+    const { results } = provider
+      ? await statement.bind(provider).all<DBAccount>()
+      : await statement.all<DBAccount>();
     return results || [];
   }
 
   /**
-   * 更新 API 账户（可仅修改别名，或同时更换 API Key/Secret）
+   * 更新 API 账户（可仅修改别名，或同时更换凭据）
    */
   async updateAccount(id: number, alias: string, apiKey?: string, apiSecret?: string): Promise<DBAccount> {
     const existing = await this.db.prepare(
-      "SELECT alias, api_key, api_secret FROM accounts WHERE id = ?"
+      "SELECT alias, api_key, api_secret, provider FROM accounts WHERE id = ?"
     ).bind(id).first();
     if (!existing) {
       throw new Error(`未找到 ID 为 ${id} 的账户`);
     }
-    const existingRow = existing as { alias: string; api_key: string; api_secret: string };
+    const existingRow = existing as { alias: string; api_key: string; api_secret: string; provider?: string };
 
     const finalAlias = (alias || "").trim() || existingRow.alias;
     let finalApiKey = existingRow.api_key;
     let finalEncryptedSecret = existingRow.api_secret;
 
-    // 若提供了新的 API Key/Secret，则校验有效性并加密替换；留空表示保持不变
-    const newKey = (apiKey || "").trim();
-    const newSecret = (apiSecret || "").trim();
-    if (newKey || newSecret) {
-      if (!newKey || !newSecret) {
-        throw new Error("更换 API 密钥时，API Key 与 API Secret 必须同时填写");
+    if (existingRow.provider === "cloudflare") {
+      // Cloudflare 账号：apiSecret 即 API Token，只需单独更换 Token；api_key（账号唯一键）保持不变
+      const newToken = (apiSecret || "").trim();
+      if (newToken) {
+        const cfClient = new CloudflareClient(newToken);
+        try {
+          const verify = await cfClient.verifyToken();
+          if (verify.status && verify.status.toLowerCase() !== "active") {
+            throw new Error(`Token 状态异常 (${verify.status})`);
+          }
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : "未知错误";
+          throw new Error(`无法验证新 Cloudflare Token: ${message}`);
+        }
+        finalEncryptedSecret = await encryptText(newToken, this.aesKey);
       }
-      const client = new DNSHEClient(newKey, newSecret);
-      try {
-        await client.getQuota();
-      } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证新 API 密钥有效性: ${message}`);
+    } else {
+      // 若提供了新的 API Key/Secret，则校验有效性并加密替换；留空表示保持不变
+      const newKey = (apiKey || "").trim();
+      const newSecret = (apiSecret || "").trim();
+      if (newKey || newSecret) {
+        if (!newKey || !newSecret) {
+          throw new Error("更换 API 密钥时，API Key 与 API Secret 必须同时填写");
+        }
+        const client = new DNSHEClient(newKey, newSecret);
+        try {
+          await client.getQuota();
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : "未知错误";
+          throw new Error(`无法验证新 API 密钥有效性: ${message}`);
+        }
+        finalApiKey = newKey;
+        finalEncryptedSecret = await encryptText(newSecret, this.aesKey);
       }
-      finalApiKey = newKey;
-      finalEncryptedSecret = await encryptText(newSecret, this.aesKey);
     }
 
     try {
@@ -1024,7 +1109,7 @@ export class DatabaseManager {
     }
 
     const result = await this.db.prepare(
-      "SELECT id, alias, api_key, created_at FROM accounts WHERE id = ?"
+      "SELECT id, alias, api_key, provider, created_at FROM accounts WHERE id = ?"
     ).bind(id).first<DBAccount>();
 
     await this.writeLog("success", "operation", `账户 [${finalAlias}] 信息已更新`);
@@ -1054,31 +1139,48 @@ export class DatabaseManager {
   }
 
   /**
-   * 根据 ID 获取解密后的 API 客户端
+   * 根据 ID 获取解密后的 API 客户端（按账号 provider 返回 DNSHE / Cloudflare 客户端）
    */
-  async getClientForAccount(id: number): Promise<{ client: DNSHEClient; alias: string }> {
+  async getClientForAccount(id: number): Promise<{ client: DNSHEClient | CloudflareClient; alias: string; provider: AccountProvider }> {
     const account = await this.db.prepare(
-      "SELECT alias, api_key, api_secret FROM accounts WHERE id = ?"
+      "SELECT alias, api_key, api_secret, provider FROM accounts WHERE id = ?"
     ).bind(id).first();
-    
+
     if (!account) {
       throw new Error(`未找到 ID 为 ${id} 的账户`);
     }
 
-    const typedAccount = account as { alias: string; api_key: string; api_secret: string };
+    const typedAccount = account as { alias: string; api_key: string; api_secret: string; provider?: string };
     const apiSecret = await decryptText(typedAccount.api_secret, this.aesKey);
+    if (typedAccount.provider === "cloudflare") {
+      return {
+        client: new CloudflareClient(apiSecret),
+        alias: typedAccount.alias,
+        provider: "cloudflare"
+      };
+    }
     return {
       client: new DNSHEClient(typedAccount.api_key, apiSecret),
-      alias: typedAccount.alias
+      alias: typedAccount.alias,
+      provider: "dnshe"
     };
   }
 
   /**
    * 跨账号列出域名（包含所属账户别名），支持搜索与状态过滤
+   *
+   * NOTE: provider 过滤 —— 缺省时排除 Cloudflare 账号的 zone 行（它们在独立的
+   * Cloudflare 标签页展示，DNSHE 域名页不应混入）；显式传 "cloudflare" 时只返回
+   * 这些行，传 "dnshe" 时只返回 DNSHE 账号的行。
    */
-  async getDomains(search = "", status = "", accountId?: number): Promise<DBDomain[]> {
+  async getDomains(
+    search = "",
+    status = "",
+    accountId?: number,
+    provider?: AccountProvider
+  ): Promise<DBDomain[]> {
     let query = `
-      SELECT d.*, a.alias as account_alias 
+      SELECT d.*, a.alias as account_alias, a.provider as account_provider
       FROM domains_cache d
       LEFT JOIN accounts a ON d.account_id = a.id
       WHERE 1=1
@@ -1101,9 +1203,17 @@ export class DatabaseManager {
       binds.push(accountId);
     }
 
+    if (provider === "cloudflare") {
+      query += " AND a.provider = 'cloudflare'";
+    } else if (provider === "dnshe") {
+      query += " AND IFNULL(a.provider, 'dnshe') != 'cloudflare'";
+    } else {
+      query += " AND IFNULL(a.provider, 'dnshe') != 'cloudflare'";
+    }
+
     query += " ORDER BY d.expires_at ASC";
 
-    const { results } = await this.db.prepare(query).bind(...binds).all<DBDomain>();
+    const { results } = await this.db.prepare(query).bind(...binds).all<DBDomain & { account_provider?: string }>();
     return results || [];
   }
 
@@ -1175,11 +1285,12 @@ export class DatabaseManager {
       : "未解析";
 
     return this.db.prepare(`
-      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, provider_account_id, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, provider_account_id, remote_id, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         account_id = excluded.account_id,
         provider_account_id = COALESCE(excluded.provider_account_id, domains_cache.provider_account_id),
+        remote_id = COALESCE(excluded.remote_id, domains_cache.remote_id),
         ${dnsStateAssignments}
         created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
         expires_at = excluded.expires_at,
@@ -1196,6 +1307,7 @@ export class DatabaseManager {
       hasDnsVal,
       dnsProvider,
       providerAccountId,
+      sub.remote_id || null,
       this.getBeijingNow()
     );
   }

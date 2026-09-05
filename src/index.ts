@@ -2,8 +2,10 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
+import type { DBDomain } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
+import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification, sendWebhookNotification } from "./cron";
 import type { WebhookType } from "./cron";
 import { computeDnsState } from "./dns-provider";
@@ -41,7 +43,16 @@ type Bindings = {
   DEFAULT_API_ALIAS?: string;
 };
 
-// NOTE: 深度同步单个账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
+// NOTE: 深度同步 Cloudflare 账号的 zone 列表。zones 拉取成功即视为权威结论——
+// 上游删掉的 zone 会由 syncAccountDomains 的差集清理逻辑移除，包括 0 个 zone 的情况。
+// zone → 上游行 的映射复用 cloudflare.ts 的 mapZoneToUpstream。
+async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number, client: CloudflareClient): Promise<number> {
+  const zones = await client.listZones();
+  await dbManager.syncAccountDomains(accountId, zones.map(mapZoneToUpstream));
+  return zones.length;
+}
+
+// NOTE: 深度同步单个 DNSHE 账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
 // 与 cron.ts 中 "同步所有域名" 的逻辑保持一致，供绑定/批量/修改换 Key 后调用
 async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, client: DNSHEClient): Promise<number> {
   const subdomains = await fetchAllSubdomainsFromClient(client);
@@ -76,11 +87,15 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
 async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds: number[]) {
   for (const id of accountIds) {
     try {
-      const { client, alias } = await dbManager.getClientForAccount(id);
+      const { client, alias, provider } = await dbManager.getClientForAccount(id);
       // 先刷配额缓存再同步域名：前端是以「该账号的域名已落库」作为后台任务完成的信号，
       // 放在后面做会让配额缓存慢于这个信号，用户切到配额页仍是旧数据
-      await dbManager.refreshAccountQuotaCache(id, alias);
-      const synced = await deepSyncAccountDomains(dbManager, id, client);
+      await dbManager.refreshAccountQuotaCache(id, alias, provider);
+      const synced = client instanceof CloudflareClient
+        ? await syncCloudflareZones(dbManager, id, client)
+        : client instanceof DNSHEClient
+          ? await deepSyncAccountDomains(dbManager, id, client)
+          : 0;
       console.log(`Deep sync finished for account ${id}: ${synced} domains`);
     } catch (e: unknown) {
       console.error(`Background account resync failed for account ${id}:`, e);
@@ -152,7 +167,9 @@ async function ensureDefaultAccount(c: any, dbManager: DatabaseManager) {
         // 深度同步一次域名，保证自动分类（已委派/已解析/未解析）
         try {
           const { client } = await dbManager.getClientForAccount(newAcc.id);
-          await deepSyncAccountDomains(dbManager, newAcc.id, client);
+          if (client instanceof DNSHEClient) {
+            await deepSyncAccountDomains(dbManager, newAcc.id, client);
+          }
         } catch (syncErr) {
           console.error("Default account auto-sync failed:", syncErr);
         }
@@ -837,19 +854,28 @@ app.get("/api/accounts", async (c) => {
   }
 });
 
-// 2. 绑定新账号（alias 可选，留空时自动从 API Key 解析密钥名称作为别名）
+// 2. 绑定新账号（DNSHE：API Key + Secret；Cloudflare：API Token。alias 可选，留空时自动解析）
 app.post("/api/accounts", async (c) => {
   const dbManager = c.get("db");
   try {
     const body = await c.req.json();
-    const { alias, api_key, api_secret } = body;
-    
-    if (!api_key || !api_secret) {
-      return c.json(errorRes("参数缺失：api_key, api_secret 为必填项（alias 可选，留空将自动解析）", "bad_request"), 400);
+    const provider = body.provider === "cloudflare" ? "cloudflare" : "dnshe";
+    const { alias, api_key, api_secret, api_token } = body;
+
+    let newAccount;
+    if (provider === "cloudflare") {
+      if (!api_token) {
+        return c.json(errorRes("参数缺失：api_token 为必填项（Cloudflare API Token，alias 可选，留空将自动解析）", "bad_request"), 400);
+      }
+      // 绑定过程会先校验 Token（/user/tokens/verify），无效 Token 直接报错不入库
+      newAccount = await dbManager.addAccount(String(alias || "").trim(), "", String(api_token).trim(), "cloudflare");
+    } else {
+      if (!api_key || !api_secret) {
+        return c.json(errorRes("参数缺失：api_key, api_secret 为必填项（alias 可选，留空将自动解析）", "bad_request"), 400);
+      }
+      newAccount = await dbManager.addAccount(String(alias || "").trim(), String(api_key), String(api_secret));
     }
 
-    const newAccount = await dbManager.addAccount(String(alias || "").trim(), String(api_key), String(api_secret));
-    
     // 绑定成功后，后台深度同步该账号域名（逐个拉取 DNS 记录自动分类），不阻塞响应
     if (newAccount && newAccount.id) {
       c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [newAccount.id]));
@@ -862,14 +888,20 @@ app.post("/api/accounts", async (c) => {
   }
 });
 
-// 3. 批量绑定新账号（仅需 API Key + API Secret，别名留空自动解析）
+// 3. 批量绑定新账号（DNSHE：Key+Secret 每行一组；Cloudflare：api_token 每行一个）
 app.post("/api/accounts/batch", async (c) => {
   const dbManager = c.get("db");
   try {
     const body = await c.req.json().catch(() => ({}));
+    const provider = body.provider === "cloudflare" ? "cloudflare" : "dnshe";
     const items = Array.isArray(body.accounts) ? body.accounts : [];
     if (items.length === 0) {
-      return c.json(errorRes("请至少提供一条账号信息（api_key + api_secret）", "bad_request"), 400);
+      return c.json(errorRes(
+        provider === "cloudflare"
+          ? "请至少提供一条账号信息（api_token）"
+          : "请至少提供一条账号信息（api_key + api_secret）",
+        "bad_request"
+      ), 400);
     }
     if (items.length > 50) {
       return c.json(errorRes("单次最多批量绑定 50 个账号", "bad_request"), 400);
@@ -880,11 +912,34 @@ app.post("/api/accounts/batch", async (c) => {
     let successCount = 0;
     let failCount = 0;
 
-    // 串行处理每个账号，间隔 800ms 以规避 DNSHE 速率限制（默认 30-60 请求/分钟）
+    // 串行处理每个账号，间隔 800ms 以规避上游 API 速率限制
     for (const item of items) {
+      const alias = String(item?.alias || "").trim();
+
+      if (provider === "cloudflare") {
+        const apiToken = String(item?.api_token || "").trim();
+        if (!apiToken) {
+          failCount++;
+          results.push({ api_key: "(未填写)", success: false, message: "缺少 Cloudflare API Token" });
+          continue;
+        }
+
+        try {
+          const newAccount = await dbManager.addAccount(alias, "", apiToken, "cloudflare");
+          newAccountIds.push(newAccount.id);
+          successCount++;
+          results.push({ api_key: `${apiToken.slice(0, 4)}***`, alias: newAccount.alias, success: true, message: "绑定成功" });
+        } catch (e: unknown) {
+          failCount++;
+          const message = e instanceof Error ? e.message : "未知错误";
+          results.push({ api_key: `${apiToken.slice(0, 4)}***`, success: false, message });
+        }
+        await sleep(800);
+        continue;
+      }
+
       const apiKey = String(item?.api_key || "").trim();
       const apiSecret = String(item?.api_secret || "").trim();
-      const alias = String(item?.alias || "").trim();
 
       if (!apiKey || !apiSecret) {
         failCount++;
@@ -925,7 +980,7 @@ app.post("/api/accounts/batch", async (c) => {
   }
 });
 
-// 4. 修改账号信息（可仅改别名，或同时更换 API Key/Secret）
+// 4. 修改账号信息（可仅改别名；DNSHE 可换 Key/Secret 对，Cloudflare 可换 Token）
 app.put("/api/accounts/:id", async (c) => {
   const dbManager = c.get("db");
   const id = parseInt(c.req.param("id"), 10);
@@ -933,13 +988,15 @@ app.put("/api/accounts/:id", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const alias = String(body.alias || "");
     const apiKey = body.api_key !== undefined ? String(body.api_key) : undefined;
+    // Cloudflare 的 Token 走 api_token 字段，与 DNSHE 的 api_secret 区分开
+    const apiToken = body.api_token !== undefined ? String(body.api_token).trim() : undefined;
     const apiSecret = body.api_secret !== undefined ? String(body.api_secret) : undefined;
 
-    const updatedAccount = await dbManager.updateAccount(id, alias, apiKey, apiSecret);
+    const updatedAccount = await dbManager.updateAccount(id, alias, apiKey, apiToken ?? apiSecret);
 
-    // 若更换了 API Key，则后台深度重新同步该账号的域名缓存（拉取 DNS 记录自动分类）
-    // 并刷新其配额缓存；仅改别名时配额数字不变，只需就地改掉缓存里的别名
-    if (apiKey && apiSecret) {
+    // 若更换了凭据，则后台深度重新同步该账号的域名缓存；仅改别名时只需就地改掉配额缓存里的别名
+    const credentialsChanged = Boolean(apiToken) || Boolean(apiKey && apiSecret);
+    if (credentialsChanged) {
       c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [updatedAccount.id]));
     } else {
       await dbManager.renameAccountInQuotaCache(updatedAccount.id, updatedAccount.alias);
@@ -973,15 +1030,20 @@ app.delete("/api/accounts/:id", async (c) => {
  */
 
 // 1. 跨账号列出所有域名
+//
+// NOTE: provider 查询参数 —— 传 "cloudflare" 时只返回 Cloudflare 账号的 zone（独立的
+// Cloudflare 标签页使用）；缺省时排除这些行，DNSHE 域名页的数据结构保持不变。
 app.get("/api/domains", async (c) => {
   const dbManager = c.get("db");
   const search = c.req.query("search") || "";
   const status = c.req.query("status") || "";
   const accountIdStr = c.req.query("account_id");
   const accountId = accountIdStr ? parseInt(accountIdStr, 10) : undefined;
+  const providerParam = c.req.query("provider");
+  const provider = providerParam === "cloudflare" || providerParam === "dnshe" ? providerParam : undefined;
 
   try {
-    const domains = await dbManager.getDomains(search, status, accountId);
+    const domains = await dbManager.getDomains(search, status, accountId, provider);
     return c.json(successRes({ domains }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";
@@ -1016,7 +1078,11 @@ app.post("/api/domains/:id/renew", async (c) => {
     }
 
     const { client, alias } = await dbManager.getClientForAccount(domainInfo.account_id);
-    
+    // Cloudflare 域名的有效期由注册商管理，不存在 DNSHE 式续期
+    if (!(client instanceof DNSHEClient)) {
+      return c.json(errorRes("Cloudflare 域名不通过 DNSHE 续期，请在 Cloudflare 或对应注册商平台管理有效期", "not_supported"), 400);
+    }
+
     const res = await client.renewSubdomain(domainId);
     if (res && res.success) {
       const newExpiresAt = res.new_expires_at || "";
@@ -1126,6 +1192,11 @@ app.post("/api/domains/:id/delete", async (c) => {
 
     const { client, alias } = await dbManager.getClientForAccount(domainInfo.account_id);
 
+    // Cloudflare zone 不在本面板删除（危险操作，请前往 Cloudflare 控制台）
+    if (!(client instanceof DNSHEClient)) {
+      return c.json(errorRes("Cloudflare 域名不支持在本面板删除，请前往 Cloudflare 控制台操作", "delete_forbidden"), 409);
+    }
+
     // ── 防线二：解析记录历史检查 ──
     // 只要当前仍存在解析记录就直接拦截；"历史"记录无法从 API 读取，
     // 交由上游判定（失败时走 translateDeleteError 翻译）。
@@ -1205,8 +1276,10 @@ app.get("/api/domains/:id/dns", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.listDnsRecords(domainId);
-    
+    // DNSHE 行的 remote_id 为空，直接用主键 subdomain_id；Cloudflare 行用 zone id
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainId;
+    const res = await client.listDnsRecords(remoteId);
+
     if (res && res.success) {
       const records = res.records || [];
       await dbManager.setCache(cacheKey, JSON.stringify(records));
@@ -1269,18 +1342,25 @@ function translateDnsWriteError(raw: string, type?: unknown): { message: string;
 }
 
 // 辅助函数：DNS 记录变更后，自动重新计算并同步更新域名的三态 (已委派 / 已解析 / 未解析)
-async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client: DNSHEClient, domainId: number) {
+async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client: DNSHEClient | CloudflareClient, domainInfo: DBDomain) {
   try {
-    const dnsRes = await client.listDnsRecords(domainId);
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainInfo.id;
+    const dnsRes = await client.listDnsRecords(remoteId);
     const records = (dnsRes && dnsRes.success && Array.isArray(dnsRes.records)) ? dnsRes.records : [];
-    
-    // 写操作回源后，将最新记录回填到缓存，后续读操作直接命中
-    await dbManager.setCache(`api_cache:dns:${domainId}`, JSON.stringify(records));
 
-    const { status, has_dns, dns_provider } = computeDnsState(records);
-    await dbManager.updateDomainStatusAndDns(domainId, status, has_dns, dns_provider);
+    // 写操作回源后，将最新记录回填到缓存，后续读操作直接命中
+    await dbManager.setCache(`api_cache:dns:${domainInfo.id}`, JSON.stringify(records));
+
+    if (client instanceof CloudflareClient) {
+      // Cloudflare 托管的 zone：apex NS 记录必然指向 *.ns.cloudflare.com，computeDnsState
+      // 会把它误判成「已委派」。这些行由绑定的 CF 账号直接管理，固定写「已解析」。
+      await dbManager.updateDomainStatusAndDns(domainInfo.id, "已解析", 1, "Cloudflare");
+    } else {
+      const { status, has_dns, dns_provider } = computeDnsState(records);
+      await dbManager.updateDomainStatusAndDns(domainInfo.id, status, has_dns, dns_provider);
+    }
   } catch (e) {
-    console.error(`域名状态实时更新异常 [subdomain_id: ${domainId}]:`, e);
+    console.error(`域名状态实时更新异常 [domain_id: ${domainInfo.id}]:`, e);
   }
 }
 
@@ -1303,15 +1383,29 @@ app.post("/api/domains/:id/dns", async (c) => {
     // NOTE: 保留 ...body 透传（weight / port / target 等上游可选字段），只覆盖需要
     // 规范化的主机记录；前端把列表里读到的完整域名填回来时也不会被上游拒绝。
     const recordName = normalizeDnsRecordName(String(body.name ?? ""), domainInfo.full_domain);
-    const res = await client.createDnsRecord({
-      subdomain_id: domainId,
-      ...body,
-      name: recordName
-    } as CreateDnsRecordParams);
+    let res;
+    if (client instanceof CloudflareClient) {
+      res = await client.createDnsRecord({
+        zone_id: String(domainInfo.remote_id || ""),
+        zone_name: domainInfo.full_domain,
+        type: String(body.type || ""),
+        name: recordName,
+        content: String(body.content ?? ""),
+        ttl: Number(body.ttl) > 0 ? Number(body.ttl) : undefined,
+        priority: Number.isFinite(Number(body.priority)) ? Number(body.priority) : undefined,
+        proxied: body.proxied === true || body.proxied === "true",
+      });
+    } else {
+      res = await client.createDnsRecord({
+        subdomain_id: domainId,
+        ...body,
+        name: recordName
+      } as CreateDnsRecordParams);
+    }
 
     if (res && res.success) {
       await dbManager.writeLog("success", "api", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${recordName} -> ${body.content}`);
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
       return c.json(successRes({ message: "创建DNS记录成功", record: res.record }));
     } else {
       throw new Error(res.message || "创建DNS记录失败");
@@ -1337,36 +1431,44 @@ interface DnsBatchItemResult {
 }
 
 /**
- * 把批量请求里的单条 item 规范化为上游写接口参数
+ * 把批量请求里的单条 item 规范化为提供商中立的上游写参数
  *
- * 类型统一大写、主机记录转相对名、优先级只对 MX / SRV 下发、线路留空则不带上，
- * 批量创建与批量修改共用一份逻辑。type / content 为空时由调用方拒绝该条。
+ * 类型统一大写、主机记录转相对名、优先级只对 MX / SRV 下发、线路留空则不带上。
+ * NOTE: 不再携带 subdomain_id / zone_id —— 调用方按账号提供商补齐各自的路由字段
+ * （DNSHE 加 subdomain_id，Cloudflare 加 zone_id + zone_name）。type / content 为空时
+ * 由调用方拒绝该条。
  */
 function buildBatchDnsParams(
   item: Record<string, unknown> | null | undefined,
-  domainId: number,
   fullDomain: string
-): { type: string; name: string; content: string; params: Record<string, unknown> } {
+): { type: string; name: string; content: string; ttl: number; priority?: number; proxied?: boolean; params: Record<string, unknown> } {
   const type = String(item?.type || "").trim().toUpperCase();
   const name = normalizeDnsRecordName(String(item?.name ?? ""), fullDomain);
   const content = String(item?.content || "").trim();
 
+  const ttl = Number(item?.ttl) > 0 ? Number(item?.ttl) : 600;
   const params: Record<string, unknown> = {
-    subdomain_id: domainId,
     type,
     name,
     content,
-    ttl: Number(item?.ttl) > 0 ? Number(item?.ttl) : 600,
+    ttl,
   };
+  let priority: number | undefined;
   if ((type === "MX" || type === "SRV") && Number.isFinite(Number(item?.priority))) {
-    params.priority = Number(item?.priority);
+    priority = Number(item?.priority);
+    params.priority = priority;
   }
   const line = String(item?.line || "").trim();
   if (line) {
     params.line = line;
   }
+  // 橙色云代理开关（仅 Cloudflare 生效；DNSHE 上游会忽略未知字段）
+  const proxied = item?.proxied === true || item?.proxied === "true" ? true : undefined;
+  if (proxied) {
+    params.proxied = proxied;
+  }
 
-  return { type, name, content, params };
+  return { type, name, content, ttl, priority, proxied, params };
 }
 
 // 5.1 批量新建 DNS 解析记录（串行提交，逐条返回结果，最后统一回源同步一次三态）
@@ -1394,6 +1496,7 @@ app.post("/api/domains/:id/dns/batch", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const cfZoneId = String(domainInfo.remote_id || "");
 
     const results: DnsBatchItemResult[] = [];
     let successCount = 0;
@@ -1402,7 +1505,7 @@ app.post("/api/domains/:id/dns/batch", async (c) => {
     let changed = false;
 
     for (const item of items) {
-      const { type, name, content, params } = buildBatchDnsParams(item, domainId, domainInfo.full_domain);
+      const { type, name, content, ttl, priority, proxied, params } = buildBatchDnsParams(item, domainInfo.full_domain);
       const label = `${type || "?"} ${name} → ${content || "(空)"}`;
 
       if (!type || !content) {
@@ -1412,7 +1515,12 @@ app.post("/api/domains/:id/dns/batch", async (c) => {
       }
 
       try {
-        const res = await client.createDnsRecord(params as unknown as CreateDnsRecordParams);
+        let res;
+        if (client instanceof CloudflareClient) {
+          res = await client.createDnsRecord({ zone_id: cfZoneId, zone_name: domainInfo.full_domain, type, name, content, ttl, priority, proxied });
+        } else {
+          res = await client.createDnsRecord({ ...params, subdomain_id: domainId } as unknown as CreateDnsRecordParams);
+        }
         if (res && res.success) {
           successCount++;
           changed = true;
@@ -1435,7 +1543,7 @@ app.post("/api/domains/:id/dns/batch", async (c) => {
 
     // 只要有记录真的写进去了，就回源刷新缓存与三态（整批失败时不必多跑一次上游）
     if (changed) {
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
     }
 
     await dbManager.writeLog(
@@ -1486,6 +1594,7 @@ app.post("/api/domains/:id/dns/batch-update", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const cfZoneId = String(domainInfo.remote_id || "");
 
     const results: DnsBatchItemResult[] = [];
     let successCount = 0;
@@ -1494,7 +1603,7 @@ app.post("/api/domains/:id/dns/batch-update", async (c) => {
     let changed = false;
 
     for (const item of items) {
-      const { type, name, content, params } = buildBatchDnsParams(item, domainId, domainInfo.full_domain);
+      const { type, name, content, ttl, priority, proxied, params } = buildBatchDnsParams(item, domainInfo.full_domain);
       const recordId = String(item?.record_id ?? item?.id ?? "").trim();
       const label = String(item?.label || "").trim() || `${type || "?"} ${name} → ${content || "(空)"}`;
 
@@ -1510,10 +1619,15 @@ app.post("/api/domains/:id/dns/batch-update", async (c) => {
       }
 
       try {
-        const res = await client.updateDnsRecord({
-          ...params,
-          record_id: recordId,
-        } as unknown as UpdateDnsRecordParams);
+        let res;
+        if (client instanceof CloudflareClient) {
+          res = await client.updateDnsRecord({ zone_id: cfZoneId, zone_name: domainInfo.full_domain, record_id: recordId, type, name, content, ttl, priority, proxied });
+        } else {
+          res = await client.updateDnsRecord({
+            ...params,
+            record_id: recordId,
+          } as unknown as UpdateDnsRecordParams);
+        }
         if (res && res.success) {
           successCount++;
           changed = true;
@@ -1535,7 +1649,7 @@ app.post("/api/domains/:id/dns/batch-update", async (c) => {
     }
 
     if (changed) {
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
     }
 
     await dbManager.writeLog(
@@ -1595,6 +1709,7 @@ app.post("/api/domains/:id/dns/batch-delete", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainId;
 
     const results: DnsBatchItemResult[] = [];
     let successCount = 0;
@@ -1605,7 +1720,7 @@ app.post("/api/domains/:id/dns/batch-delete", async (c) => {
     for (const item of items) {
       const label = item.label || item.recordId;
       try {
-        const res = await client.deleteDnsRecord(domainId, item.recordId);
+        const res = await client.deleteDnsRecord(remoteId, item.recordId);
         if (res && res.success) {
           successCount++;
           changed = true;
@@ -1628,7 +1743,7 @@ app.post("/api/domains/:id/dns/batch-delete", async (c) => {
     }
 
     if (changed) {
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
     }
 
     await dbManager.writeLog(
@@ -1698,11 +1813,26 @@ app.put("/api/domains/:id/dns/:record_id", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.updateDnsRecord(params as unknown as UpdateDnsRecordParams);
+    let res;
+    if (client instanceof CloudflareClient) {
+      res = await client.updateDnsRecord({
+        zone_id: String(domainInfo.remote_id || ""),
+        zone_name: domainInfo.full_domain,
+        record_id: recordId,
+        type,
+        name: String(params.name),
+        content,
+        ttl: Number(params.ttl),
+        priority: Number.isFinite(Number(params.priority)) ? Number(params.priority) : undefined,
+        proxied: body.proxied === true || body.proxied === "true",
+      });
+    } else {
+      res = await client.updateDnsRecord(params as unknown as UpdateDnsRecordParams);
+    }
 
     if (res && res.success) {
       await dbManager.writeLog("success", "api", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${params.type} ${params.name} -> ${params.content}`);
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
       return c.json(successRes({ message: "更新DNS记录成功" }));
     } else {
       throw new Error(res.message || "更新DNS记录失败");
@@ -1728,11 +1858,12 @@ app.delete("/api/domains/:id/dns/:record_id", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.deleteDnsRecord(domainId, recordId);
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainId;
+    const res = await client.deleteDnsRecord(remoteId, recordId);
 
     if (res && res.success) {
       await dbManager.writeLog("success", "api", `删除了域名 [${domainInfo.full_domain}] 下的 DNS 记录 (ID: ${recordId})`);
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
       return c.json(successRes({ message: "删除DNS记录成功" }));
     } else {
       throw new Error(res.message || "删除DNS记录失败");
@@ -1753,11 +1884,16 @@ app.delete("/api/domains/:id/dns/:record_id", async (c) => {
  * 辅助函数：并发拉取所有账号的配额并返回（不含缓存逻辑，供接口与写操作回填复用）
  */
 async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: Array<{ id: number; alias: string }>; quotas: any[] }> {
-  const accounts = await dbManager.getAccounts();
+  const allAccounts = await dbManager.getAccounts();
+  // Cloudflare 账号没有 DNSHE 式配额概念，跳过查询避免无意义的上游报错
+  const accounts = allAccounts.filter((acc) => acc.provider !== "cloudflare");
 
   // 并发发起所有账号的配额查询请求
   const quotaPromises = accounts.map(async (acc) => {
     const { client } = await dbManager.getClientForAccount(acc.id);
+    if (!(client instanceof DNSHEClient)) {
+      throw new Error("该账号不支持配额查询");
+    }
     const qRes = await client.getQuota();
     if (qRes && qRes.success) {
       return {
@@ -1986,11 +2122,19 @@ app.post("/api/settings/test-webhook", async (c) => {
     let client: DNSHEClient;
     if (accountIdParam) {
       const auth = await dbManager.getClientForAccount(Number(accountIdParam));
+      if (!(auth.client instanceof DNSHEClient)) {
+        return c.json(errorRes("仅 DNSHE 账号支持 WHOIS 查重", "not_supported"), 400);
+      }
       client = auth.client;
     } else {
       const accounts = await dbManager.getAccounts();
-      if (accounts.length > 0) {
-        const auth = await dbManager.getClientForAccount(accounts[0].id);
+      // 优先取第一个 DNSHE 账号；Cloudflare 账号没有 WHOIS 代理能力
+      const dnsheAccount = accounts.find((acc) => acc.provider !== "cloudflare");
+      if (dnsheAccount) {
+        const auth = await dbManager.getClientForAccount(dnsheAccount.id);
+        if (!(auth.client instanceof DNSHEClient)) {
+          return c.json(errorRes("仅 DNSHE 账号支持 WHOIS 查重", "not_supported"), 400);
+        }
         client = auth.client;
       } else {
         client = new DNSHEClient("public", "public");
@@ -2246,6 +2390,10 @@ app.post("/api/domains/register", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(account_id);
+    // 在线注册是 DNSHE 免费子域名专属能力
+    if (!(client instanceof DNSHEClient)) {
+      return c.json(errorRes("仅 DNSHE 账号支持在线注册子域名", "not_supported"), 400);
+    }
     // 中文等非 ASCII 域名统一转 Punycode (xn--) 后再送往上游 DNSHE API
     const asciiSub = toASCII(String(subdomain).trim());
     const asciiRoot = toASCII(String(rootdomain).trim());

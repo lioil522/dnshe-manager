@@ -576,6 +576,8 @@ export default function App() {
   const [cfSelectedZone, setCfSelectedZone] = useState<Domain | null>(null);
   const [cfRecords, setCfRecords] = useState<DnsRecord[]>([]);
   const [loadingCfRecords, setLoadingCfRecords] = useState(false);
+  // 记录列表加载失败的原因（区别于「确实没有记录」的空态，避免误导用户去添加）
+  const [cfRecordsError, setCfRecordsError] = useState<string | null>(null);
   // CF 新建记录表单（TTL 取值 1 表示 Cloudflare 的「自动」）
   const [cfFormOpen, setCfFormOpen] = useState(false);
   const [cfNewType, setCfNewType] = useState("A");
@@ -3115,10 +3117,13 @@ export default function App() {
       const data = await res.json();
       if (data.success) {
         setCfRecords(data.records || []);
+        setCfRecordsError(null);
       } else {
+        setCfRecordsError(data.message || "获取解析记录失败");
         showToast("error", data.message || "获取解析记录失败");
       }
     } catch (e) {
+      setCfRecordsError("网络连接异常，无法获取解析记录");
       showToast("error", "网络连接异常，无法获取解析记录");
     } finally {
       setLoadingCfRecords(false);
@@ -3129,6 +3134,7 @@ export default function App() {
     setCfSelectedZone(zone);
     setCfDnsModalOpen(true);
     setCfRecords([]);
+    setCfRecordsError(null);
     setCfSelectedKeys(new Set());
     setCfEditingKey(null);
     setCfFormOpen(false);
@@ -6562,6 +6568,7 @@ export default function App() {
                             autoComplete="off"
                             value={cfBatchName}
                             onChange={(e) => setCfBatchName(e.target.value)}
+                            placeholder="@（留空按 @ 处理）"
                             className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary font-mono"
                           />
                         </div>
@@ -6792,6 +6799,18 @@ export default function App() {
                   <div className="flex flex-col items-center justify-center py-12 text-content-muted">
                     <RefreshCw className="w-6 h-6 animate-spin text-indigo-500 mb-2" />
                     <span className="text-sm">正在加载解析记录...</span>
+                  </div>
+                ) : cfRecordsError ? (
+                  <div className="text-center py-10 border border-red-300/60 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 rounded-xl">
+                    <AlertTriangle className="w-10 h-10 text-red-500 mx-auto mb-2" />
+                    <p className="text-red-600 dark:text-red-400 text-sm font-semibold mb-1">解析记录加载失败</p>
+                    <p className="text-content-muted text-xs max-w-md mx-auto break-all">{cfRecordsError}</p>
+                    <button
+                      onClick={() => reloadCfRecords(cfSelectedZone, true)}
+                      className="mt-3 px-3 py-1.5 text-xs font-semibold text-red-600 dark:text-red-400 bg-elevated border border-red-200 dark:border-red-900/60 rounded-lg transition-all inline-flex items-center gap-1.5"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" /> 重试
+                    </button>
                   </div>
                 ) : cfRecords.length === 0 ? (
                   <div className="text-center py-12 border border-dashed border-border-base rounded-xl bg-surface">

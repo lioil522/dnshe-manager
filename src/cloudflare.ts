@@ -193,10 +193,24 @@ export class CloudflareClient {
     }
 
     if (!response.ok || !data.success) {
+      const firstCode = (data.errors || [])[0]?.code;
       const detail = (data.errors || [])
         .map((err) => err?.message)
         .filter(Boolean)
         .join("; ");
+      // NOTE: Cloudflare 对「Token 无效」和「Token 缺少该操作的权限」一律返回
+      // Authentication error (code 10000/9109)。最常见的原因是 Token 只有
+      // Zone:Read（拉 zone 列表够用，一旦读写解析记录就被拒），或 zone 范围
+      // 未覆盖该账号 / 域名，翻译成可操作的中文指引而不是裸的英文原文。
+      const isAuthError =
+        firstCode === 9109 ||
+        firstCode === 10000 ||
+        /authentication error|invalid bearer|not authorized|missing authorization/i.test(detail);
+      if (isAuthError) {
+        throw new Error(
+          "Cloudflare API 认证失败：请到 Cloudflare 控制台编辑该账号绑定的 API Token，确认包含 Zone:Read 与 Zone DNS:Edit 权限，且 zone 范围覆盖此域名（Include 指定账号或 All zones），改完无需重新绑定即可重试"
+        );
+      }
       throw new Error(`Cloudflare API 错误: ${detail || `HTTP ${response.status}`}`);
     }
 

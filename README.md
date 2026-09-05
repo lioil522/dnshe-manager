@@ -5,13 +5,14 @@
 [![构建自建镜像](https://github.com/lioil522/dnshe-manager/actions/workflows/docker.yml/badge.svg)](https://github.com/lioil522/dnshe-manager/actions/workflows/docker.yml)
 [![部署到 Cloudflare](https://github.com/lioil522/dnshe-manager/actions/workflows/deploy.yml/badge.svg)](https://github.com/lioil522/dnshe-manager/actions/workflows/deploy.yml)
 
-DNSHE-Manager 是一个面向 [DNSHE](https://my.dnshe.com) 用户的**多账号域名集中管理面板**，支持域名资产看板、DNS 解析托管、到期自动续期、多平台通知推送等功能。同一套代码同时支持 **Cloudflare Workers** 和 **Docker 自建** 两种部署形态。
+DNSHE-Manager 是一个面向 [DNSHE](https://my.dnshe.com) 用户的**多账号域名集中管理面板**，支持域名资产看板、DNS 解析托管、到期自动续期、多平台通知推送等功能，亦可通过 API Token 绑定 Cloudflare 账号，在独立标签页直接管理托管于 Cloudflare 的域名解析。同一套代码同时支持 **Cloudflare Workers** 和 **Docker 自建** 两种部署形态。
 
 ---
 
 ## ✨ 功能特性
 
 - **多账号管理** — 支持绑定多个 DNSHE API Key，跨账号统一管理域名资产
+- **Cloudflare 管理** — 独立标签页绑定 Cloudflare 账号（API Token，绑定时在线校验、别名自动取账号名），自动同步 zones 列表；支持 Cloudflare 全部 21 种记录类型的增删改与批量操作、橙色云代理开关、控制台深链；域名页对已委派且已绑定的域名一键跳转定位
 - **域名资产看板** — 一览所有域名的状态、到期时间、DNS 托管商等信息
 - **DNS 解析管理** — 在面板内直接增删改 DNS 记录（A / AAAA / CNAME / MX / TXT 等）
 - **自动续期** — 每日定时扫描即将到期的域名并自动续期，无人值守
@@ -41,6 +42,7 @@ graph TD
             B2["src/db.ts — 数据层"]
             B3["src/cron.ts — 定时任务"]
             B4["src/dnshe.ts — API 客户端"]
+            B5["src/cloudflare.ts — CF API 客户端"]
         end
 
         A1 -->|API 调用| B1
@@ -48,6 +50,7 @@ graph TD
 
     B1 --> C1
     B1 --> C2
+    B1 --> C3
 
     subgraph Cloudflare Workers
         C1["D1 Database / Cron Trigger / 静态资源同源发出"]
@@ -55,6 +58,10 @@ graph TD
 
     subgraph Docker 自建
         C2["SQLite 内置 / 进程内定时器 / 同端口同源"]
+    end
+
+    subgraph 上游 API
+        C3["DNSHE REST API / Cloudflare API v4"]
     end
 ```
 
@@ -209,6 +216,7 @@ DNSHE-Manager/
 │   ├── db.ts                   #   数据库管理器（加密、鉴权、CRUD）
 │   ├── cron.ts                 #   定时任务（域名同步、自动续期、通知推送）
 │   ├── dnshe.ts                #   DNSHE API 客户端
+│   ├── cloudflare.ts           #   Cloudflare API v4 客户端（zone 与解析记录）
 │   ├── dns-provider.ts         #   DNS 托管商识别
 │   └── punycode.ts             #   国际化域名编码
 │
@@ -347,6 +355,14 @@ Docker 的 `registry-mirrors` 只代理 Docker Hub，对 `ghcr.io` 无效。
 ### 忘记管理员密码怎么办？
 
 如果配置了 `ADMIN_TOKEN` 环境变量，可以使用它作为兜底登录方式。如果未配置，需要删除数据库中的管理员数据重新初始化。
+
+### 自动续期会处理 Cloudflare 的域名吗？
+
+不会。Cloudflare 账号仅同步 zones 列表（zone 有效期由注册商管理），不参与自动续期与配额统计；zone 的创建 / 删除请前往 Cloudflare 控制台。
+
+### 绑定 Cloudflare 账号需要什么权限？
+
+API Token 需包含 `Zone:Read` 与 `Zone DNS:Edit` 两项权限，作用范围建议覆盖要管理的域名。绑定时面板会调用 Cloudflare `user/tokens/verify` 在线校验，无效或已禁用的 Token 不会入库；同一 Cloudflare 账号不可重复绑定。若 Token 只有 Zone 类权限，账号信息接口会被拒，面板会自动退用 zones 数据内嵌的账号名。
 
 ---
 

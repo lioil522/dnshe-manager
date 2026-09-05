@@ -1361,7 +1361,7 @@ export default function App() {
             className="min-w-0 text-xs font-medium text-sky-600 dark:text-sky-400 hover:text-sky-500 dark:hover:text-sky-300 flex items-center gap-1.5 transition-colors text-left"
             title="已绑定 Cloudflare 账号，点击前往 Cloudflare 标签页并定位到该域名"
           >
-            <Cloud className="w-3.5 h-3.5 flex-shrink-0" />
+            <CloudflareIcon className="w-3.5 h-3.5 flex-shrink-0" />
             <span className="truncate">前往 Cloudflare 管理解析</span>
           </button>
         )}

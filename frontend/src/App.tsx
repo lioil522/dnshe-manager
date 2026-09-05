@@ -2942,11 +2942,13 @@ export default function App() {
     [accounts]
   );
 
-  // CF zones 按账号分组（保留 0 个 zone 的账号分组，提示用户去同步）
+  // CF zones 按账号分组。选择特定账号时只生成该账号的分组（其余隐藏，与域名列表页
+  // 的账号筛选行为一致）；选中的账号若还没有 zone 数据，保留分组提示用户去同步
   const groupedCfZones = useMemo(() => {
     const groups: Array<{ accountId: number; alias: string; zones: Domain[] }> = [];
     const byId = new Map<number, { accountId: number; alias: string; zones: Domain[] }>();
     cfAccountList.forEach((acc) => {
+      if (cfAccountFilter !== "all" && String(acc.id) !== cfAccountFilter) return;
       const group = { accountId: acc.id, alias: acc.alias, zones: [] as Domain[] };
       byId.set(acc.id, group);
       groups.push(group);
@@ -2956,7 +2958,7 @@ export default function App() {
       if (group) group.zones.push(z);
     });
     return groups;
-  }, [cfAccountList, cfZones]);
+  }, [cfAccountList, cfZones, cfAccountFilter]);
 
   // 域名匹配键：Punycode 小写 + 去首尾点（兼容 DNSHE 侧偶发的「.ddns.ge」空前缀形态）
   const normalizeDomainKey = (value: string): string =>
@@ -6202,6 +6204,18 @@ export default function App() {
               </div>
 
               <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:justify-end">
+                <button
+                  onClick={handleCfSyncZones}
+                  disabled={cfAccountList.length === 0 || actionLoading === "cf-sync"}
+                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {actionLoading === "cf-sync" ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  )}
+                  同步 zones
+                </button>
                 {cfZones.length > 0 && (
                   <button
                     onClick={cfToggleAllAccounts}
@@ -6220,18 +6234,6 @@ export default function App() {
                     )}
                   </button>
                 )}
-                <button
-                  onClick={handleCfSyncZones}
-                  disabled={cfAccountList.length === 0 || actionLoading === "cf-sync"}
-                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {actionLoading === "cf-sync" ? (
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  )}
-                  同步 zones
-                </button>
               </div>
             </div>
 

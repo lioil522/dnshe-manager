@@ -1333,7 +1333,7 @@ export default function App() {
 
       {/* 交叉提示：委派到 Cloudflare 且同名 zone 已在绑定的 CF 账号中同步过，
           引导用户去 Cloudflare 标签页管理解析记录（纯展示层匹配，不改数据） */}
-      {!checkHasDns(dom) && cfZoneFullDomainSet.has(normalizeDomainKey(dom.full_domain)) && (
+      {!checkHasDns(dom) && domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k)) && (
         <button
           onClick={() => setActiveTab("cloudflare")}
           className="w-full mt-3 text-xs font-medium text-sky-600 dark:text-sky-400 bg-sky-50 dark:bg-sky-950/60 border border-sky-200 dark:border-sky-900/60 rounded-lg px-3 py-2 flex items-center justify-center gap-1.5 hover:bg-sky-100 dark:hover:bg-sky-950 transition-colors"
@@ -2927,15 +2927,31 @@ export default function App() {
   const normalizeDomainKey = (value: string): string =>
     toASCII(String(value || "").trim().toLowerCase()).replace(/^\.+|\.+$/g, "");
 
+  // 域名匹配候选键
+  //
+  // NOTE: Cloudflare 建区时按 UTS-46 直接删除「可忽略字符」（零宽空格 U+200B 等），
+  // 因此带零宽前缀的域名在 CF 侧的 zone 名可能是剥除后的形态
+  // （「\u200B.ddns.ge」→「ddns.ge」而非「xn--zug.ddns.ge」）。
+  // 这里生成 原始归一化 / 剥除归一化 两个候选键，任一命中即视为同一域名；
+  // 两种形态一致（普通域名）时只返回一个，避免无谓的比对。
+  const domainKeyCandidates = (value: string): string[] => {
+    const raw = String(value || "");
+    const normalized = normalizeDomainKey(raw);
+    const stripped = normalizeDomainKey(raw.replace(/[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g, ""));
+    return stripped === normalized ? [normalized] : [normalized, stripped];
+  };
+
   // 已同步 zone 的完整域名集合，供 DNSHE 域名页做「已在 Cloudflare 管理」交叉提示
   const cfZoneFullDomainSet = useMemo(
-    () => new Set(cfZones.map((z) => normalizeDomainKey(String(z.full_domain || "")))),
+    () => new Set(cfZones.flatMap((z) => domainKeyCandidates(String(z.full_domain || "")))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [cfZones]
   );
 
   // DNSHE 注册域名集合，供 CF zone 卡片显示「DNSHE 注册」标识
   const dnsheFullDomainSet = useMemo(
-    () => new Set(domains.map((d) => normalizeDomainKey(String(d.full_domain || "")))),
+    () => new Set(domains.flatMap((d) => domainKeyCandidates(String(d.full_domain || "")))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [domains]
   );
 
@@ -3475,7 +3491,7 @@ export default function App() {
   const renderCfZoneCard = (zone: Domain) => {
     const unicodeDomain = displayDomain(toUnicode(zone.full_domain));
     const isActive = String(zone.status || "").toLowerCase() === "active";
-    const isDnsheRegistered = dnsheFullDomainSet.has(normalizeDomainKey(String(zone.full_domain || "")));
+    const isDnsheRegistered = domainKeyCandidates(String(zone.full_domain || "")).some((k) => dnsheFullDomainSet.has(k));
 
     const handleCopyZone = () => {
       navigator.clipboard.writeText(zone.full_domain).then(() => {

@@ -574,8 +574,23 @@ export default function App() {
   const [cfZones, setCfZones] = useState<Domain[]>([]);
   const [loadingCfZones, setLoadingCfZones] = useState(false);
   const [cfAccountFilter, setCfAccountFilter] = useState<string>("all");
-  // zones 分组的收起状态（独立于 DNSHE 域名页的 collapsedAccounts）
-  const [cfCollapsedAccounts, setCfCollapsedAccounts] = useState<Set<number>>(new Set());
+  // zones 分组的收起状态（独立于 DNSHE 域名页的 collapsedAccounts，持久化于本地，
+  // 刷新 / 重开浏览器后保持上次布局）
+  const [cfCollapsedAccounts, setCfCollapsedAccounts] = useState<Set<number>>(() => {
+    try {
+      const raw = localStorage.getItem("DNSHE_CF_COLLAPSED_ACCOUNTS");
+      const parsed = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(parsed) ? parsed : []);
+    } catch {
+      return new Set();
+    }
+  });
+
+  // 折叠状态落盘
+  const persistCfCollapsed = (next: Set<number>) => {
+    setCfCollapsedAccounts(next);
+    localStorage.setItem("DNSHE_CF_COLLAPSED_ACCOUNTS", JSON.stringify([...next]));
+  };
   // 绑定 Cloudflare 账号弹窗（仅支持 API Token）
   const [cfBindModal, setCfBindModal] = useState(false);
   const [cfNewAlias, setCfNewAlias] = useState("");
@@ -2979,16 +2994,16 @@ export default function App() {
     const next = new Set(cfCollapsedAccounts);
     if (next.has(accountId)) next.delete(accountId);
     else next.add(accountId);
-    setCfCollapsedAccounts(next);
+    persistCfCollapsed(next);
   };
 
   // 展开/收起全部账号分组（与域名列表页的 toggleAllAccounts 同构：
   // 存在收起的分组 → 全部展开；否则全部收起）
   const cfToggleAllAccounts = () => {
     if (cfCollapsedAccounts.size > 0) {
-      setCfCollapsedAccounts(new Set());
+      persistCfCollapsed(new Set());
     } else {
-      setCfCollapsedAccounts(new Set(groupedCfZones.map((g) => g.accountId)));
+      persistCfCollapsed(new Set(groupedCfZones.map((g) => g.accountId)));
     }
   };
 
@@ -3001,12 +3016,11 @@ export default function App() {
     setActiveTab("cloudflare");
     if (!zone) return;
     // 展开该 zone 所在的账号分组，否则卡片不可见、无从滚动定位
-    setCfCollapsedAccounts((prev) => {
-      if (!prev.has(zone.account_id)) return prev;
-      const next = new Set(prev);
+    if (cfCollapsedAccounts.has(zone.account_id)) {
+      const next = new Set(cfCollapsedAccounts);
       next.delete(zone.account_id);
-      return next;
-    });
+      persistCfCollapsed(next);
+    }
     setCfHighlightZoneId(zone.id);
   };
 

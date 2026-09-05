@@ -148,6 +148,17 @@ interface AppLog {
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * 域名显示用的零宽字符占位
+ *
+ * NOTE: 有用户注册了以零宽字符（U+200B 等）为前缀的域名，直接显示时看起来像
+ * 「.ddns.ge」，容易被当成显示异常或空空前缀。仅在渲染时替换为可见的 ◌ 占位符，
+ * 复制、搜索、Cloudflare 匹配仍使用原始完整域名，不受影响。
+ */
+const INVISIBLE_CHAR_RE = /[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g;
+const displayDomain = (value: string): string =>
+  String(value || "").replace(INVISIBLE_CHAR_RE, "◌");
+
+/**
  * 带「显示 / 隐藏」小眼睛的密码输入框
  *
  * 用在所有 type="password" 的位置（登录、初始化、修改密码、API Secret），
@@ -1262,7 +1273,7 @@ export default function App() {
 
   // 渲染单个域名卡片
   const renderDomainCard = (dom: Domain) => {
-    const unicodeDomain = toUnicode(dom.full_domain);
+    const unicodeDomain = displayDomain(toUnicode(dom.full_domain));
 
     const handleCopyDomain = () => {
       navigator.clipboard.writeText(dom.full_domain).then(() => {
@@ -3462,7 +3473,7 @@ export default function App() {
 
   // 渲染单个 Cloudflare zone 卡片
   const renderCfZoneCard = (zone: Domain) => {
-    const unicodeDomain = toUnicode(zone.full_domain);
+    const unicodeDomain = displayDomain(toUnicode(zone.full_domain));
     const isActive = String(zone.status || "").toLowerCase() === "active";
     const isDnsheRegistered = dnsheFullDomainSet.has(normalizeDomainKey(String(zone.full_domain || "")));
 
@@ -6361,7 +6372,7 @@ export default function App() {
                 <div className="min-w-0">
                   <h3 className="text-base sm:text-lg font-bold text-content-primary font-mono truncate flex items-center gap-2">
                     <Cloud className="w-4 h-4 text-sky-400 flex-shrink-0" />
-                    {toUnicode(cfSelectedZone.full_domain)}
+                    {displayDomain(toUnicode(cfSelectedZone.full_domain))}
                   </h3>
                   <p className="text-xs text-content-muted mt-0.5">
                     Cloudflare 托管 zone · {String(cfSelectedZone.status || "").toLowerCase() === "active" ? "已激活" : "待激活"}

@@ -130,6 +130,8 @@ function mapCfRecord(rec: CfDnsRecord): DnsRecordInfo {
  * NOTE: status 直接存 zone 的原始状态（active/pending/moved），这些行只在 Cloudflare
  * 标签页展示，由该页面自己渲染状态徽标，不走 DNSHE 的三态语义。expires_at 用 0000
  * 前缀占位，前端 formatDate 会显示成「永久」。数值主键由 zoneIdToNumericId（db.ts）产出。
+ * provider_account_id 借存 CF 账号 id —— DNSHE 行用它做线路判定兜底，CF 行用不到
+ * 那套语义，正好复用给前端拼控制台深链（dash.cloudflare.com/{账号id}/{zone名}）。
  */
 export function mapZoneToUpstream(zone: CfZoneInfo): UpstreamSubdomain {
   return {
@@ -142,6 +144,7 @@ export function mapZoneToUpstream(zone: CfZoneInfo): UpstreamSubdomain {
     expires_at: "0000-00-00 00:00:00",
     has_dns: 1,
     dns_provider: "Cloudflare",
+    provider_account_id: zone.account?.id || null,
     remote_id: zone.id,
     dns_state_known: true
   };

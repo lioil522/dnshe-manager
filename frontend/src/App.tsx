@@ -3557,11 +3557,15 @@ export default function App() {
         {/* 底部：DNS 管理按钮与 Cloudflare 控制台外链 */}
         <div className="flex items-center justify-end gap-2">
           <a
-            href={`https://dash.cloudflare.com/${zone.remote_id || ""}`}
+            href={zone.provider_account_id
+              ? `https://dash.cloudflare.com/${zone.provider_account_id}/${zone.full_domain}/dns/records`
+              : "https://dash.cloudflare.com/"}
             target="_blank"
             rel="noreferrer"
             className="text-xs font-semibold px-3 py-2 rounded-lg flex items-center gap-1.5 bg-elevated hover:bg-hovered text-content-secondary transition-all"
-            title="在 Cloudflare 控制台打开该 zone"
+            title={zone.provider_account_id
+              ? "在 Cloudflare 控制台打开该 zone 的 DNS 记录页"
+              : "点击「同步 zones」后可直达该 zone 的 DNS 记录页（当前缺账号信息，先打开控制台首页）"}
           >
             控制台 <ExternalLink className="w-3.5 h-3.5" />
           </a>

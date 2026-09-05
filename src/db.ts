@@ -5,6 +5,18 @@ import { CloudflareClient } from "./cloudflare";
 export type AccountProvider = "dnshe" | "cloudflare";
 
 /**
+ * 归一化自动解析出的 Cloudflare 账号别名
+ *
+ * NOTE: Cloudflare 给个人账号生成的默认名是「<邮箱>'s Account」，后缀是界面噪音，
+ * 自动命名时直接去掉（如 Lioil@nmail.art's Account → Lioil@nmail.art）；
+ * 账号名本身没有该后缀、或剥掉后为空时保持原样。用户显式填写的别名不经过这里。
+ */
+function normalizeCfAlias(name: string): string {
+  const stripped = String(name || "").replace(/\s*'s\s+account$/i, "").trim();
+  return stripped || String(name || "").trim();
+}
+
+/**
  * 导入 Crypto 工具以处理 AES 加密
  * 
  * NOTE: 使用 SHA-256 将任意长度的密钥材料派生为 256 位 AES-GCM 密钥
@@ -961,27 +973,27 @@ export class DatabaseManager {
         throw new Error(`Cloudflare Token 状态异常 (${verify.status})，请检查 Token 是否被禁用`);
       }
 
-      // 别名留空时自动解析 Cloudflare 账号名。优先 GET /accounts（需要 Account:Read
-      // 权限）；Token 没有该权限时退回 GET /zones —— 每个 zone 都内嵌
-      // account.id / account.name，凭 Zone:Read 就能拿到；两者都失败才退回 Token id。
+      // 别名留空时自动解析 Cloudflare 账号名。
+      // NOTE: 实测仅有 Zone 类权限的 Token 调 GET /accounts 会「成功但返回空列表」
+      //（没有 Account:Read 权限时不报错、只是看不到账号），因此「结果为空」与
+      //「请求失败」都要回退到 GET /zones —— 每个 zone 都内嵌 account.id / account.name，
+      // 凭 Zone:Read 即可拿到；两者都拿不到才退回 Token id。
+      let cfAccount: { id?: string; name?: string } | undefined;
       try {
-        const cfAccounts = await cfClient.listAccounts();
-        const first = cfAccounts[0];
-        if (first) {
-          if (!finalAlias) finalAlias = first.name || first.id;
-          uniqueKey = `cf:${first.id}`;
-        }
+        cfAccount = (await cfClient.listAccounts())[0];
       } catch {
+        cfAccount = undefined;
+      }
+      if (!cfAccount) {
         try {
-          const zones = await cfClient.listZones();
-          const acc = zones.find((z) => z.account?.id)?.account;
-          if (acc?.id) {
-            if (!finalAlias) finalAlias = acc.name || acc.id;
-            uniqueKey = `cf:${acc.id}`;
-          }
+          cfAccount = (await cfClient.listZones()).find((z) => z.account?.id)?.account;
         } catch {
-          // 忽略：唯一键退回 Token id，同样能防重复绑定
+          cfAccount = undefined;
         }
+      }
+      if (cfAccount?.id) {
+        if (!finalAlias) finalAlias = normalizeCfAlias(cfAccount.name || "") || cfAccount.id;
+        uniqueKey = `cf:${cfAccount.id}`;
       }
       if (!finalAlias) finalAlias = `Cloudflare ${String(verify.token_id).slice(0, 8)}`;
       if (uniqueKey === apiKey) uniqueKey = `cf:token:${verify.token_id}`;

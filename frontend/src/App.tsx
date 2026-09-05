@@ -432,8 +432,10 @@ export default function App() {
   const [batchInput, setBatchInput] = useState("");
   const [batchResults, setBatchResults] = useState<Array<{ api_key: string; alias?: string; success: boolean; message: string }> | null>(null);
 
-  // 绑定弹窗状态（"single" 单个 / "batch" 批量 / null 关闭）
-  const [bindModal, setBindModal] = useState<"single" | "batch" | null>(null);
+  // 绑定账号弹窗（统一承载 DNSHE / Cloudflare 两种提供商与 单个 / 批量 两种方式）
+  const [bindModalOpen, setBindModalOpen] = useState(false);
+  const [bindProvider, setBindProvider] = useState<"dnshe" | "cloudflare">("dnshe");
+  const [bindMode, setBindMode] = useState<"single" | "batch">("single");
   // 批量输入框引用（自绘拖拽调整高度用）
   const batchTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -591,10 +593,12 @@ export default function App() {
     setCfCollapsedAccounts(next);
     localStorage.setItem("DNSHE_CF_COLLAPSED_ACCOUNTS", JSON.stringify([...next]));
   };
-  // 绑定 Cloudflare 账号弹窗（仅支持 API Token）
-  const [cfBindModal, setCfBindModal] = useState(false);
+  // 绑定 Cloudflare 账号表单（单个 / 批量共用一套 Token 来源）
   const [cfNewAlias, setCfNewAlias] = useState("");
   const [cfNewToken, setCfNewToken] = useState("");
+  // Cloudflare 批量绑定：每行一条「api_token [别名]」
+  const [cfBatchBindInput, setCfBatchBindInput] = useState("");
+  const [cfBatchBindResults, setCfBatchBindResults] = useState<Array<{ api_key: string; alias?: string; success: boolean; message: string }> | null>(null);
   // 编辑 Cloudflare 账号（换 Token / 改别名）
   const [cfEditingAccount, setCfEditingAccount] = useState<Account | null>(null);
   const [cfEditAlias, setCfEditAlias] = useState("");
@@ -1969,7 +1973,7 @@ export default function App() {
         setNewAlias("");
         setNewApiKey("");
         setNewApiSecret("");
-        setBindModal(null);
+        setBindModalOpen(false);
         fetchAccounts();
         // 域名由后端 waitUntil 后台深度同步，轮询等它落库后再刷新列表
         waitForAccountDomainSync(
@@ -3057,7 +3061,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        setCfBindModal(false);
+        setBindModalOpen(false);
         setCfNewAlias("");
         setCfNewToken("");
         await fetchAccounts();
@@ -3072,6 +3076,70 @@ export default function App() {
       }
     } catch (e) {
       showToast("error", "绑定 Cloudflare 账号请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // 批量绑定 Cloudflare 账号：每行一条「api_token [别名]」，分隔符支持空格/Tab/逗号/竖线
+  const handleCfBatchAddAccounts = async () => {
+    const lines = cfBatchBindInput
+      .split(/[\n;；]+/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"));
+    if (lines.length === 0) {
+      showToast("error", "请至少输入一条 Cloudflare API Token");
+      return;
+    }
+
+    const parsed: Array<{ api_token: string; alias: string }> = [];
+    let invalidLines = 0;
+    for (const line of lines) {
+      const parts = line.split(/[\s,，|]+/).map((p) => p.trim()).filter(Boolean);
+      if (parts.length >= 1) {
+        parsed.push({ api_token: parts[0], alias: parts.length >= 2 ? parts.slice(1).join(" ") : "" });
+      } else {
+        invalidLines++;
+      }
+    }
+    if (invalidLines > 0) {
+      showToast("warning", `${invalidLines} 行格式不正确（每行需包含 API Token），已自动跳过`);
+    }
+    if (parsed.length === 0) {
+      showToast("error", "未能解析出任何有效的账号信息，请检查输入格式");
+      return;
+    }
+    if (parsed.length > 50) {
+      showToast("error", "单次最多批量绑定 50 个账号");
+      return;
+    }
+
+    setActionLoading("cf-batch-add-accounts");
+    setCfBatchBindResults(null);
+    try {
+      const res = await apiFetch("/api/accounts/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "cloudflare", accounts: parsed })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCfBatchBindResults(data.results || []);
+        showToast(data.fail_count === 0 ? "success" : "warning", data.message || "批量绑定完成");
+        setCfBatchBindInput("");
+        await fetchAccounts();
+        const ids: number[] = (data.account_ids || []).map(Number);
+        if (ids.length > 0) {
+          // 后台逐个同步 zones，落库后自动刷新（fetchCfZones 在等待函数末尾统一调用）
+          waitForAccountDomainSync(ids, `${ids.length} 个 Cloudflare 账号绑定成功`, undefined, () => "cloudflare");
+        } else {
+          await fetchCfZones();
+        }
+      } else {
+        showToast("error", data.message || "批量绑定失败");
+      }
+    } catch (err) {
+      showToast("error", "批量绑定请求发送失败，请检查网络");
     } finally {
       setActionLoading(null);
     }
@@ -6307,79 +6375,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Cloudflare 绑定账号弹窗 */}
-        {cfBindModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
-            <div className="bg-surface border border-border-base w-full max-w-md max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
-              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
-                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
-                  <Cloud className="w-5 h-5 text-sky-400" /> 绑定 Cloudflare 账号
-                </h3>
-                <button
-                  onClick={() => setCfBindModal(false)}
-                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名（可选，留空自动解析）</label>
-                  <input
-                    type="text"
-                    name="cf-bind-alias"
-                    autoComplete="off"
-                    value={cfNewAlias}
-                    onChange={(e) => setCfNewAlias(e.target.value)}
-                    placeholder="留空将使用 Cloudflare 账号名称"
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Token</label>
-                  <PasswordInput
-                    name="cf-bind-token"
-                    autoComplete="new-password"
-                    value={cfNewToken}
-                    onChange={setCfNewToken}
-                    placeholder="粘贴 Cloudflare API Token"
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
-                  />
-                </div>
-                <p className="text-[11px] text-content-muted leading-relaxed">
-                  在 Cloudflare 控制台「My Profile → API Tokens」创建 Token，权限需包含
-                  <span className="font-mono text-content-secondary"> Zone:Read </span>与
-                  <span className="font-mono text-content-secondary"> Zone DNS:Edit</span>
-                  。Token 仅用于调用 Cloudflare 官方 API，绑定后会加密存储并校验有效性。
-                </p>
-
-                <div className="flex gap-2 pt-1">
-                  <button
-                    onClick={() => setCfBindModal(false)}
-                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
-                  >
-                    取消
-                  </button>
-                  <button
-                    onClick={handleCfAddAccount}
-                    disabled={actionLoading === "cf-add-account"}
-                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
-                  >
-                    {actionLoading === "cf-add-account" ? (
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <>
-                        <Cloud className="w-4 h-4" /> 绑定
-                      </>
-                    )}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* Cloudflare 编辑账号弹窗 */}
         {cfEditingAccount && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
@@ -7080,27 +7075,27 @@ export default function App() {
         {/* Tab 2: 账号管理 */}
         {activeTab === "accounts" && (
           <div className="space-y-6">
-            {/* 顶部：绑定按钮（横排，点击打开弹窗） */}
+            {/* 顶部：绑定按钮（横排，打开统一的绑定弹窗，弹窗内可切换提供商与单个/批量） */}
             <div className="flex flex-col sm:flex-row gap-3">
               <button
                 type="button"
-                onClick={() => setBindModal("single")}
+                onClick={() => {
+                  setBindProvider("dnshe");
+                  setBindMode("single");
+                  setBindModalOpen(true);
+                }}
                 className="flex-1 py-3 rounded-xl text-sm font-semibold bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-500 shadow-lg shadow-indigo-900/40 flex items-center justify-center gap-2 transition-all"
               >
                 <Plus className="w-5 h-5" />
-                绑定单个账号
+                绑定 DNSHE 账号
               </button>
               <button
                 type="button"
-                onClick={() => setBindModal("batch")}
-                className="flex-1 py-3 rounded-xl text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-500 shadow-lg shadow-emerald-900/40 flex items-center justify-center gap-2 transition-all"
-              >
-                <Sparkles className="w-5 h-5" />
-                批量绑定账号
-              </button>
-              <button
-                type="button"
-                onClick={() => setCfBindModal(true)}
+                onClick={() => {
+                  setBindProvider("cloudflare");
+                  setBindMode("single");
+                  setBindModalOpen(true);
+                }}
                 className="flex-1 py-3 rounded-xl text-sm font-semibold bg-sky-600 hover:bg-sky-500 text-white border border-sky-500 shadow-lg shadow-sky-900/40 flex items-center justify-center gap-2 transition-all"
               >
                 <Cloud className="w-5 h-5" />
@@ -7312,8 +7307,333 @@ export default function App() {
           </div>
         )}
 
-        {/* 绑定单个账号弹窗 */}
-        {/* 词库新建 / 编辑模态框 */}
+        {/* 绑定账号弹窗（统一承载 DNSHE / Cloudflare 与 单个 / 批量） */}
+        {bindModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+            <div className="bg-surface border border-border-base w-full max-w-lg max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
+              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
+                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
+                  {bindProvider === "cloudflare" ? (
+                    <>
+                      <Cloud className="w-5 h-5 text-sky-400" /> 绑定 Cloudflare 账号
+                    </>
+                  ) : (
+                    <>
+                      <Plus className="w-5 h-5 text-indigo-400" /> 绑定 DNSHE 账号
+                    </>
+                  )}
+                </h3>
+                <button
+                  onClick={() => setBindModalOpen(false)}
+                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
+                {/* 提供商与方式切换 */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">账号提供商</label>
+                    <div className="grid grid-cols-2 gap-1 bg-elevated border border-border-base rounded-lg p-1">
+                      <button
+                        type="button"
+                        onClick={() => setBindProvider("dnshe")}
+                        className={`py-1.5 rounded-md text-xs font-semibold transition-all ${
+                          bindProvider === "dnshe" ? "bg-indigo-600 text-white shadow" : "text-content-muted hover:text-content-primary"
+                        }`}
+                      >
+                        DNSHE
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setBindProvider("cloudflare")}
+                        className={`py-1.5 rounded-md text-xs font-semibold transition-all ${
+                          bindProvider === "cloudflare" ? "bg-sky-600 text-white shadow" : "text-content-muted hover:text-content-primary"
+                        }`}
+                      >
+                        Cloudflare
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">绑定方式</label>
+                    <div className="grid grid-cols-2 gap-1 bg-elevated border border-border-base rounded-lg p-1">
+                      <button
+                        type="button"
+                        onClick={() => setBindMode("single")}
+                        className={`py-1.5 rounded-md text-xs font-semibold transition-all ${
+                          bindMode === "single" ? "bg-indigo-600 text-white shadow" : "text-content-muted hover:text-content-primary"
+                        }`}
+                      >
+                        单个绑定
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setBindMode("batch")}
+                        className={`py-1.5 rounded-md text-xs font-semibold transition-all ${
+                          bindMode === "batch" ? "bg-emerald-600 text-white shadow" : "text-content-muted hover:text-content-primary"
+                        }`}
+                      >
+                        批量绑定
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {bindProvider === "dnshe" && bindMode === "single" && (
+                  <form onSubmit={handleAddAccount} className="space-y-4 pt-1">
+                    {/* NOTE: 与「修改账号」弹窗同理，避免 Chrome 把 API Key/Secret 当成登录凭据对填充 */}
+                    <div>
+                      <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (可选，留空自动解析)</label>
+                      <input
+                        type="text"
+                        name="dnshe-bind-alias"
+                        autoComplete="off"
+                        placeholder="如：主账号、测试组"
+                        value={newAlias}
+                        onChange={(e) => setNewAlias(e.target.value)}
+                        className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key</label>
+                      <input
+                        type="text"
+                        required
+                        name="dnshe-bind-api-key"
+                        autoComplete="off"
+                        placeholder="cfsd_xxxxxxxxxx"
+                        value={newApiKey}
+                        onChange={(e) => setNewApiKey(e.target.value)}
+                        className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret</label>
+                      <PasswordInput
+                        required
+                        name="dnshe-bind-api-secret"
+                        autoComplete="new-password"
+                        placeholder="请输入 API Secret"
+                        value={newApiSecret}
+                        onChange={setNewApiSecret}
+                        className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                      />
+                    </div>
+                    <p className="text-[11px] text-content-muted leading-relaxed">
+                      别名留空时，系统会自动调用 DNSHE 密钥列表接口获取该 Key 的名称作为别名。
+                    </p>
+
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setBindModalOpen(false)}
+                        className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={actionLoading === "add-account"}
+                        className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                      >
+                        {actionLoading === "add-account" ? (
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <>
+                            <Plus className="w-4 h-4" /> 验证并绑定账号
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                {bindProvider === "dnshe" && bindMode === "batch" && (
+                  <div className="space-y-4 pt-1">
+                    <p className="text-xs text-content-muted leading-relaxed">
+                      每行填入一组 <span className="font-mono text-indigo-400">API Key + API Secret</span>（用空格 / Tab / 逗号分隔），别名自动从 API Key 解析，无需填写。
+                    </p>
+                    <div className="relative">
+                      <textarea
+                        ref={batchTextareaRef}
+                        value={batchInput}
+                        onChange={(e) => setBatchInput(e.target.value)}
+                        rows={6}
+                        spellCheck={false}
+                        placeholder={"cfsd_xxxxxxxx1 你的secret1\ncfsd_xxxxxxxx2 你的secret2\ncfsd_xxxxxxxx3,你的secret3"}
+                        className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-none"
+                        style={{ height: 160, transition: "none" }}
+                      />
+                      <div
+                        onPointerDown={handleBatchResizeStart}
+                        className="absolute bottom-0 right-1 h-4 w-10 cursor-ns-resize touch-none select-none flex items-center justify-center gap-[3px]"
+                        title="拖拽调整高度"
+                      >
+                        <span className="block w-3.5 h-[3px] rounded-full bg-current opacity-50" />
+                        <span className="block w-3.5 h-[3px] rounded-full bg-current opacity-50" />
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleBatchAddAccounts}
+                      disabled={actionLoading === "batch-add-accounts"}
+                      className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                      {actionLoading === "batch-add-accounts" ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" /> 正在批量验证绑定…
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-4 h-4" /> 开始批量绑定 ({batchInput.split(/[\n;；]+/).map((l) => l.trim()).filter(Boolean).length} 条)
+                        </>
+                      )}
+                    </button>
+
+                    {batchResults && batchResults.length > 0 && (
+                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                        {batchResults.map((r, idx) => (
+                          <div
+                            key={idx}
+                            className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
+                              r.success
+                                ? "bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-500/10 dark:border-emerald-500/30 dark:text-emerald-300"
+                                : "bg-red-50 border-red-200 text-red-700 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300"
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="font-mono truncate">{r.api_key}</div>
+                              {r.alias && <div className="text-content-muted truncate">别名: {r.alias}</div>}
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                              <span>{r.success ? "成功" : r.message}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {bindProvider === "cloudflare" && bindMode === "single" && (
+                  <div className="space-y-4 pt-1">
+                    <div>
+                      <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名（可选，留空自动解析）</label>
+                      <input
+                        type="text"
+                        name="cf-bind-alias"
+                        autoComplete="off"
+                        value={cfNewAlias}
+                        onChange={(e) => setCfNewAlias(e.target.value)}
+                        placeholder="留空将使用 Cloudflare 账号名称"
+                        className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-content-muted mb-1.5">API Token</label>
+                      <PasswordInput
+                        name="cf-bind-token"
+                        autoComplete="new-password"
+                        value={cfNewToken}
+                        onChange={setCfNewToken}
+                        placeholder="粘贴 Cloudflare API Token"
+                        className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
+                      />
+                    </div>
+                    <p className="text-[11px] text-content-muted leading-relaxed">
+                      在 Cloudflare 控制台「My Profile → API Tokens」创建 Token，权限需包含
+                      <span className="font-mono text-content-secondary"> Zone:Read </span>与
+                      <span className="font-mono text-content-secondary"> Zone DNS:Edit</span>
+                      。Token 仅用于调用 Cloudflare 官方 API，绑定后会加密存储并校验有效性。
+                    </p>
+
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        onClick={() => setBindModalOpen(false)}
+                        className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                      >
+                        取消
+                      </button>
+                      <button
+                        onClick={handleCfAddAccount}
+                        disabled={actionLoading === "cf-add-account"}
+                        className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                      >
+                        {actionLoading === "cf-add-account" ? (
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <>
+                            <Cloud className="w-4 h-4" /> 验证并绑定账号
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {bindProvider === "cloudflare" && bindMode === "batch" && (
+                  <div className="space-y-4 pt-1">
+                    <p className="text-xs text-content-muted leading-relaxed">
+                      每行填入一个 <span className="font-mono text-sky-400">API Token</span>（用空格 / Tab / 逗号 / 竖线分隔），可选择性跟随别名：
+                      <span className="font-mono text-content-secondary">token 你的别名</span>。别名留空自动使用 Cloudflare 账号名称。
+                    </p>
+                    <textarea
+                      value={cfBatchBindInput}
+                      onChange={(e) => setCfBatchBindInput(e.target.value)}
+                      rows={6}
+                      spellCheck={false}
+                      placeholder={"cfut_xxxxxxxxxxxx1 别名A\ncfut_xxxxxxxxxxxx2 别名B\ncfut_xxxxxxxxxxxx3"}
+                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-none"
+                      style={{ height: 160 }}
+                    />
+                    <button
+                      onClick={handleCfBatchAddAccounts}
+                      disabled={actionLoading === "cf-batch-add-accounts"}
+                      className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                      {actionLoading === "cf-batch-add-accounts" ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" /> 正在批量验证绑定…
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-4 h-4" /> 开始批量绑定 ({cfBatchBindInput.split(/[\n;；]+/).map((l) => l.trim()).filter(Boolean).length} 条)
+                        </>
+                      )}
+                    </button>
+
+                    {cfBatchBindResults && cfBatchBindResults.length > 0 && (
+                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                        {cfBatchBindResults.map((r, idx) => (
+                          <div
+                            key={idx}
+                            className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
+                              r.success
+                                ? "bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-500/10 dark:border-emerald-500/30 dark:text-emerald-300"
+                                : "bg-red-50 border-red-200 text-red-700 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300"
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="font-mono truncate">{r.api_key}</div>
+                              {r.alias && <div className="text-content-muted truncate">别名: {r.alias}</div>}
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                              <span>{r.success ? "成功" : r.message}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
         {bankModalOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
             <div className="bg-surface border border-border-base w-full max-w-lg max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
@@ -7402,175 +7722,6 @@ export default function App() {
                   <Save className="w-4 h-4" />
                   {editingBank ? "保存修改" : "创建词库"}
                 </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {bindModal === "single" && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
-            <div className="bg-surface border border-border-base w-full max-w-md max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
-              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
-                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
-                  <Plus className="w-5 h-5 text-indigo-400" /> 绑定单个账号
-                </h3>
-                <button
-                  onClick={() => setBindModal(null)}
-                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <form onSubmit={handleAddAccount} className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
-                {/* NOTE: 与「修改账号」弹窗同理，避免 Chrome 把 API Key/Secret 当成登录凭据对填充 */}
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">账户别名 (可选，留空自动解析)</label>
-                  <input
-                    type="text"
-                    name="dnshe-bind-alias"
-                    autoComplete="off"
-                    placeholder="如：主账号、测试组"
-                    value={newAlias}
-                    onChange={(e) => setNewAlias(e.target.value)}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Key</label>
-                  <input
-                    type="text"
-                    required
-                    name="dnshe-bind-api-key"
-                    autoComplete="off"
-                    placeholder="cfsd_xxxxxxxxxx"
-                    value={newApiKey}
-                    onChange={(e) => setNewApiKey(e.target.value)}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">API Secret</label>
-                  <PasswordInput
-                    required
-                    name="dnshe-bind-api-secret"
-                    autoComplete="new-password"
-                    placeholder="请输入 API Secret"
-                    value={newApiSecret}
-                    onChange={setNewApiSecret}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                  />
-                </div>
-                <p className="text-[11px] text-content-muted leading-relaxed">
-                  别名留空时，系统会自动调用 DNSHE 密钥列表接口获取该 Key 的名称作为别名。
-                </p>
-
-                <div className="flex gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => setBindModal(null)}
-                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={actionLoading === "add-account"}
-                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
-                  >
-                    {actionLoading === "add-account" ? (
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <>
-                        <Plus className="w-4 h-4" /> 验证并绑定账号
-                      </>
-                    )}
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
-        )}
-
-        {/* 批量绑定账号弹窗 */}
-        {bindModal === "batch" && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/85">
-            <div className="bg-surface border border-border-base w-full max-w-lg max-h-[90dvh] rounded-xl overflow-hidden flex flex-col shadow-2xl">
-              <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
-                <h3 className="text-lg font-bold text-content-primary flex items-center gap-1.5">
-                  <Sparkles className="w-5 h-5 text-emerald-400" /> 批量绑定账号
-                </h3>
-                <button
-                  onClick={() => setBindModal(null)}
-                  className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1">
-                <p className="text-xs text-content-muted leading-relaxed">
-                  每行填入一组 <span className="font-mono text-indigo-400">API Key + API Secret</span>（用空格 / Tab / 逗号分隔），别名自动从 API Key 解析，无需填写。
-                </p>
-                <div className="relative">
-                  <textarea
-                    ref={batchTextareaRef}
-                    value={batchInput}
-                    onChange={(e) => setBatchInput(e.target.value)}
-                    rows={6}
-                    spellCheck={false}
-                    placeholder={"cfsd_xxxxxxxx1 你的secret1\ncfsd_xxxxxxxx2 你的secret2\ncfsd_xxxxxxxx3,你的secret3"}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm font-mono text-content-secondary resize-none"
-                    style={{ height: 160, transition: "none" }}
-                  />
-                  <div
-                    onPointerDown={handleBatchResizeStart}
-                    className="absolute bottom-0 right-1 h-4 w-10 cursor-ns-resize touch-none select-none flex items-center justify-center gap-[3px]"
-                    title="拖拽调整高度"
-                  >
-                    <span className="block w-3.5 h-[3px] rounded-full bg-current opacity-50" />
-                    <span className="block w-3.5 h-[3px] rounded-full bg-current opacity-50" />
-                  </div>
-                </div>
-                <button
-                  onClick={handleBatchAddAccounts}
-                  disabled={actionLoading === "batch-add-accounts"}
-                  className="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm text-white flex items-center justify-center gap-2 disabled:opacity-50"
-                >
-                  {actionLoading === "batch-add-accounts" ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 animate-spin" /> 正在批量验证绑定…
-                    </>
-                  ) : (
-                    <>
-                      <Play className="w-4 h-4" /> 开始批量绑定 ({batchInput.split(/[\n;；]+/).map((l) => l.trim()).filter(Boolean).length} 条)
-                    </>
-                  )}
-                </button>
-
-                {batchResults && batchResults.length > 0 && (
-                  <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                    {batchResults.map((r, idx) => (
-                      <div
-                        key={idx}
-                        className={`flex items-start justify-between gap-2 text-xs px-3 py-2 rounded-lg border ${
-                          r.success
-                            ? "bg-emerald-50 border-emerald-200 text-emerald-700 dark:bg-emerald-500/10 dark:border-emerald-500/30 dark:text-emerald-300"
-                            : "bg-red-50 border-red-200 text-red-700 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300"
-                        }`}
-                      >
-                        <div className="min-w-0">
-                          <div className="font-mono truncate">{r.api_key}</div>
-                          {r.alias && <div className="text-content-muted truncate">别名: {r.alias}</div>}
-                        </div>
-                        <div className="flex items-center gap-1 shrink-0">
-                          {r.success ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
-                          <span>{r.success ? "成功" : r.message}</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             </div>
           </div>

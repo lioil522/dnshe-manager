@@ -1333,34 +1333,36 @@ export default function App() {
         )}
       </div>
 
-      {/* 交叉提示：委派到 Cloudflare 且同名 zone 已在绑定的 CF 账号中同步过，
-          引导用户去 Cloudflare 标签页管理解析记录（纯展示层匹配，不改数据） */}
-      {!checkHasDns(dom) && domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k)) && (
-        <button
-          onClick={() => setActiveTab("cloudflare")}
-          className="w-full mt-3 text-xs font-medium text-sky-600 dark:text-sky-400 bg-sky-50 dark:bg-sky-950/60 border border-sky-200 dark:border-sky-900/60 rounded-lg px-3 py-2 flex items-center justify-center gap-1.5 hover:bg-sky-100 dark:hover:bg-sky-950 transition-colors"
-        >
-          <Cloud className="w-3.5 h-3.5" />
-          已绑定 Cloudflare 账号，前往 Cloudflare 页管理解析
-        </button>
-      )}
-
       {/* 分隔线 */}
       <div className="border-t border-border-base my-3.5" />
 
-      {/* 底部：DNS 按钮与更多三点下拉菜单 */}
-      <div className="flex items-center justify-end gap-3 relative">
-        <button
-          onClick={() => handleOpenDnsModal(dom)}
-          disabled={!checkHasDns(dom)}
-          className={`text-xs font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 transition-all shadow-inner ${
-            checkHasDns(dom)
-              ? "bg-elevated hover:bg-hovered text-content-secondary cursor-pointer"
-              : "bg-elevated text-content-muted opacity-50 cursor-not-allowed"
-          }`}
-        >
-          <Settings className={`w-3.5 h-3.5 ${checkHasDns(dom) ? "text-content-muted" : "text-content-muted"}`} /> DNS
-        </button>
+      {/* 底部：交叉提示（已绑定 CF 账号的委派域名）+ DNS 按钮与更多三点下拉菜单 */}
+      <div className="flex items-center gap-3 relative">
+        {/* 交叉提示：委派到 Cloudflare 且同名 zone 已在绑定的 CF 账号中同步过，
+            引导用户去 Cloudflare 标签页管理解析记录（纯展示层匹配，不改数据） */}
+        {!checkHasDns(dom) && domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k)) && (
+          <button
+            onClick={() => setActiveTab("cloudflare")}
+            className="min-w-0 text-xs font-medium text-sky-600 dark:text-sky-400 hover:text-sky-500 dark:hover:text-sky-300 flex items-center gap-1.5 transition-colors text-left"
+            title="已绑定 Cloudflare 账号，点击前往 Cloudflare 标签页管理解析记录"
+          >
+            <Cloud className="w-3.5 h-3.5 flex-shrink-0" />
+            <span className="truncate">前往 Cloudflare 管理解析</span>
+          </button>
+        )}
+
+        <div className="flex items-center gap-3 ml-auto flex-shrink-0">
+          <button
+            onClick={() => handleOpenDnsModal(dom)}
+            disabled={!checkHasDns(dom)}
+            className={`text-xs font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 transition-all shadow-inner ${
+              checkHasDns(dom)
+                ? "bg-elevated hover:bg-hovered text-content-secondary cursor-pointer"
+                : "bg-elevated text-content-muted opacity-50 cursor-not-allowed"
+            }`}
+          >
+            <Settings className={`w-3.5 h-3.5 ${checkHasDns(dom) ? "text-content-muted" : "text-content-muted"}`} /> DNS
+          </button>
 
         <div className="relative">
           <button
@@ -1412,6 +1414,7 @@ export default function App() {
               </button>
             </div>
           )}
+        </div>
         </div>
       </div>
     </div>
@@ -6122,12 +6125,6 @@ export default function App() {
 
               <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:justify-end">
                 <button
-                  onClick={() => setCfBindModal(true)}
-                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-500 shadow-lg shadow-indigo-900/40 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap"
-                >
-                  <Plus className="w-3.5 h-3.5" /> 绑定 Cloudflare 账号
-                </button>
-                <button
                   onClick={handleCfSyncZones}
                   disabled={cfAccountList.length === 0 || actionLoading === "cf-sync"}
                   className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
@@ -6142,47 +6139,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* 已绑定的 Cloudflare 账号卡片 */}
-            {cfAccountList.length > 0 && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {cfAccountList.map((acc) => (
-                  <div key={acc.id} className="bg-surface border border-border-base rounded-xl p-4 flex items-center justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="text-sm font-bold text-content-primary truncate flex items-center gap-1.5">
-                        <Cloud className="w-3.5 h-3.5 text-sky-400 flex-shrink-0" />
-                        <span className="truncate">{acc.alias}</span>
-                      </div>
-                      <div className="text-xs text-content-muted font-mono mt-0.5">
-                        Token cf:••••{acc.api_key.slice(-4)}
-                      </div>
-                      <div className="text-[11px] text-content-muted mt-0.5">绑定于 {formatDate(acc.created_at, false)}</div>
-                    </div>
-                    <div className="flex items-center gap-1 flex-shrink-0">
-                      <button
-                        onClick={() => {
-                          setCfEditingAccount(acc);
-                          setCfEditAlias(acc.alias);
-                          setCfEditToken("");
-                        }}
-                        className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-content-primary transition-colors"
-                        title="编辑账号"
-                      >
-                        <Pencil className="w-4 h-4" />
-                      </button>
-                      <button
-                        onClick={() => handleCfDeleteAccount(acc)}
-                        disabled={actionLoading === `cf-delete-account-${acc.id}`}
-                        className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-red-500 transition-colors disabled:opacity-50"
-                        title="解绑账号"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
             {/* zones 列表（按账号分组） */}
             {loadingCfZones && cfZones.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-20 text-content-muted">
@@ -6194,8 +6150,14 @@ export default function App() {
                 <Cloud className="w-12 h-12 text-content-muted mx-auto mb-3" />
                 <h3 className="text-lg font-bold text-content-secondary">尚未绑定 Cloudflare 账号</h3>
                 <p className="text-content-muted text-sm mt-1 max-w-md mx-auto">
-                  点击右上角「绑定 Cloudflare 账号」，使用 API Token（需 Zone.Read 与 Zone DNS Edit 权限）绑定后即可在这里管理 zones 与解析记录。
+                  请前往「账号管理」使用 API Token（需 Zone.Read 与 Zone DNS Edit 权限）绑定，绑定后在这里管理 zones 与解析记录。
                 </p>
+                <button
+                  onClick={() => setActiveTab("accounts")}
+                  className="mt-4 px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-500 shadow-lg shadow-indigo-900/40 rounded-lg transition-all inline-flex items-center gap-1.5"
+                >
+                  <Key className="w-3.5 h-3.5" /> 前往账号管理
+                </button>
               </div>
             ) : (
               <div className="space-y-6">
@@ -7038,6 +7000,69 @@ export default function App() {
                 <Sparkles className="w-5 h-5" />
                 批量绑定账号
               </button>
+              <button
+                type="button"
+                onClick={() => setCfBindModal(true)}
+                className="flex-1 py-3 rounded-xl text-sm font-semibold bg-sky-600 hover:bg-sky-500 text-white border border-sky-500 shadow-lg shadow-sky-900/40 flex items-center justify-center gap-2 transition-all"
+              >
+                <Cloud className="w-5 h-5" />
+                绑定 Cloudflare 账号
+              </button>
+            </div>
+
+            {/* 已绑定的 Cloudflare 账号 */}
+            <div>
+              <h2 className="text-lg font-bold text-content-primary mb-4 flex items-center gap-2">
+                <Cloud className="w-5 h-5 text-sky-400" /> Cloudflare 账号 ({cfAccountList.length})
+              </h2>
+              {loadingAccounts ? (
+                <div className="flex justify-center py-10">
+                  <RefreshCw className="w-6 h-6 animate-spin text-indigo-500" />
+                </div>
+              ) : cfAccountList.length === 0 ? (
+                <div className="text-center py-12 border border-dashed border-border-base rounded-xl bg-surface">
+                  <Cloud className="w-10 h-10 text-content-muted mx-auto mb-2" />
+                  <p className="text-content-muted text-sm">尚未绑定 Cloudflare 账号，点击上方「绑定 Cloudflare 账号」用 API Token 绑定</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {cfAccountList.map((acc) => (
+                    <div key={acc.id} className="bg-surface border border-border-base rounded-xl p-4 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-sm font-bold text-content-primary truncate flex items-center gap-1.5">
+                          <Cloud className="w-3.5 h-3.5 text-sky-400 flex-shrink-0" />
+                          <span className="truncate">{acc.alias}</span>
+                        </div>
+                        <div className="text-xs text-content-muted font-mono mt-0.5">
+                          Token cf:••••{acc.api_key.slice(-4)}
+                        </div>
+                        <div className="text-[11px] text-content-muted mt-0.5">绑定于 {formatDate(acc.created_at, false)}</div>
+                      </div>
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        <button
+                          onClick={() => {
+                            setCfEditingAccount(acc);
+                            setCfEditAlias(acc.alias);
+                            setCfEditToken("");
+                          }}
+                          className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-content-primary transition-colors"
+                          title="编辑账号"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => handleCfDeleteAccount(acc)}
+                          disabled={actionLoading === `cf-delete-account-${acc.id}`}
+                          className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-red-500 transition-colors disabled:opacity-50"
+                          title="解绑账号"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* 已绑定的 API 账号 */}

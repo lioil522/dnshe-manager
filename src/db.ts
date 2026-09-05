@@ -961,7 +961,9 @@ export class DatabaseManager {
         throw new Error(`Cloudflare Token 状态异常 (${verify.status})，请检查 Token 是否被禁用`);
       }
 
-      // 别名留空时用 Token 可访问的账号名；缺 Account:Read 权限时退回 Token id
+      // 别名留空时自动解析 Cloudflare 账号名。优先 GET /accounts（需要 Account:Read
+      // 权限）；Token 没有该权限时退回 GET /zones —— 每个 zone 都内嵌
+      // account.id / account.name，凭 Zone:Read 就能拿到；两者都失败才退回 Token id。
       try {
         const cfAccounts = await cfClient.listAccounts();
         const first = cfAccounts[0];
@@ -970,7 +972,16 @@ export class DatabaseManager {
           uniqueKey = `cf:${first.id}`;
         }
       } catch {
-        // 忽略：唯一键退回 Token id，同样能防重复绑定
+        try {
+          const zones = await cfClient.listZones();
+          const acc = zones.find((z) => z.account?.id)?.account;
+          if (acc?.id) {
+            if (!finalAlias) finalAlias = acc.name || acc.id;
+            uniqueKey = `cf:${acc.id}`;
+          }
+        } catch {
+          // 忽略：唯一键退回 Token id，同样能防重复绑定
+        }
       }
       if (!finalAlias) finalAlias = `Cloudflare ${String(verify.token_id).slice(0, 8)}`;
       if (uniqueKey === apiKey) uniqueKey = `cf:token:${verify.token_id}`;

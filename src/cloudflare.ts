@@ -261,8 +261,86 @@ export class CloudflareClient {
   }
 
   /**
+   * 结构化类型的内容 → Cloudflare data 对象
+   *
+   * NOTE: Cloudflare 对 SRV / LOC / DNSKEY / DS / SVCB / HTTPS / TLSA / SSHFP 等
+   * 结构化类型要求通过 data 对象提交。面板上用户按 RFC 惯例用空格分隔填写内容
+   * （如 SRV「10 5 8080 example.com」、DS「2371 13 2 <摘要>」），这里按类型拆解
+   * 字段；字段数不符等无法解析的情形返回 null，调用方保留原 content 提交，
+   * 由 Cloudflare 返回明确的错误信息。
+   */
+  private buildStructuredData(type: string, content: string, priorityParam?: number): Record<string, unknown> | null {
+    const parts = content.split(/\s+/).filter(Boolean);
+    const unquote = (v: string) => v.replace(/^"(.*)"$/, "$1");
+    const stripM = (v: string) => Number(String(v).replace(/m$/i, ""));
+    const isNum = (v: string) => Number.isFinite(Number(v));
+
+    switch (type) {
+      case "SRV":
+        if (parts.length !== 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return {
+          priority: priorityParam ?? Number(parts[0]),
+          weight: Number(parts[1]),
+          port: Number(parts[2]),
+          target: parts[3],
+        };
+      case "URI":
+        if (parts.length < 3 || !isNum(parts[0]) || !isNum(parts[1])) return null;
+        return { priority: priorityParam ?? Number(parts[0]), weight: Number(parts[1]), target: parts.slice(2).join(" ") };
+      case "SSHFP":
+        if (parts.length < 3 || !isNum(parts[0]) || !isNum(parts[1])) return null;
+        return { algorithm: Number(parts[0]), type: Number(parts[1]), fingerprint: parts.slice(2).join("") };
+      case "TLSA":
+      case "SMIMEA":
+        if (parts.length < 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return { usage: Number(parts[0]), selector: Number(parts[1]), matching_type: Number(parts[2]), certificate: parts.slice(3).join("") };
+      case "DS":
+        if (parts.length < 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return { key_tag: Number(parts[0]), algorithm: Number(parts[1]), digest_type: Number(parts[2]), digest: parts.slice(3).join("") };
+      case "DNSKEY":
+        if (parts.length < 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return { flags: Number(parts[0]), protocol: Number(parts[1]), algorithm: Number(parts[2]), public_key: parts.slice(3).join("") };
+      case "CERT":
+        if (parts.length < 4 || !isNum(parts[1]) || !isNum(parts[2])) return null;
+        return { type: isNum(parts[0]) ? Number(parts[0]) : parts[0], key_tag: Number(parts[1]), algorithm: Number(parts[2]), certificate: parts.slice(3).join("") };
+      case "NAPTR":
+        if (parts.length < 6 || !isNum(parts[0]) || !isNum(parts[1])) return null;
+        return { order: Number(parts[0]), preference: Number(parts[1]), flags: unquote(parts[2]), service: unquote(parts[3]), regexp: unquote(parts[4]), replacement: parts.slice(5).join(" ") };
+      case "SVCB":
+      case "HTTPS":
+        if (parts.length < 2 || !isNum(parts[0])) return null;
+        return {
+          priority: priorityParam ?? Number(parts[0]),
+          target: parts[1],
+          ...(parts.length > 2 ? { value: parts.slice(2).join(" ") } : {}),
+        };
+      case "LOC": {
+        // RFC 1876：「纬度1 纬度2 纬秒 N 经度1 经度2 经秒 E 海拔 [尺寸 水平精度 垂直精度]」
+        if (parts.length < 9 || !isNum(parts[0]) || !isNum(parts[1]) || !isNum(parts[2]) || !isNum(parts[4]) || !isNum(parts[5]) || !isNum(parts[6])) return null;
+        const data: Record<string, unknown> = {
+          lat_degrees: Number(parts[0]),
+          lat_minutes: Number(parts[1]),
+          lat_seconds: Number(parts[2]),
+          lat_direction: parts[3].toUpperCase(),
+          long_degrees: Number(parts[4]),
+          long_minutes: Number(parts[5]),
+          long_seconds: Number(parts[6]),
+          long_direction: parts[7].toUpperCase(),
+          altitude: stripM(parts[8]),
+        };
+        if (parts[9] !== undefined) data.size = stripM(parts[9]);
+        if (parts[10] !== undefined) data.precision_horz = stripM(parts[10]);
+        if (parts[11] !== undefined) data.precision_vert = stripM(parts[11]);
+        return data;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /**
    * 根据写参数构造 CF 请求体：相对名转完整域名、代理记录强制自动 TTL、
-   * MX 缺省优先级时从内容前缀解析、SRV 转为 data 对象格式
+   * MX 缺省优先级时从内容前缀解析、结构化类型转为 data 对象
    */
   private buildWritePayload(params: CfDnsWriteParams): Record<string, unknown> {
     const type = String(params.type || "").trim().toUpperCase();
@@ -292,20 +370,18 @@ export class CloudflareClient {
       if (Number.isFinite(priority) && priority >= 0) {
         payload.priority = priority;
       }
+      return payload;
     }
 
-    if (type === "SRV") {
-      // Cloudflare 的 SRV 记录要求通过 data 对象提交：priority weight port target
-      const parts = content.split(/\s+/).filter(Boolean);
-      if (parts.length === 4) {
-        payload.data = {
-          priority: Number.isFinite(Number(params.priority)) ? Number(params.priority) : Number(parts[0]),
-          weight: Number(parts[1]),
-          port: Number(parts[2]),
-          target: parts[3],
-        };
-        delete payload.content;
-      }
+    // 结构化类型：内容自动转 data 对象；解析不出则保留 content，由 Cloudflare 报具体错误
+    const structured = this.buildStructuredData(
+      type,
+      content,
+      Number.isFinite(Number(params.priority)) ? Number(params.priority) : undefined
+    );
+    if (structured) {
+      payload.data = structured;
+      delete payload.content;
     }
 
     return payload;

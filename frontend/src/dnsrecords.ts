@@ -23,6 +23,33 @@ export const DNS_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
 
 const DNS_TYPE_SET = new Set(DNS_TYPE_OPTIONS.map((o) => o.value));
 
+/**
+ * Cloudflare 支持的完整记录类型清单（DNSHE 上游只支持上面 8 种，Cloudflare 全部支持）
+ *
+ * NOTE: 与 Cloudflare 控制台下拉框保持一致。结构化类型（SRV / LOC / DNSKEY / DS 等）
+ * 的内容写法见 cloudflare.ts 的 buildWritePayload —— 后端会把空格分隔的内容自动
+ * 解析成 Cloudflare 要求的 data 对象。
+ */
+export const CF_DNS_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
+  ...DNS_TYPE_OPTIONS,
+  { value: "PTR", label: "PTR (反向解析)" },
+  { value: "URI", label: "URI (统一资源标识)" },
+  { value: "CERT", label: "CERT (证书)" },
+  { value: "DNSKEY", label: "DNSKEY (DNS 密钥)" },
+  { value: "DS", label: "DS (委派签名)" },
+  { value: "HTTPS", label: "HTTPS (HTTPS 服务绑定)" },
+  { value: "SVCB", label: "SVCB (通用服务绑定)" },
+  { value: "TLSA", label: "TLSA (TLS 证书校验)" },
+  { value: "SMIMEA", label: "SMIMEA (S/MIME 校验)" },
+  { value: "SSHFP", label: "SSHFP (SSH 指纹)" },
+  { value: "NAPTR", label: "NAPTR (命名权威指针)" },
+  { value: "LOC", label: "LOC (地理位置)" },
+  { value: "OPENPGPKEY", label: "OPENPGPKEY (OpenPGP 公钥)" },
+];
+
+/** Cloudflare 记录类型集合（批量添加解析行首类型令牌时使用） */
+export const CF_DNS_TYPE_SET: ReadonlySet<string> = new Set(CF_DNS_TYPE_OPTIONS.map((o) => o.value));
+
 /** 只有 MX / SRV 需要优先级，其余类型不展示也不下发该字段 */
 export const needsDnsPriority = (type: string): boolean => type === "MX" || type === "SRV";
 
@@ -91,8 +118,14 @@ export interface DnsLineDefaults {
  *
  * NOTE: 顺序是「先取主机记录，再从行尾剥离数字，且始终至少留一个字段作为记录值」——
  * 反过来先剥数字的话，`TXT @ 12345` 这类记录值本身是数字的行会把记录值误当成 TTL。
+ * allowedTypes 决定行首「类型令牌」识别范围：DNSHE 面板用默认 8 种，Cloudflare
+ * 面板传入 CF_DNS_TYPE_SET（否则 PTR 这类行首会被误认成主机记录）。
  */
-export function parseDnsBatchLine(raw: string, defaults: DnsLineDefaults): ParsedDnsLine | null {
+export function parseDnsBatchLine(
+  raw: string,
+  defaults: DnsLineDefaults,
+  allowedTypes: ReadonlySet<string> = DNS_TYPE_SET
+): ParsedDnsLine | null {
   const line = raw.trim();
   if (!line) return null;
 
@@ -101,7 +134,7 @@ export function parseDnsBatchLine(raw: string, defaults: DnsLineDefaults): Parse
   if (tokens.length === 0) return null;
 
   let type = defaults.type;
-  if (tokens.length > 1 && DNS_TYPE_SET.has(tokens[0].toUpperCase())) {
+  if (tokens.length > 1 && allowedTypes.has(tokens[0].toUpperCase())) {
     type = tokens.shift()!.toUpperCase();
   }
 
@@ -134,12 +167,16 @@ export function parseDnsBatchLine(raw: string, defaults: DnsLineDefaults): Parse
  * 解析整个批量添加输入框：按行拆分，跳过空行与 `#` 注释行。
  * 返回每行的解析结果（含 null），由调用方据此提示"有几行被跳过"。
  */
-export function parseDnsBatchInput(text: string, defaults: DnsLineDefaults): Array<ParsedDnsLine | null> {
+export function parseDnsBatchInput(
+  text: string,
+  defaults: DnsLineDefaults,
+  allowedTypes: ReadonlySet<string> = DNS_TYPE_SET
+): Array<ParsedDnsLine | null> {
   return text
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"))
-    .map((l) => parseDnsBatchLine(l, defaults));
+    .map((l) => parseDnsBatchLine(l, defaults, allowedTypes));
 }
 
 /** 批量修改面板里「哪些字段要被覆盖」的勾选状态 */

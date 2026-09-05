@@ -59,6 +59,8 @@ import {
 } from "./rulegen";
 import {
   DNS_TYPE_OPTIONS,
+  CF_DNS_TYPE_OPTIONS,
+  CF_DNS_TYPE_SET,
   needsDnsPriority,
   dnsRecordKey,
   toRelativeRecordName,
@@ -1320,7 +1322,7 @@ export default function App() {
 
       {/* 交叉提示：委派到 Cloudflare 且同名 zone 已在绑定的 CF 账号中同步过，
           引导用户去 Cloudflare 标签页管理解析记录（纯展示层匹配，不改数据） */}
-      {!checkHasDns(dom) && cfZoneFullDomainSet.has(toASCII(dom.full_domain).toLowerCase()) && (
+      {!checkHasDns(dom) && cfZoneFullDomainSet.has(normalizeDomainKey(dom.full_domain)) && (
         <button
           onClick={() => setActiveTab("cloudflare")}
           className="w-full mt-3 text-xs font-medium text-sky-600 dark:text-sky-400 bg-sky-50 dark:bg-sky-950/60 border border-sky-200 dark:border-sky-900/60 rounded-lg px-3 py-2 flex items-center justify-center gap-1.5 hover:bg-sky-100 dark:hover:bg-sky-950 transition-colors"
@@ -2910,15 +2912,19 @@ export default function App() {
     return groups;
   }, [cfAccountList, cfZones]);
 
-  // 已同步 zone 的完整域名集合（punycode 归一化），供 DNSHE 域名页做「已在 Cloudflare 管理」交叉提示
+  // 域名匹配键：Punycode 小写 + 去首尾点（兼容 DNSHE 侧偶发的「.ddns.ge」空前缀形态）
+  const normalizeDomainKey = (value: string): string =>
+    toASCII(String(value || "").trim().toLowerCase()).replace(/^\.+|\.+$/g, "");
+
+  // 已同步 zone 的完整域名集合，供 DNSHE 域名页做「已在 Cloudflare 管理」交叉提示
   const cfZoneFullDomainSet = useMemo(
-    () => new Set(cfZones.map((z) => toASCII(String(z.full_domain || "")).toLowerCase())),
+    () => new Set(cfZones.map((z) => normalizeDomainKey(String(z.full_domain || "")))),
     [cfZones]
   );
 
-  // DNSHE 注册域名集合（punycode 归一化），供 CF zone 卡片显示「DNSHE 注册」标识
+  // DNSHE 注册域名集合，供 CF zone 卡片显示「DNSHE 注册」标识
   const dnsheFullDomainSet = useMemo(
-    () => new Set(domains.map((d) => toASCII(String(d.full_domain || "")).toLowerCase())),
+    () => new Set(domains.map((d) => normalizeDomainKey(String(d.full_domain || "")))),
     [domains]
   );
 
@@ -3225,6 +3231,7 @@ export default function App() {
   };
 
   // CF 批量添加输入框的实时解析（主机记录提前转相对名，预览与提交一致）
+  // NOTE: 行首类型令牌按 Cloudflare 全量类型识别，否则 PTR 这类行首会被误认成主机记录
   const cfParsedBatchLines = useMemo(
     () =>
       parseDnsBatchInput(cfBatchInput, {
@@ -3232,7 +3239,7 @@ export default function App() {
         name: cfBatchName,
         ttl: cfBatchProxied ? 1 : cfBatchTtl,
         priority: cfBatchPriority
-      }).map((r) =>
+      }, CF_DNS_TYPE_SET).map((r) =>
         r ? { ...r, name: toRelativeRecordName(r.name, cfSelectedZone?.full_domain || "") } : null
       ),
     [cfBatchInput, cfBatchType, cfBatchName, cfBatchTtl, cfBatchPriority, cfBatchProxied, cfSelectedZone]
@@ -3457,7 +3464,7 @@ export default function App() {
   const renderCfZoneCard = (zone: Domain) => {
     const unicodeDomain = toUnicode(zone.full_domain);
     const isActive = String(zone.status || "").toLowerCase() === "active";
-    const isDnsheRegistered = dnsheFullDomainSet.has(toASCII(String(zone.full_domain || "")).toLowerCase());
+    const isDnsheRegistered = dnsheFullDomainSet.has(normalizeDomainKey(String(zone.full_domain || "")));
 
     const handleCopyZone = () => {
       navigator.clipboard.writeText(zone.full_domain).then(() => {
@@ -6403,7 +6410,7 @@ export default function App() {
                             }}
                             className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
                           >
-                            {DNS_TYPE_OPTIONS.map((opt) => (
+                            {CF_DNS_TYPE_OPTIONS.map((opt) => (
                               <option key={opt.value} value={opt.value}>{opt.label}</option>
                             ))}
                           </select>
@@ -6515,7 +6522,7 @@ export default function App() {
                             onChange={(e) => setCfBatchType(e.target.value)}
                             className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
                           >
-                            {DNS_TYPE_OPTIONS.map((opt) => (
+                            {CF_DNS_TYPE_OPTIONS.map((opt) => (
                               <option key={opt.value} value={opt.value}>{opt.label}</option>
                             ))}
                           </select>
@@ -6810,7 +6817,7 @@ export default function App() {
                                     }}
                                     className="form-input px-2 py-1.5 rounded-lg text-xs text-content-secondary w-24"
                                   >
-                                    {DNS_TYPE_OPTIONS.map((opt) => (
+                                    {CF_DNS_TYPE_OPTIONS.map((opt) => (
                                       <option key={opt.value} value={opt.value}>{opt.value}</option>
                                     ))}
                                   </select>

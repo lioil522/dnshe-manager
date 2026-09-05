@@ -607,6 +607,8 @@ export default function App() {
   const cfBatchTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   // CF 批量修改面板（字段：记录值 / TTL / 代理）
   const [cfSelectedKeys, setCfSelectedKeys] = useState<Set<string>>(new Set());
+  // 从 DNSHE 域名页交叉提示跳转过来时待定位的 zone（domains_cache id），短暂高亮后自动清除
+  const [cfHighlightZoneId, setCfHighlightZoneId] = useState<number | null>(null);
   const [cfEditPanelOpen, setCfEditPanelOpen] = useState(false);
   const [cfEditFields, setCfEditFields] = useState({
     content: false,
@@ -1342,9 +1344,9 @@ export default function App() {
             引导用户去 Cloudflare 标签页管理解析记录（纯展示层匹配，不改数据） */}
         {!checkHasDns(dom) && domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k)) && (
           <button
-            onClick={() => setActiveTab("cloudflare")}
+            onClick={() => gotoCfZone(dom.full_domain)}
             className="min-w-0 text-xs font-medium text-sky-600 dark:text-sky-400 hover:text-sky-500 dark:hover:text-sky-300 flex items-center gap-1.5 transition-colors text-left"
-            title="已绑定 Cloudflare 账号，点击前往 Cloudflare 标签页管理解析记录"
+            title="已绑定 Cloudflare 账号，点击前往 Cloudflare 标签页并定位到该域名"
           >
             <Cloud className="w-3.5 h-3.5 flex-shrink-0" />
             <span className="truncate">前往 Cloudflare 管理解析</span>
@@ -2967,6 +2969,40 @@ export default function App() {
     setCfCollapsedAccounts(next);
   };
 
+  // 交叉提示跳转：切到 Cloudflare 标签页并定位到同名 zone 的卡片
+  const gotoCfZone = (fullDomain: string) => {
+    const keys = domainKeyCandidates(String(fullDomain || ""));
+    const zone = cfZones.find((z) =>
+      domainKeyCandidates(String(z.full_domain || "")).some((k) => keys.includes(k))
+    );
+    setActiveTab("cloudflare");
+    if (!zone) return;
+    // 展开该 zone 所在的账号分组，否则卡片不可见、无从滚动定位
+    setCfCollapsedAccounts((prev) => {
+      if (!prev.has(zone.account_id)) return prev;
+      const next = new Set(prev);
+      next.delete(zone.account_id);
+      return next;
+    });
+    setCfHighlightZoneId(zone.id);
+  };
+
+  // 定位高亮：等标签页与分组展开渲染完成后平滑滚动到目标卡片，停留数秒自动清除
+  useEffect(() => {
+    if (cfHighlightZoneId === null || activeTab !== "cloudflare") return;
+    const scrollTimer = window.setTimeout(() => {
+      document.getElementById(`cf-zone-card-${cfHighlightZoneId}`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center"
+      });
+    }, 150);
+    const clearTimer = window.setTimeout(() => setCfHighlightZoneId(null), 4000);
+    return () => {
+      window.clearTimeout(scrollTimer);
+      window.clearTimeout(clearTimer);
+    };
+  }, [cfHighlightZoneId, activeTab]);
+
   // 绑定 Cloudflare 账号（后端会先调 /user/tokens/verify 校验 Token）
   const handleCfAddAccount = async () => {
     if (!cfNewToken.trim()) {
@@ -3513,7 +3549,12 @@ export default function App() {
     return (
       <div
         key={zone.id}
-        className="bg-surface border border-border-base rounded-2xl p-5 flex flex-col justify-between transition-all duration-200 shadow-xl"
+        id={`cf-zone-card-${zone.id}`}
+        className={`bg-surface border rounded-2xl p-5 flex flex-col justify-between transition-all duration-300 shadow-xl ${
+          zone.id === cfHighlightZoneId
+            ? "border-sky-400 ring-2 ring-sky-400/50"
+            : "border-border-base"
+        }`}
       >
         {/* 顶部：域名名称与状态 */}
         <div className="flex items-center justify-between gap-2">

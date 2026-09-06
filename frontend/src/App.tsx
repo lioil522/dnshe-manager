@@ -3683,15 +3683,11 @@ export default function App() {
           )}
         </div>
 
-        {/* 中间：元信息 */}
+        {/* 中间：元信息（zone 由 Cloudflare 托管，无到期概念，有效期看注册商） */}
         <div className="mt-4 space-y-2 text-xs">
           <div className="flex justify-between items-center">
             <span className="text-content-muted font-medium">创建时间</span>
             <span className="font-mono text-content-secondary">{formatDate(zone.created_at, false)}</span>
-          </div>
-          <div className="flex justify-between items-center">
-            <span className="text-content-muted font-medium">到期时间</span>
-            <span className="font-mono text-content-secondary">永久</span>
           </div>
           {isDnsheRegistered && (
             <div className="flex justify-between items-center">

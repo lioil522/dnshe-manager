@@ -641,6 +641,8 @@ export default function App() {
   const [cfSelectedKeys, setCfSelectedKeys] = useState<Set<string>>(new Set());
   // 从 DNSHE 域名页交叉提示跳转过来时待定位的 zone（domains_cache id），短暂高亮后自动清除
   const [cfHighlightZoneId, setCfHighlightZoneId] = useState<number | null>(null);
+  // CF zone 到期时间：DNSHE 注册的取本地缓存，其余经后端 RDAP 查注册商（后端缓存 7 天）
+  const [cfExpiryMap, setCfExpiryMap] = useState<Record<string, { found: boolean; expires_at?: string }>>({});
   const [cfEditPanelOpen, setCfEditPanelOpen] = useState(false);
   const [cfEditFields, setCfEditFields] = useState({
     content: false,
@@ -2996,6 +2998,35 @@ export default function App() {
     [domains]
   );
 
+  // 批量查询非 DNSHE 注册的 zone 到期时间（RDAP；后端 D1 缓存 7 天）
+  const fetchCfExpiry = async (zoneList: Domain[]) => {
+    const targets = Array.from(
+      new Set(
+        zoneList
+          .filter((z) => !dnsheFullDomainSet.has(normalizeDomainKey(String(z.full_domain || ""))))
+          .map((z) => normalizeDomainKey(String(z.full_domain || "")))
+          .filter(Boolean)
+      )
+    ).filter((k) => !(k in cfExpiryMap));
+    if (targets.length === 0) return;
+    try {
+      const res = await apiFetch(`/api/expiry?domains=${encodeURIComponent(targets.join(","))}`);
+      const data = await res.json();
+      if (data.success && data.expiry) {
+        setCfExpiryMap((prev) => ({ ...prev, ...(data.expiry as Record<string, { found: boolean; expires_at?: string }>) }));
+      }
+    } catch {
+      // 到期查询失败不打扰用户，卡片显示 —
+    }
+  };
+
+  // 进入 Cloudflare 页或 zones 更新时拉取到期时间（已缓存的域名后端直接命中，秒回）
+  useEffect(() => {
+    if (activeTab !== "cloudflare" || cfZones.length === 0) return;
+    void fetchCfExpiry(cfZones);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, cfZones]);
+
   const cfToggleAccountCollapse = (accountId: number) => {
     const next = new Set(cfCollapsedAccounts);
     if (next.has(accountId)) next.delete(accountId);
@@ -3644,6 +3675,19 @@ export default function App() {
     const unicodeDomain = displayDomain(toUnicode(zone.full_domain));
     const isActive = String(zone.status || "").toLowerCase() === "active";
     const isDnsheRegistered = domainKeyCandidates(String(zone.full_domain || "")).some((k) => dnsheFullDomainSet.has(k));
+    // 到期时间：DNSHE 注册的取本地缓存的真实到期时间；其余用 RDAP 查询结果（查不到显示 —）
+    const dnsheMatch = isDnsheRegistered
+      ? domains.find((d) => {
+          const keys = domainKeyCandidates(String(d.full_domain || ""));
+          return domainKeyCandidates(String(zone.full_domain || "")).some((k) => keys.includes(k));
+        })
+      : undefined;
+    const rdapInfo = cfExpiryMap[normalizeDomainKey(String(zone.full_domain || ""))];
+    const expiryText = dnsheMatch?.expires_at
+      ? formatDate(dnsheMatch.expires_at, true)
+      : rdapInfo?.expires_at
+        ? formatDate(rdapInfo.expires_at, true)
+        : "—";
 
     const handleCopyZone = () => {
       navigator.clipboard.writeText(zone.full_domain).then(() => {
@@ -3683,11 +3727,20 @@ export default function App() {
           )}
         </div>
 
-        {/* 中间：元信息（zone 由 Cloudflare 托管，无到期概念，有效期看注册商） */}
+        {/* 中间：元信息（到期时间 = DNSHE 本地缓存或 RDAP 查询的注册商侧数据） */}
         <div className="mt-4 space-y-2 text-xs">
           <div className="flex justify-between items-center">
             <span className="text-content-muted font-medium">创建时间</span>
             <span className="font-mono text-content-secondary">{formatDate(zone.created_at, false)}</span>
+          </div>
+          <div className="flex justify-between items-center">
+            <span className="text-content-muted font-medium">到期时间</span>
+            <span
+              className="font-mono text-content-secondary"
+              title="注册商侧到期时间（RDAP 查询，7 天缓存）；DNSHE 注册的域名取本地缓存"
+            >
+              {expiryText}
+            </span>
           </div>
           {isDnsheRegistered && (
             <div className="flex justify-between items-center">

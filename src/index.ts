@@ -2378,6 +2378,109 @@ app.get("/api/dns/ns", async (c) => {
 });
 
 /**
+ * RDAP 查询域名在注册商侧的到期时间
+ *
+ * NOTE: Cloudflare 的 zone 对象没有到期字段（有效期登记在注册商处）。rdap.org 是
+ * IANA 的公共 RDAP 重定向入口，按 TLD 302 到对应注册局的 RDAP 服务，无需任何凭据。
+ * 结果写入 D1 缓存 7 天：到期时间以年为单位变化，没有更细粒度拉取的意义；
+ * 查不到（404，常见于 zone 是别人根域的子域）同样落缓存避免反复打上游，查询失败不落。
+ */
+const RDAP_CACHE_TTL = 7 * 24 * 3600;
+
+interface RdapEvent {
+  eventAction?: string;
+  eventDate?: string;
+}
+
+interface RdapExpiryResult {
+  found: boolean;
+  expires_at?: string;
+  registered_at?: string;
+  error?: string;
+}
+
+async function fetchExpiryViaRdap(domain: string): Promise<RdapExpiryResult> {
+  const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+    headers: { accept: "application/rdap+json" }
+  });
+  // 404 = 该名字不是可注册域名（多为子域 zone）或注册局无此记录
+  if (res.status === 404) {
+    return { found: false };
+  }
+  if (!res.ok) {
+    throw new Error(`RDAP HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as { events?: RdapEvent[] };
+  const eventDate = (action: string) =>
+    (data.events || []).find((e) => e.eventAction === action)?.eventDate || "";
+  return {
+    found: true,
+    expires_at: eventDate("expiration") || undefined,
+    registered_at: eventDate("registration") || undefined
+  };
+}
+
+// GET /api/expiry?domains=a.com,b.com — 批量查询域名注册商侧到期时间（RDAP，7 天缓存）
+app.get("/api/expiry", async (c) => {
+  const dbManager = c.get("db");
+  const domains = Array.from(
+    new Set(
+      (c.req.query("domains") || "")
+        .split(",")
+        .map((d) => toASCII(String(d || "").trim().toLowerCase()))
+        .filter(Boolean)
+    )
+  ).slice(0, 50);
+
+  if (domains.length === 0) {
+    return c.json(successRes({ expiry: {} }));
+  }
+
+  const expiry: Record<string, RdapExpiryResult> = {};
+  const toQuery: string[] = [];
+
+  // 1. 先命中 D1 缓存
+  for (const d of domains) {
+    const cached = await dbManager.getCache(`rdap:${d}`);
+    if (cached) {
+      try {
+        expiry[d] = JSON.parse(cached) as RdapExpiryResult;
+        continue;
+      } catch {
+        // 缓存脏了按未命中处理
+      }
+    }
+    toQuery.push(d);
+  }
+
+  // 2. 未命中的并发回源（不同 TLD 落在不同注册局的 RDAP 服务，压力天然分散）。
+  //    错误在任务内部就地捕获：查询失败不落缓存（下次请求重试），其余结果（含 404）落 7 天缓存。
+  const settled = await Promise.allSettled(
+    toQuery.map((d) =>
+      fetchExpiryViaRdap(d)
+        .then(async (result) => {
+          await dbManager.setCache(`rdap:${d}`, JSON.stringify(result), RDAP_CACHE_TTL);
+          return { d, result };
+        })
+        .catch((err: unknown) => ({
+          d,
+          result: {
+            found: false,
+            error: err instanceof Error ? err.message : "查询失败"
+          } as RdapExpiryResult
+        }))
+    )
+  );
+  for (const item of settled) {
+    if (item.status === "fulfilled") {
+      expiry[item.value.d] = item.value.result;
+    }
+  }
+
+  return c.json(successRes({ expiry }));
+});
+
+/**
  * 9. 在线注册新子域名 (代理接口)
  */
 app.post("/api/domains/register", async (c) => {

@@ -1,6 +1,6 @@
 import { DatabaseManager } from "./db";
 import type { SubdomainInfo } from "./dnshe";
-import { DNSHEClient } from "./dnshe";
+import { DNSHEClient, isDnsheOriginError } from "./dnshe";
 import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
 import { computeDnsState } from "./dns-provider";
 
@@ -179,7 +179,13 @@ interface SubdomainClient {
 /**
  * 分页拉取某个账号下的全部子域名
  *
- * NOTE: DNSHE API 的 per_page 最大值为 500。循环分页直到所有数据拉取完毕。
+ * NOTE: DNSHE API 的 per_page 最大值为 500。
+ *
+ * 实测响应顶层**没有** `total`，分页信息在 `pagination`：
+ *   { mode:"offset", page, per_page, has_more, total }
+ * 原实现读 `res.total` 判断是否到底，那个分支永远不生效，全靠
+ * `subdomains.length < perPage` 兜底 —— 若某账号域名数恰为 per_page 的整数倍，
+ * 会多打一次空页请求。现在优先信 `pagination.has_more`。
  */
 export async function fetchAllSubdomainsFromClient(client: SubdomainClient): Promise<SubdomainInfo[]> {
   const allSubdomains: SubdomainInfo[] = [];
@@ -195,13 +201,17 @@ export async function fetchAllSubdomainsFromClient(client: SubdomainClient): Pro
 
     allSubdomains.push(...res.subdomains);
 
-    // 判断是否还有下一页：当返回的数据量不足一页，或已达到 total 总数时停止
-    if (res.subdomains.length < perPage) {
-      hasMore = false;
-    } else if (res.total !== undefined && allSubdomains.length >= res.total) {
-      hasMore = false;
+    const pagination = (res as { pagination?: { has_more?: boolean; next_page?: number | null; total?: number } }).pagination;
+    if (pagination && typeof pagination.has_more === "boolean") {
+      hasMore = pagination.has_more;
+      if (hasMore) page = Number(pagination.next_page) || page + 1;
+    } else if (typeof pagination?.total === "number" || typeof res.total === "number") {
+      const total = Number(pagination?.total ?? res.total);
+      hasMore = allSubdomains.length < total;
+      if (hasMore) page++;
     } else {
-      page++;
+      hasMore = res.subdomains.length >= perPage;
+      if (hasMore) page++;
     }
 
     // 安全保护：最多拉取 50 页（25000 条），防止无限循环
@@ -276,18 +286,36 @@ export async function runDailySyncAndRenewal(
       const subdomains = await fetchAllSubdomainsFromClient(client);
       
       // 3. 并发获取每个子域名的 DNS 记录，自动计算真实状态（已委派 / 已解析 / 未解析）
-      const subdomainsWithDnsInfo = await Promise.all(
-        subdomains.map(async (sub) => {
-          try {
-            const recordsRes = await client.listDnsRecords(sub.id);
-            const records = recordsRes.records || [];
-            return { ...sub, ...computeDnsState(records) };
-          } catch (e) {
-            // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
-            return { ...sub };
-          }
-        })
-      );
+      //
+      // WHY 分批：早期是裸 `Promise.all(subdomains.map(...))`，整账号所有域名的
+      // listDnsRecords 同时发出。实测瞬时并发 120 会把 DNSHE 应用层打崩
+      // （89/120 返回 520，持续数十分钟不恢复）。这里并发上限压到 3。
+      let originDown: unknown = null;
+      const subdomainsWithDnsInfo: any[] = [];
+      for (let bi = 0; bi < subdomains.length; bi += 3) {
+        if (originDown) break;
+        const chunk = subdomains.slice(bi, bi + 3);
+        const part = await Promise.all(
+          chunk.map(async (sub) => {
+            try {
+              const recordsRes = await client.listDnsRecords(sub.id);
+              const records = recordsRes.records || [];
+              return { ...sub, ...computeDnsState(records) };
+            } catch (e) {
+              if (isDnsheOriginError(e)) {
+                originDown = e;
+                return null;
+              }
+              // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
+              return { ...sub };
+            }
+          })
+        );
+        for (const p of part) if (p) subdomainsWithDnsInfo.push(p);
+      }
+
+      // 上游不可达：本轮直接放弃，不为剩余域名继续发请求
+      if (originDown) throw originDown;
 
       // 4. 同步到本地 cache
       await dbManager.syncAccountDomains(acc.id, subdomainsWithDnsInfo);

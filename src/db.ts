@@ -1,4 +1,4 @@
-import { DNSHEClient } from "./dnshe";
+import { DNSHEClient, setDnsheCooldownStore } from "./dnshe";
 import { CloudflareClient } from "./cloudflare";
 
 /** 绑定账号的提供商 */
@@ -242,6 +242,14 @@ export class DatabaseManager {
   constructor(d1Database: D1Database, aesKey?: string) {
     this.db = d1Database;
     this.aesKey = aesKey;
+
+    // 把 DB 注入 DNSHE 客户端的冷却存储：520 后多实例/多 isolate 共享同一份冷却状态，
+    // 避免每次同步都先「试一次」把已故障的上游继续刷成一片 520。
+    // NOTE: 用 setter 而非构造参数，保持 DNSHEClient 可被单独 new（测试/脚本复用）。
+    setDnsheCooldownStore({
+      get: (key) => this.getCache(key),
+      set: (key, value, ttl) => this.setCache(key, value, ttl),
+    });
   }
 
   /**

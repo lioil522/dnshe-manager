@@ -3,7 +3,7 @@ import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
 import type { DBDomain } from "./db";
-import { DNSHEClient } from "./dnshe";
+import { DNSHEClient, isDnsheOriginError } from "./dnshe";
 import type { CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
 import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification, sendWebhookNotification } from "./cron";
@@ -54,12 +54,28 @@ async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number
 
 // NOTE: 深度同步单个 DNSHE 账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
 // 与 cron.ts 中 "同步所有域名" 的逻辑保持一致，供绑定/批量/修改换 Key 后调用
+//
+// WHY 分 batch：早期是裸 `Promise.all(subdomains.map(...))`，账号下所有域名的
+// listDnsRecords 同时发出。实测瞬时并发 120 会把 DNSHE 应用层打崩（89/120 返回 520，
+// 且持续数十分钟不恢复）。批处理后并发峰值 ≤3。
+async function batchedAll<T, R>(items: T[], fn: (item: T) => Promise<R>, size = 3): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(...(await Promise.all(items.slice(i, i + size).map(fn))));
+  }
+  return out;
+}
+
 async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, client: DNSHEClient): Promise<number> {
   const subdomains = await fetchAllSubdomainsFromClient(client);
 
-  // 并发拉取每个子域名的 DNS 记录，自动计算真实状态
-  const enriched = await Promise.all(
-    subdomains.map(async (sub) => {
+  // 并发拉取每个子域名的 DNS 记录（并发上限 3），自动计算真实状态
+  let originDown: unknown = null;
+
+  const enriched = await batchedAll(
+    subdomains,
+    async (sub) => {
+      if (originDown) return null; // 已判定上游不可达，剩余项跳过
       try {
         const recordsRes = await client.listDnsRecords(sub.id);
         const records = recordsRes.records || [];
@@ -69,23 +85,37 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
 
         return { ...sub, ...computeDnsState(records) };
       } catch (e: unknown) {
+        if (isDnsheOriginError(e)) {
+          originDown = e;
+          return null;
+        }
         console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
         // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
         return { ...sub };
       }
-    })
+    },
+    3
   );
 
-  if (enriched.length > 0) {
-    await dbManager.syncAccountDomains(accountId, enriched);
+  const usable = enriched.filter((x): x is NonNullable<typeof x> => x !== null);
+  if (usable.length > 0) {
+    await dbManager.syncAccountDomains(accountId, usable as any[]);
   }
+
+  if (originDown) throw originDown;
   return subdomains.length;
 }
 
 // NOTE: 账号绑定/换 Key 后逐个账号深度同步域名，并刷新该账号的配额缓存
 //       （间隔 1.2s 规避 DNSHE 速率限制）
+//
+// WHY 遇上游不可达要 return 而不是继续：
+// 实测 6 个账号 × 2 次调用 = 12 条 520，全程 13 秒。而 520 与限流无关
+// （串行 120 次实测 0 次 520），等待不会恢复。继续跑剩余账号只会把 1 条错误
+// 变成 N 条，并给已故障的上游继续施压。
 async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds: number[]) {
-  for (const id of accountIds) {
+  for (let i = 0; i < accountIds.length; i++) {
+    const id = accountIds[i];
     try {
       const { client, alias, provider } = await dbManager.getClientForAccount(id);
       // 先刷配额缓存再同步域名：前端是以「该账号的域名已落库」作为后台任务完成的信号，
@@ -98,6 +128,20 @@ async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds
           : 0;
       console.log(`Deep sync finished for account ${id}: ${synced} domains`);
     } catch (e: unknown) {
+      if (isDnsheOriginError(e)) {
+        const msg = e instanceof Error ? e.message : "DNSHE 上游服务异常";
+        console.error(`Background account resync aborted at account ${id} (upstream unreachable): ${msg}`);
+        try {
+          await dbManager.writeLog(
+            "error",
+            "sync",
+            `账号 ${id} 同步失败：${msg}。已中止本批剩余 ${accountIds.length - i - 1} 个账号（上游不可达时重试无意义）`
+          );
+        } catch {
+          /* 日志失败不影响中止 */
+        }
+        return;
+      }
       console.error(`Background account resync failed for account ${id}:`, e);
     }
     await sleep(1200);
@@ -1888,35 +1932,37 @@ async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: A
   // Cloudflare 账号没有 DNSHE 式配额概念，跳过查询避免无意义的上游报错
   const accounts = allAccounts.filter((acc) => acc.provider !== "cloudflare");
 
-  // 并发发起所有账号的配额查询请求
-  const quotaPromises = accounts.map(async (acc) => {
-    const { client } = await dbManager.getClientForAccount(acc.id);
-    if (!(client instanceof DNSHEClient)) {
-      throw new Error("该账号不支持配额查询");
-    }
-    const qRes = await client.getQuota();
-    if (qRes && qRes.success) {
-      return {
-        account_id: acc.id,
-        alias: acc.alias,
-        ...qRes.quota
-      };
-    }
-    throw new Error(qRes.message || "获取额度失败");
-  });
-
-  const results = await Promise.allSettled(quotaPromises);
-
-  const quotas = results.map((result, idx) => {
-    if (result.status === "fulfilled") {
-      return result.value;
-    }
-    return {
-      account_id: accounts[idx].id,
-      alias: accounts[idx].alias,
-      error: result.reason?.message || "获取额度失败"
-    };
-  });
+  // NOTE: 早期这里是 `Promise.allSettled(accounts.map(...))` —— 所有账号的配额
+  // 查询**同时**发出。账号越多瞬时并发越高，与 listDnsRecords 的并发叠加后
+  // 很容易把 DNSHE 应用层打崩（实测 120 并发 → 89/120 返回 520）。
+  // 改为分批（每批 3 个），配合 dnshe.ts 内部的全局时间片限速形成双保险。
+  const quotas: any[] = [];
+  const BATCH = 3;
+  for (let i = 0; i < accounts.length; i += BATCH) {
+    const chunk = accounts.slice(i, i + BATCH);
+    const part = await Promise.all(
+      chunk.map(async (acc) => {
+        try {
+          const { client } = await dbManager.getClientForAccount(acc.id);
+          if (!(client instanceof DNSHEClient)) {
+            throw new Error("该账号不支持配额查询");
+          }
+          const qRes = await client.getQuota();
+          if (qRes && qRes.success) {
+            return { account_id: acc.id, alias: acc.alias, ...qRes.quota };
+          }
+          throw new Error(qRes.message || "获取额度失败");
+        } catch (e: unknown) {
+          return {
+            account_id: acc.id,
+            alias: acc.alias,
+            error: e instanceof Error ? e.message : "获取额度失败",
+          };
+        }
+      })
+    );
+    quotas.push(...part);
+  }
 
   return { accounts, quotas };
 }

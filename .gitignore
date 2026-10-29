@@ -15,6 +15,8 @@ dist-node/
 # public/ 可选的前端产物拷贝（容器内为 /app/public）
 /data/
 /public/
+# 本地测试用的独立数据目录（含 aes.key 与 SQLite 库，绝不入库）
+/.testdata/
 # NOTE: 只忽略仓库根目录的 public/。frontend/public/ 是 Vite 的静态资源源目录
 #       （Cloudflare _headers、theme-init.js 等靠它拷进 dist），必须入库。
 
